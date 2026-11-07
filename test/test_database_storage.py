@@ -20,6 +20,16 @@ def _account_rows(backend: DatabaseStorageBackend) -> dict[str, AccountModel]:
         session.close()
 
 
+def test_save_accounts_accepts_access_token_longer_than_legacy_varchar_limit(tmp_path):
+    backend = DatabaseStorageBackend(f"sqlite:///{tmp_path / 'accounts.db'}")
+    token = "eyJ" + ("a" * 4000)
+    backend.save_accounts([{"access_token": token, "name": "long"}])
+
+    loaded = backend.load_accounts()
+    assert loaded == [{"access_token": token, "name": "long"}]
+    assert len(loaded[0]["access_token"]) > 2048
+
+
 def test_save_accounts_preserves_existing_rows_and_updates_only_changed_data(tmp_path):
     backend = DatabaseStorageBackend(f"sqlite:///{tmp_path / 'accounts.db'}")
     backend.save_accounts(

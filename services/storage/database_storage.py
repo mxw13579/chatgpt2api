@@ -17,7 +17,14 @@ class AccountModel(Base):
     __tablename__ = "accounts"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    access_token = Column(String(2048), unique=True, nullable=False, index=True)
+    # ChatGPT access_token 是 JWT，经常超过 2048。PostgreSQL 的 varchar(2048) 会把导入打成 500。
+    # MySQL 不能给整列 TEXT 建唯一索引，所以只在 MySQL 上保留定长字符串。
+    access_token = Column(
+        Text().with_variant(String(2048), "mysql"),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
     data = Column(Text, nullable=False)  # JSON 格式存储完整账号数据
 
 
@@ -41,7 +48,28 @@ class DatabaseStorageBackend(StorageBackend):
             pool_recycle=3600,   # 1小时回收连接
         )
         Base.metadata.create_all(self.engine)
+        self._widen_access_token_column()
         self.Session = sessionmaker(bind=self.engine)
+
+    def _widen_access_token_column(self) -> None:
+        """把已有库里的 varchar access_token 放成 text。create_all 不会改旧列。"""
+        if self.engine.dialect.name != "postgresql":
+            return
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT character_maximum_length
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'accounts'
+                      AND column_name = 'access_token'
+                    """
+                )
+            ).first()
+            if row is None or row[0] is None:
+                return
+            conn.execute(text("ALTER TABLE accounts ALTER COLUMN access_token TYPE TEXT"))
 
     def load_accounts(self) -> list[dict[str, Any]]:
         """从数据库加载账号数据"""
