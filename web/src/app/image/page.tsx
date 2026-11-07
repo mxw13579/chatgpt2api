@@ -5,6 +5,7 @@ import { ArrowDown, History, LoaderCircle, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { ImageComposer } from "@/app/image/components/image-composer";
+import { ImageDrawingDialog } from "@/app/image/components/image-drawing-dialog";
 import { ImageResults, type ImageLightboxItem } from "@/app/image/components/image-results";
 import { ImageSidebar } from "@/app/image/components/image-sidebar";
 import { ImageLightbox } from "@/components/image-lightbox";
@@ -21,14 +22,14 @@ import {
   createImageEditTask,
   createImageGenerationTask,
   fetchAccounts,
-  fetchModels,
+  fetchImageModelCatalog,
   fetchImageTasks,
   resumeImagePoll,
   type Account,
   type ImageModel,
-  type Model,
   type ImageTask,
 } from "@/lib/api";
+import { clearCachedImages, deleteCachedImageSources, resolveCachedImage } from "@/lib/image-cache";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { useSettingsStore } from "@/app/settings/store";
 import {
@@ -55,6 +56,16 @@ const IMAGE_MODEL_STORAGE_KEY = "chatgpt2api:image_last_model";
 const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count";
 const SCROLL_POSITIONS_STORAGE_KEY = "chatgpt2api:image_scroll_positions";
 const SCROLL_TO_LATEST_THRESHOLD = 160;
+const FALLBACK_IMAGE_MODELS: ImageModel[] = [
+  "gpt-image-2.6-sunburst",
+  "gpt-image-2.6-flare",
+  "gpt-image-2.5-sunburst",
+  "gpt-image-2.5-flare",
+  "gpt-image-2",
+  "gpt-5-5-thinking",
+  "gpt-5-5",
+  "gpt-5-3",
+];
 
 function loadScrollPositions(): Map<string, number> {
   if (typeof window === "undefined") return new Map();
@@ -144,18 +155,12 @@ function dataUrlToFile(dataUrl: string, fileName: string, mimeType?: string) {
   return new File([bytes], fileName, { type: mimeType || matchedMimeType || "image/png" });
 }
 
-function filterImageModels(items: Model[]): ImageModel[] {
-  return items
-    .map((item) => String(item.id || "").trim())
-    .filter((id, index, list) => id.toLowerCase().includes("image") && list.indexOf(id) === index);
-}
-
 function normalizeStoredImageModel(value: string | null, availableModels: ImageModel[]): ImageModel {
   const normalized = String(value || "").trim();
   if (normalized && availableModels.includes(normalized)) {
     return normalized;
   }
-  return availableModels[0] || "gpt-image-2";
+  return availableModels.includes("gpt-image-2") ? "gpt-image-2" : availableModels[0] || "gpt-image-2";
 }
 
 function buildReferenceImageFromResult(image: StoredImage, fileName: string): StoredReferenceImage | null {
@@ -171,12 +176,17 @@ function buildReferenceImageFromResult(image: StoredImage, fileName: string): St
 }
 
 async function fetchImageAsFile(url: string, fileName: string) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error("读取结果图失败");
-  }
-  const blob = await response.blob();
+  const blob = (await resolveCachedImage(url)).blob;
+  if (!blob) throw new Error("读取结果图失败");
   return new File([blob], fileName, { type: blob.type || "image/png" });
+}
+
+function getTurnResultSources(turn: ImageTurn | null | undefined) {
+  return turn?.images.flatMap((image) => (image.url ? [image.url] : [])) || [];
+}
+
+function getConversationResultSources(conversation: ImageConversation | null | undefined) {
+  return conversation?.turns.flatMap(getTurnResultSources) || [];
 }
 
 async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: string) {
@@ -470,10 +480,13 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [imageHeight, setImageHeight] = useState("1024");
   const [imageQuality, setImageQuality] = useState("auto");
   const [imageModel, setImageModel] = useState<ImageModel>("gpt-image-2");
-  const [imageModels, setImageModels] = useState<ImageModel[]>(["gpt-image-2"]);
+  const [globalImageModel, setGlobalImageModel] = useState<ImageModel>("gpt-image-2");
+  const [imageModels, setImageModels] = useState<ImageModel[]>(FALLBACK_IMAGE_MODELS);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [referenceImageFiles, setReferenceImageFiles] = useState<File[]>([]);
   const [referenceImages, setReferenceImages] = useState<StoredReferenceImage[]>([]);
+  const [maskFiles, setMaskFiles] = useState<File[]>([]);
+  const [maskImages, setMaskImages] = useState<StoredReferenceImage[]>([]);
   const [conversations, setConversations] = useState<ImageConversation[]>([]);
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
   const [isLoadingHistory, setIsLoadingHistory] = useState(true);
@@ -481,6 +494,11 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [lightboxImages, setLightboxImages] = useState<ImageLightboxItem[]>([]);
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [lightboxIndex, setLightboxIndex] = useState(0);
+  const [drawingDialog, setDrawingDialog] = useState<
+    | { mode: "sketch" }
+    | { mode: "annotate"; conversationId: string; image: StoredImage; source: string }
+    | null
+  >(null);
   const scrollToLatestBtnRef = useRef<HTMLButtonElement>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<
     | { type: "one"; id: string }
@@ -690,14 +708,21 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
     const loadImageModels = async () => {
       try {
-        const data = await fetchModels();
-        const available = filterImageModels(Array.isArray(data.data) ? data.data : []);
+        const catalog = await fetchImageModelCatalog();
+        const available = Array.from(new Set(catalog.models));
         if (cancelled || available.length === 0) {
           return;
         }
         setImageModels(available);
         const storedModel = typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_MODEL_STORAGE_KEY) : null;
+        const configuredDefaultModel = String(catalog.default_image_model || "").trim();
+        if (configuredDefaultModel && available.includes(configuredDefaultModel)) {
+          setGlobalImageModel(configuredDefaultModel);
+        }
         setImageModel((current) => {
+          if (configuredDefaultModel && available.includes(configuredDefaultModel)) {
+            return configuredDefaultModel;
+          }
           if (available.includes(current)) {
             return current;
           }
@@ -705,7 +730,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         });
       } catch {
         if (!cancelled) {
-          setImageModels(["gpt-image-2"]);
+          setImageModels(FALLBACK_IMAGE_MODELS);
         }
       }
     };
@@ -904,10 +929,37 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     [],
   );
 
+  useEffect(() => {
+    if (!selectedConversationId) return;
+    const conversation = conversationsRef.current.find((item) => item.id === selectedConversationId);
+    const conversationModel = conversation && imageModels.includes(conversation.model)
+      ? conversation.model
+      : imageModels[0];
+    if (conversationModel) {
+      setImageModel(conversationModel);
+    }
+  }, [imageModels, selectedConversationId]);
+
+  const handleConversationModelChange = useCallback(
+    async (model: ImageModel) => {
+      setImageModel(model);
+      if (!selectedConversationId) return;
+      await updateConversation(selectedConversationId, (current) => {
+        if (!current) {
+          throw new Error("图片对话不存在");
+        }
+        return { ...current, model, updatedAt: new Date().toISOString() };
+      });
+    },
+    [selectedConversationId, updateConversation],
+  );
+
   const clearComposerInputs = useCallback(() => {
     setImagePrompt("");
     setReferenceImageFiles([]);
     setReferenceImages([]);
+    setMaskFiles([]);
+    setMaskImages([]);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -922,11 +974,13 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     const btn = scrollToLatestBtnRef.current;
     if (btn) btn.style.display = "none";
     setSelectedConversationId(null);
+    setImageModel(globalImageModel);
     resetComposer();
     textareaRef.current?.focus();
   };
 
   const handleDeleteConversation = async (id: string) => {
+    const removedConversation = conversations.find((item) => item.id === id);
     const nextConversations = conversations.filter((item) => item.id !== id);
     conversationsRef.current = nextConversations;
     setConversations(nextConversations);
@@ -937,6 +991,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
     try {
       await deleteImageConversation(id);
+      await deleteCachedImageSources(getConversationResultSources(removedConversation));
     } catch (error) {
       const message = error instanceof Error ? error.message : "删除会话失败";
       toast.error(message);
@@ -951,6 +1006,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     if (!conversation) {
       return;
     }
+    const removedSources = part === "results"
+      ? getTurnResultSources(conversation.turns.find((turn) => turn.id === turnId))
+      : [];
 
     const turns = conversation.turns
       .map((turn) => {
@@ -991,11 +1049,15 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       turns,
     };
     await persistConversation(nextConversation);
+    if (removedSources.length > 0) {
+      await deleteCachedImageSources(removedSources);
+    }
   };
 
   const handleClearHistory = async () => {
     try {
       await clearImageConversations();
+      await clearCachedImages().catch(() => undefined);
       conversationsRef.current = [];
       setConversations([]);
       setSelectedConversationId(null);
@@ -1101,6 +1163,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       return next;
     });
     setReferenceImages((prev) => prev.filter((_, currentIndex) => currentIndex !== index));
+    setMaskFiles([]);
+    setMaskImages([]);
   }, []);
 
   const handleContinueEdit = useCallback(
@@ -1121,6 +1185,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
         setReferenceImages((prev) => [...prev, nextReference.referenceImage]);
         setReferenceImageFiles((prev) => [...prev, nextReference.file]);
+        setMaskFiles([]);
+        setMaskImages([]);
         setImagePrompt("");
         textareaRef.current?.focus();
         toast.success("已加入当前参考图，继续输入描述即可编辑");
@@ -1130,6 +1196,47 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       }
     },
     [],
+  );
+
+  const handleAnnotateImage = useCallback(
+    (conversationId: string, image: StoredImage, source: string) => {
+      setDrawingDialog({ mode: "annotate", conversationId, image, source });
+    },
+    [],
+  );
+
+  const handleApplyDrawing = useCallback(
+    async (file: File) => {
+      if (!drawingDialog) return;
+      const dataUrl = await readFileAsDataUrl(file);
+      const storedDrawing: StoredReferenceImage = { name: file.name, type: file.type || "image/png", dataUrl };
+
+      if (drawingDialog.mode === "sketch") {
+        setReferenceImageFiles((current) => [...current, file]);
+        setReferenceImages((current) => [...current, storedDrawing]);
+        setImagePrompt("");
+        textareaRef.current?.focus();
+        toast.success("草图已加入参考图，请描述希望生成的完整画面");
+        return;
+      }
+
+      const source = await buildReferenceImageFromStoredImage(
+        drawingDialog.image,
+        `annotated-source-${Date.now()}.png`,
+      );
+      if (!source) {
+        throw new Error("无法读取要标注编辑的图片");
+      }
+      setSelectedConversationId(drawingDialog.conversationId);
+      setReferenceImageFiles([source.file]);
+      setReferenceImages([source.referenceImage]);
+      setMaskFiles([file]);
+      setMaskImages([storedDrawing]);
+      setImagePrompt("");
+      textareaRef.current?.focus();
+      toast.success("标注区域已应用，请描述需要如何修改");
+    },
+    [drawingDialog],
   );
 
   const handleReuseTurnConfig = useCallback(async (conversationId: string, turnId: string) => {
@@ -1150,15 +1257,22 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     setImageQuality(turn.quality);
     setImageModel(turn.model);
     setReferenceImages(turn.referenceImages);
+    setMaskImages(turn.maskImages);
     setReferenceImageFiles(
       turn.referenceImages.map((image) => dataUrlToFile(image.dataUrl, image.name, image.type)),
     );
+    setMaskFiles(turn.maskImages.map((image) => dataUrlToFile(image.dataUrl, image.name, image.type)));
+    await updateConversation(conversationId, (current) => ({
+      ...(current ?? conversation),
+      model: turn.model,
+      updatedAt: new Date().toISOString(),
+    }));
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
     textareaRef.current?.focus();
     toast.success("已复用这条提示词配置");
-  }, []);
+  }, [updateConversation]);
 
   const openLightbox = useCallback((images: ImageLightboxItem[], index: number) => {
     if (images.length === 0) {
@@ -1231,6 +1345,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         const referenceFiles = activeTurn.referenceImages.map((image, index) =>
           dataUrlToFile(image.dataUrl, image.name || `${activeTurn.id}-${index + 1}.png`, image.type),
         );
+        const activeMaskFiles = activeTurn.maskImages.map((image, index) =>
+          dataUrlToFile(image.dataUrl, image.name || `${activeTurn.id}-mask-${index + 1}.png`, image.type),
+        );
         if (activeTurn.mode === "edit" && referenceFiles.length === 0) {
           throw new Error("未找到可用于继续编辑的参考图");
         }
@@ -1240,7 +1357,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
           pendingImages.map((image) => {
             const taskId = image.taskId || image.id;
             return activeTurn.mode === "edit"
-              ? createImageEditTask(taskId, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality)
+              ? createImageEditTask(taskId, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeMaskFiles)
               : createImageGenerationTask(taskId, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality);
           }),
         );
@@ -1292,7 +1409,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
               const resubmitted = await Promise.all(
                 missingImages.map((image) =>
                   activeTurn.mode === "edit"
-                    ? createImageEditTask(image.taskId || image.id, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality)
+                    ? createImageEditTask(image.taskId || image.id, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeMaskFiles)
                     : createImageGenerationTask(image.taskId || image.id, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality),
                 ),
               );
@@ -1368,6 +1485,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         model: sourceTurn.model,
         mode: sourceTurn.mode,
         referenceImages: sourceTurn.referenceImages,
+        maskImages: sourceTurn.maskImages,
         count,
         size: sourceTurn.size,
         ratio: sourceTurn.ratio,
@@ -1397,6 +1515,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       if (!conversation) {
         return;
       }
+      const replacedImage = conversation.turns
+        .find((turn) => turn.id === turnId)
+        ?.images.find((image) => image.id === imageId);
 
       const now = new Date().toISOString();
       const retryImageId = `${turnId}-${createId()}`;
@@ -1431,6 +1552,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
       setSelectedConversationId(conversationId);
       await persistConversation(nextConversation);
+      await deleteCachedImageSources([replacedImage?.url]);
       void runConversationQueue(conversationId);
     },
     [runConversationQueue],
@@ -1563,9 +1685,10 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     const draftTurn: ImageTurn = {
       id: turnId,
       prompt,
-      model: imageModel,
+      model: targetConversation?.model || imageModel,
       mode: effectiveImageMode,
       referenceImages: effectiveImageMode === "edit" ? referenceImages : [],
+      maskImages: effectiveImageMode === "edit" ? maskImages : [],
       count: parsedCount,
       size: imageSize,
       ratio: imageRatio,
@@ -1579,12 +1702,14 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     const baseConversation: ImageConversation = targetConversation
       ? {
           ...targetConversation,
+          model: targetConversation.model || imageModel,
           updatedAt: now,
           turns: [...targetConversation.turns, draftTurn],
         }
       : {
           id: conversationId,
           title: buildConversationTitle(prompt),
+          model: imageModel,
           createdAt: now,
           updatedAt: now,
           turns: [draftTurn],
@@ -1695,6 +1820,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
                 selectedConversation={selectedConversation}
                 onOpenLightbox={openLightbox}
                 onContinueEdit={handleContinueEdit}
+                onAnnotateImage={handleAnnotateImage}
                 onDeletePrompt={openDeletePromptConfirm}
                 onDeleteResults={openDeleteResultsConfirm}
                 onReuseTurnConfig={handleReuseTurnConfig}
@@ -1732,6 +1858,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             availableQuota={availableQuota}
             activeTaskCount={activeTaskCount}
             referenceImages={referenceImages}
+            maskImages={maskImages}
             textareaRef={textareaRef}
             fileInputRef={fileInputRef}
             onPromptChange={setImagePrompt}
@@ -1741,11 +1868,12 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             onImageWidthChange={setImageWidth}
             onImageHeightChange={setImageHeight}
             onImageQualityChange={setImageQuality}
-            onImageModelChange={setImageModel}
+            onImageModelChange={(model) => void handleConversationModelChange(model)}
             onSubmit={handleSubmit}
             onPickReferenceImage={() => fileInputRef.current?.click()}
             onReferenceImageChange={handleReferenceImageChange}
             onRemoveReferenceImage={handleRemoveReferenceImage}
+            onOpenSketch={() => setDrawingDialog({ mode: "sketch" })}
           />
         </div>
       </section>
@@ -1756,6 +1884,16 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         open={lightboxOpen}
         onOpenChange={setLightboxOpen}
         onIndexChange={setLightboxIndex}
+      />
+
+      <ImageDrawingDialog
+        mode={drawingDialog?.mode || "sketch"}
+        open={drawingDialog !== null}
+        source={drawingDialog?.mode === "annotate" ? drawingDialog.source : undefined}
+        onOpenChange={(open) => {
+          if (!open) setDrawingDialog(null);
+        }}
+        onApply={handleApplyDrawing}
       />
 
       {deleteConfirm ? (

@@ -39,6 +39,9 @@
   "global_system_prompt": "",
   "default_upstream_model_name": "gpt-5-5",
   "default_thinking_effort": "auto",
+  "strip_ui_markup": true,
+  "stream_variant_policy": "extend",
+  "upstream_variant_purpose": "comparison_implicit",
   "ai_review": {
     "enabled": false,
     "base_url": "",
@@ -70,6 +73,7 @@
     }
   },
   "image_account_concurrency": 3,
+  "default_image_model": "gpt-image-2",
   "image_parallel_generation": true,
   "image_poll_interval_secs": 10,
   "image_poll_initial_wait_secs": 10,

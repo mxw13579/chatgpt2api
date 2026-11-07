@@ -14,16 +14,24 @@ import tiktoken
 from services.account_service import account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
-from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+from services.openai_backend_api import (
+    ImageContentPolicyError,
+    ImagePollTimeoutError,
+    ImageStreamHardTimeoutError,
+    OpenAIBackendAPI,
+    TEXT_STREAM_TIMEOUT_SECS,
+)
 from utils.helper import (
-    IMAGE_MODELS,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
     split_image_model,
+    supported_image_models,
+    UpstreamHTTPError,
 )
 from utils.image_tokens import count_image_content_tokens
 from utils.log import logger
+from utils.ui_markup import strip_ui_markup
 
 
 class ImageGenerationError(Exception):
@@ -89,6 +97,8 @@ def is_tls_connection_error(message: str) -> bool:
         or "connection aborted" in text
         or "remote disconnected" in text
         or "connection reset by peer" in text
+        or "curl: (92)" in text
+        or ("http/2 stream" in text and "internal_error" in text)
     )
 
 
@@ -113,6 +123,41 @@ def image_stream_error_message(message: str) -> str:
     if is_connection_timeout_error(text):
         return "upstream connection timed out, please retry later"
     return text or "image generation failed"
+
+
+def is_image_concurrency_error(error: BaseException) -> bool:
+    """识别文件服务返回的账号级并发限流错误。"""
+    if not isinstance(error, UpstreamHTTPError) or error.status_code not in {429, 503}:
+        return False
+    body = error.body
+    try:
+        body_text = json.dumps(body, ensure_ascii=False) if isinstance(body, (dict, list)) else str(body)
+    except (TypeError, ValueError):
+        body_text = repr(body)
+    text = body_text.lower()
+    return "concurrency_limit" in text or "too many concurrent" in text or "throttled" in text
+
+
+def _image_remaining_timeout_secs(backend: object) -> float:
+    deadline = getattr(backend, "image_request_deadline", None)
+    if deadline is not None:
+        try:
+            return max(0.0, float(deadline) - time.monotonic())
+        except (TypeError, ValueError):
+            pass
+    return float(config.image_poll_timeout_secs)
+
+
+def _sleep_image_retry(backend: object, seconds: float) -> None:
+    sleep_for = min(max(0.0, seconds), _image_remaining_timeout_secs(backend))
+    if sleep_for > 0:
+        time.sleep(sleep_for)
+
+
+def _sleep_until_deadline(deadline: float, seconds: float) -> None:
+    sleep_for = min(max(0.0, seconds), max(0.0, deadline - time.monotonic()))
+    if sleep_for > 0:
+        time.sleep(sleep_for)
 
 
 REFERENCED_IMAGE_IDS_RE = re.compile(r'"referenced_image_ids"\s*:\s*\[([^\]]+)\]')
@@ -166,39 +211,52 @@ def message_text(content: Any) -> str:
     return ""
 
 
+def needs_global_system(messages: list[dict[str, Any]]) -> bool:
+    """normalize_messages also runs inside conversation_events, on messages the protocol
+    layer already normalized. Adding the global system prompt a second time sends the same
+    system turn twice, which models tend to mirror back as duplicated instructions."""
+    prompt = str(config.global_system_prompt or "")
+    if not prompt:
+        return False
+    if not messages:
+        return True
+    first = messages[0]
+    if str(first.get("role") or "") != "system":
+        return True
+    return message_text(first.get("content")) != prompt
+
+
 def normalize_messages(messages: object, system: Any = None) -> list[dict[str, Any]]:
+    source = [message for message in messages if isinstance(message, dict)] if isinstance(messages, list) else []
     normalized = []
-    if config.global_system_prompt:
+    if needs_global_system(source):
         normalized.append({"role": "system", "content": config.global_system_prompt})
     system_text = message_text(system)
     if system_text:
         normalized.append({"role": "system", "content": system_text})
-    if isinstance(messages, list):
-        for message in messages:
-            if not isinstance(message, dict):
-                continue
-            role = message.get("role", "user")
-            content = message.get("content", "")
-            text = message_text(content)
-            images: list[tuple[bytes, str]] = []
-            if role == "user":
-                images.extend(extract_image_from_message_content(content))
-                if isinstance(content, list):
-                    for part in content:
-                        if not isinstance(part, dict) or part.get("type") != "image":
-                            continue
-                        data = part.get("data")
-                        if isinstance(data, (bytes, bytearray)) and all(existing[0] != bytes(data) for existing in images):
-                            images.append((bytes(data), str(part.get("mime") or "image/png")))
-            if images:
-                parts: list[Any] = []
-                if text:
-                    parts.append({"type": "text", "text": text})
-                for data, mime in images:
-                    parts.append({"type": "image", "data": data, "mime": mime})
-                normalized.append({"role": role, "content": parts})
-            else:
-                normalized.append({"role": role, "content": text})
+    for message in source:
+        role = message.get("role", "user")
+        content = message.get("content", "")
+        text = message_text(content)
+        images: list[tuple[bytes, str]] = []
+        if role == "user":
+            images.extend(extract_image_from_message_content(content))
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict) or part.get("type") != "image":
+                        continue
+                    data = part.get("data")
+                    if isinstance(data, (bytes, bytearray)) and all(existing[0] != bytes(data) for existing in images):
+                        images.append((bytes(data), str(part.get("mime") or "image/png")))
+        if images:
+            parts: list[Any] = []
+            if text:
+                parts.append({"type": "text", "text": text})
+            for data, mime in images:
+                parts.append({"type": "image", "data": data, "mime": mime})
+            normalized.append({"role": role, "content": parts})
+        else:
+            normalized.append({"role": role, "content": text})
     return normalized
 
 
@@ -311,14 +369,35 @@ class ConversationRequest:
 
 @dataclass
 class ConversationState:
+    # `text` follows what the client has actually received: deltas are append-only, so it
+    # only ever grows, even when upstream rewrites what it is generating.
     text: str = ""
-    raw_text: str = ""
     conversation_id: str = ""
     file_ids: list[str] = field(default_factory=list)
     sediment_ids: list[str] = field(default_factory=list)
     blocked: bool = False
     tool_invoked: bool | None = None
     turn_use_case: str = ""
+
+
+@dataclass
+class MessageStream:
+    """上游单条 assistant 消息的快照状态。
+
+    同一条消息的后续事件只会把文本变长，所以「新增部分 = 新快照减去旧快照」是精确的；
+    只有消息被改写、或者换了另一条消息时，才需要和已发文本做对齐。
+
+    `shadow` 用于并行变体：上游可能为同一轮同时生成两条内容几乎相同的消息（见
+    `variant_purpose`）。本轮一旦锁定主消息，其余 id 整条忽略，否则两份答案会交替追加
+    进同一个输出里。
+    """
+
+    message_id: str = ""
+    raw: str = ""
+    text: str = ""
+    tail_confirmed: bool = False
+    shadow: bool = False
+    finished: bool = False
 
 
 @dataclass
@@ -415,6 +494,136 @@ def strip_history(text: str, history_text: str = "") -> str:
     return text
 
 
+def common_prefix_length(left: str, right: str) -> int:
+    limit = min(len(left), len(right))
+    index = 0
+    while index < limit and left[index] == right[index]:
+        index += 1
+    return index
+
+
+MIN_CONTAINED_LENGTH = 4
+ANCHOR_PROBE_SIZES = (64, 32, 16, 8)
+VARIANT_SWITCH_MARGIN = 32
+
+
+def locate_snapshot_anchor(emitted: str, snapshot: str) -> int | None:
+    """在已发文本里找快照开头的位置，用于对齐上游「重来」的那一段。"""
+    for size in ANCHOR_PROBE_SIZES:
+        if len(snapshot) < size:
+            continue
+        position = emitted.rfind(snapshot[:size])
+        if position >= 0:
+            return position
+    return None
+
+
+def emitted_prefix_length(emitted: str, snapshot: str) -> int:
+    """How much of `snapshot`'s head the client has already received.
+
+    Deltas are append-only, so anything the client already has must never be sent again.
+    Upstream repeats text in three shapes, all of which show up as a snapshot that is not a
+    plain extension of what was streamed:
+
+    * the whole answer restarts from the greeting (regeneration / parallel variant),
+    * the answer restarts at a section that was already streamed (`## 二、...`),
+    * the earlier text is rewritten by sanitize_output_text, e.g. a collapsed space.
+
+    The snapshot is compared with its leading whitespace removed: the first snapshot of a
+    retake is often glued to the previous sentence while every later one starts with blank
+    lines, and a byte-exact comparison made all of them look like brand new text. When the
+    snapshot starts earlier than the end of the emitted text, the head is located inside it
+    instead of only at the tail, which is what a section retake looks like.
+    """
+    if not snapshot:
+        return 0
+    stripped = snapshot.lstrip()
+    if not stripped:
+        # Only whitespace: let it through as the separator it is.
+        return 0
+    lead = len(snapshot) - len(stripped)
+    body = stripped.rstrip()
+
+    if len(body) >= MIN_CONTAINED_LENGTH and body in emitted:
+        return len(snapshot)
+
+    prefix = common_prefix_length(emitted, stripped)
+    if prefix >= len(emitted) or prefix >= len(stripped):
+        # 正常续写，或者快照本身就是已发文本的前缀。
+        return min(len(snapshot), lead + prefix)
+
+    # 上游从更早的位置重来：先在已发文本里定位快照开头，再按该位置算重叠长度。
+    covered = prefix
+    anchor = locate_snapshot_anchor(emitted, stripped)
+    if anchor is not None:
+        covered = max(covered, common_prefix_length(emitted[anchor:], stripped))
+    if covered <= 0:
+        return 0
+    return lead + covered
+
+
+def log_stream_join(state: ConversationState, stream: MessageStream, snapshot: str,
+                    emitted: str, covered: int) -> None:
+    """记录一次「新快照需要对已发文本做对齐」的拼接。
+
+    单条消息从头流到尾只会在这里记一条（新消息的第一份快照）；如果同一条消息反复出现，
+    说明上游在改写已经生成过的内容，日志里的 covered 就是两边的实际重合长度。
+    """
+    payload = {
+        "event": "stream_text_join",
+        "diverged": bool(stream.text),
+        "message_id": stream.message_id,
+        "conversation_id": state.conversation_id,
+        "snapshot_length": len(snapshot),
+        "emitted_length": len(emitted),
+        "covered_length": covered,
+        "appended_length": max(0, len(snapshot) - covered),
+    }
+    try:
+        if stream.text:
+            logger.info(payload)
+        else:
+            logger.debug(payload)
+    except Exception:
+        pass
+
+
+def log_stream_switch(state: ConversationState, previous: MessageStream,
+                      current: MessageStream, emitted_length: int) -> None:
+    """记录一次「换一条消息继续输出」。
+
+    `extend` 策略下，当前跟的那条停滞、另一条明显更长时切换过去；只补长度差额，
+    所以既不会重复发送，也不会把后到的那份内容丢掉。
+    """
+    try:
+        logger.info({
+            "event": "stream_text_variant_switch",
+            "conversation_id": state.conversation_id,
+            "from_message_id": previous.message_id,
+            "to_message_id": current.message_id,
+            "from_length": len(previous.text),
+            "to_length": len(current.text),
+            "emitted_length": emitted_length,
+        })
+    except Exception:
+        pass
+
+
+def log_stream_variant(state: ConversationState, stream: MessageStream,
+                       snapshot: str, emitted: str) -> None:
+    """记录一条被忽略的并行变体。上游 `variant_purpose=comparison_implicit` 会同时生成两条。"""
+    try:
+        logger.info({
+            "event": "stream_text_variant_shadowed",
+            "message_id": stream.message_id,
+            "conversation_id": state.conversation_id,
+            "snapshot_length": len(snapshot),
+            "emitted_length": len(emitted),
+        })
+    except Exception:
+        pass
+
+
 def sanitize_output_text(text: str) -> str:
     text = str(text or "")
 
@@ -464,6 +673,9 @@ def sanitize_output_text(text: str) -> str:
     text = re.sub(r"(\s*)\ue200([^\ue201]*)\ue201(?=[.,;:!?])", replace_annotation_before_punctuation, text)
     text = re.sub(r"\ue200([^\ue201]*)\ue201", replace_annotation, text)
     text = re.sub(r"\ue200[^\ue201]*$", "", text)
+    text = re.sub(r"\s+([.,;:!?])", r"\1", text)
+    if config.strip_ui_markup:
+        text = strip_ui_markup(text)
     return text
 
 
@@ -492,6 +704,40 @@ def event_assistant_text(event: dict[str, Any], history_text: str = "") -> str:
         if isinstance(message, dict) and is_visible_assistant_message(message):
             return strip_history(assistant_message_text(message), history_text)
     return ""
+
+
+def event_assistant_message_id(event: dict[str, Any]) -> str:
+    for candidate in (event, event.get("v")):
+        if not isinstance(candidate, dict):
+            continue
+        message = candidate.get("message")
+        if not isinstance(message, dict):
+            continue
+        if str((message.get("author") or {}).get("role") or "").strip().lower() != "assistant":
+            continue
+        return str(message.get("id") or message.get("message_id") or "")
+    return ""
+
+
+def finished_message_id(event: dict[str, Any]) -> str | None:
+    """上游标记「这条消息写完了」时返回它的 id（空串表示归属当前消息），否则返回 None。
+
+    上游写完一条消息后会长时间保持连接（并行变体时尤其明显），只等 `[DONE]` 会让客户端
+    在答案已经完整之后还干等，所以这里把完成信号拿出来用于主动收尾。
+    """
+    for candidate in (event, event.get("v")):
+        if not isinstance(candidate, dict):
+            continue
+        message = candidate.get("message")
+        if not isinstance(message, dict):
+            continue
+        if str((message.get("author") or {}).get("role") or "").strip().lower() != "assistant":
+            continue
+        if str(message.get("status") or "") == "finished_successfully" or message.get("end_turn") is True:
+            return str(message.get("id") or message.get("message_id") or "")
+    if event.get("p") == "/message/status" and event.get("v") == "finished_successfully":
+        return ""
+    return None
 
 
 def apply_text_patch(event: dict[str, Any], current_text: str = "", history_text: str = "") -> str:
@@ -643,10 +889,15 @@ def conversation_base_event(event_type: str, state: ConversationState, **extra: 
 
 
 def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
-                               history_messages: list[str] | None = None) -> Iterator[dict[str, Any]]:
+                               history_messages: list[str] | None = None,
+                               stop_on_finish: bool = False) -> Iterator[dict[str, Any]]:
     state = ConversationState()
     history_messages = history_messages or []
     history_index = 0
+    streams: dict[str, MessageStream] = {}
+    current_message = ""
+    primary_message: str | None = None
+    leader_message: str | None = None
     for payload in payloads:
         # print(f"[upstream_sse] {payload}", flush=True)
         if not payload:
@@ -666,18 +917,85 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
         update_conversation_state(state, payload, event)
         if history_index < len(history_messages) and event_assistant_text(event, history_text) == history_messages[history_index]:
             history_index += 1
-            state.raw_text = ""
+            streams.clear()
+            current_message = ""
+            primary_message = None
+            leader_message = None
             state.text = ""
             continue
-        next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
+        message_id = event_assistant_message_id(event)
+        if message_id:
+            current_message = message_id
+        stream_key = current_message
+        stream = streams.get(stream_key)
+        if stream is None:
+            stream = MessageStream(message_id=stream_key)
+            streams[stream_key] = stream
+        next_raw_text = assistant_raw_text(event, stream.raw, history_text)
         next_text = sanitize_output_text(next_raw_text)
-        state.raw_text = next_raw_text
-        if next_text != state.text:
-            delta = next_text[len(state.text):] if next_text.startswith(state.text) else next_text
-            state.text = next_text
+        stream.raw = next_raw_text
+        finished_id = finished_message_id(event)
+        if finished_id is not None:
+            finished_stream = streams.get(finished_id or stream_key)
+            if finished_stream is not None:
+                finished_stream.finished = True
+
+        delta = ""
+        if not stream.shadow and next_text != stream.text:
+            previous_text = stream.text
+            stream.text = next_text
+            emitted_text = state.text
+            policy = config.stream_variant_policy
+            skip = False
+            if policy == "follow_first" and primary_message is not None and stream_key != primary_message:
+                # 本轮已锁定一条消息，其他 id 是并行变体：整条忽略。
+                stream.shadow = True
+                log_stream_variant(state, stream, next_text, emitted_text)
+                skip = True
+            elif policy == "extend" and leader_message is not None and stream_key != leader_message:
+                leader = streams.get(leader_message)
+                if leader is None or len(next_text) <= len(leader.text) + VARIANT_SWITCH_MARGIN:
+                    # 明显落后于当前跟的那条，先不发；等它真的更长再切过去。
+                    skip = True
+                else:
+                    log_stream_switch(state, leader, stream, len(emitted_text))
+                    leader_message = stream_key
+
+            if not skip:
+                if policy == "extend":
+                    # 只补「已发长度」之后的差额：并行两条消息时既不会重复，也不会把后到的那份丢掉。
+                    delta = next_text[len(emitted_text):] if len(next_text) > len(emitted_text) else ""
+                elif stream.tail_confirmed and next_text.startswith(previous_text):
+                    # 同一条消息在变长，而且客户端当前的结尾正是这条消息上一次的快照：
+                    # 快照之间的前缀关系是协议保证的，直接取差额即可。
+                    delta = next_text[len(previous_text):]
+                else:
+                    # 换了消息、这条消息被改写、或者上一次的内容并不是由这条消息追加的：
+                    # 只发客户端还没有的部分。
+                    covered = emitted_prefix_length(emitted_text, next_text)
+                    delta = next_text[covered:]
+                    log_stream_join(state, stream, next_text, emitted_text, covered)
+
+                if delta:
+                    if policy == "extend" and leader_message is None:
+                        leader_message = stream_key
+                    if policy == "follow_first" and primary_message is None:
+                        # 第一条真正产出内容的消息就是本轮的主消息。
+                        primary_message = stream_key
+                    state.text = emitted_text + delta
+                stream.tail_confirmed = state.text.endswith(next_text)
+
+        if delta:
             yield conversation_base_event("conversation.delta", state, raw=event, delta=delta)
-            continue
-        yield conversation_base_event("conversation.event", state, raw=event)
+        else:
+            yield conversation_base_event("conversation.event", state, raw=event)
+
+        if stop_on_finish and streams and all(
+            item.finished for item in streams.values() if not item.shadow
+        ):
+            # 上游已经把这条（或这些）消息标记为完成，不必再等它关连接。
+            yield conversation_base_event("conversation.done", state, done=True)
+            break
 
 
 def conversation_events(
@@ -703,7 +1021,9 @@ def conversation_events(
         system_hints=["picture_v2"] if image_model else None,
         thinking_effort=thinking_effort if not image_model else "",
     )
-    yield from iter_conversation_payloads(payloads, history_text, history_messages)
+    yield from iter_conversation_payloads(
+        payloads, history_text, history_messages, stop_on_finish=not image_model
+    )
 
 
 def text_backend(model: str = "auto") -> OpenAIBackendAPI:
@@ -714,47 +1034,76 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "")
     emitted = False
-    while True:
-        if token and token in attempted_tokens:
-            raise RuntimeError("no available text account")
-        if token:
-            attempted_tokens.add(token)
-        active_backend = None
-        try:
-            active_backend = OpenAIBackendAPI(access_token=token)
-            for event in conversation_events(
-                active_backend,
-                messages=request.messages,
-                model=request.model,
-                prompt=request.prompt,
-                thinking_effort=request.thinking_effort,
-            ):
-                if event.get("type") != "conversation.delta":
-                    continue
-                delta = str(event.get("delta") or "")
-                if delta:
-                    emitted = True
-                    yield delta
-            account_service.mark_text_used(token)
-            return
-        except Exception as exc:
-            error_message = str(exc)
-            if token and not emitted and is_token_invalid_error(error_message):
-                refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
-                if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
-                    token = refreshed_token
-                else:
-                    account_service.remove_invalid_token(token, "text_stream")
-                    token = account_service.get_text_access_token(
-                        excluded_tokens=set(attempted_tokens),
-                        model=request.model,
-                    )
-                if token:
-                    continue
-            raise
-        finally:
-            if active_backend is not None:
-                active_backend.close()
+    started_at = time.monotonic()
+    last_delta_at = 0.0
+    delta_count = 0
+    had_deadline = hasattr(backend, "request_deadline")
+    previous_deadline = getattr(backend, "request_deadline", None)
+    try:
+        request_deadline = float(previous_deadline) if previous_deadline is not None else time.monotonic() + TEXT_STREAM_TIMEOUT_SECS
+    except (TypeError, ValueError):
+        request_deadline = time.monotonic() + TEXT_STREAM_TIMEOUT_SECS
+    backend.request_deadline = request_deadline
+    try:
+        while True:
+            if token and token in attempted_tokens:
+                raise RuntimeError("no available text account")
+            if token:
+                attempted_tokens.add(token)
+            active_backend = None
+            try:
+                active_backend = OpenAIBackendAPI(access_token=token)
+                active_backend.request_deadline = request_deadline
+                for event in conversation_events(
+                    active_backend,
+                    messages=request.messages,
+                    model=request.model,
+                    prompt=request.prompt,
+                    thinking_effort=request.thinking_effort,
+                ):
+                    if event.get("type") != "conversation.delta":
+                        continue
+                    delta = str(event.get("delta") or "")
+                    if delta:
+                        emitted = True
+                        delta_count += 1
+                        last_delta_at = time.monotonic()
+                        yield delta
+                account_service.mark_text_used(token)
+                return
+            except Exception as exc:
+                error_message = str(exc)
+                if token and not emitted and is_token_invalid_error(error_message):
+                    refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
+                    if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
+                        token = refreshed_token
+                    else:
+                        account_service.remove_invalid_token(token, "text_stream")
+                        token = account_service.get_text_access_token(
+                            excluded_tokens=set(attempted_tokens),
+                            model=request.model,
+                        )
+                    if token:
+                        continue
+                raise
+            finally:
+                if active_backend is not None:
+                    active_backend.close()
+    finally:
+        if emitted:
+            try:
+                logger.info({
+                    "event": "text_stream_metrics",
+                    "deltas": delta_count,
+                    "total_ms": int((time.monotonic() - started_at) * 1000),
+                    "tail_gap_ms": int((time.monotonic() - last_delta_at) * 1000) if last_delta_at else 0,
+                })
+            except Exception:
+                pass
+        if had_deadline:
+            backend.request_deadline = previous_deadline
+        elif hasattr(backend, "request_deadline"):
+            delattr(backend, "request_deadline")
 
 
 def collect_text(backend: OpenAIBackendAPI, request: ConversationRequest) -> str:
@@ -878,6 +1227,7 @@ def stream_image_outputs(
     file_ids = [str(item) for item in last.get("file_ids") or []]
     sediment_ids = [str(item) for item in last.get("sediment_ids") or []]
     message = str(last.get("text") or "").strip()
+    is_text_reply = bool(message and is_model_text_reply_instead_of_image(message))
     logger.info({
         "event": "image_stream_resolve_start",
         "conversation_id": conversation_id,
@@ -895,14 +1245,13 @@ def stream_image_outputs(
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=error_text, conversation_id=conversation_id)
         return
     should_poll_for_image = bool(request.images) or last.get("turn_use_case") == "image gen"
-    if message and not file_ids and not sediment_ids and not should_poll_for_image:
+    if message and not file_ids and not sediment_ids and not should_poll_for_image and not is_text_reply:
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
         return
 
     # 检测模型是否返回了文本描述（含 referenced_image_ids）而非实际生成图片
     # 这说明模型已发起图片生成工具调用，但 SSE 在工具完成前断开，
     # 图片可能正在异步生成中。需要使用更积极的轮询策略来获取结果。
-    is_text_reply = bool(message and is_model_text_reply_instead_of_image(message))
     if is_text_reply:
         logger.info({
             "event": "image_detected_text_reply_with_ids",
@@ -959,10 +1308,8 @@ def stream_image_outputs(
     # 当检测到文本回复（含 referenced_image_ids）时，使用更长的超时来轮询图片结果。
     # 因为上游可能将图片生成作为异步任务执行，SSE 流在工具完成前就断开了，
     # 导致对话文档中尚未写入图片工具的响应记录。
-    poll_timeout = config.image_poll_timeout_secs
+    poll_timeout = _image_remaining_timeout_secs(backend)
     if is_text_reply and conversation_id:
-        # 文本回复场景下图片可能仍在异步生成，使用更长超时（默认 120s → 额外 180s = 300s）
-        poll_timeout = max(poll_timeout, 300)
         logger.info({
             "event": "image_text_reply_extended_poll",
             "conversation_id": conversation_id,
@@ -1046,10 +1393,12 @@ def stream_image_outputs(
                 "message_preview": message[:200],
             })
             # 文本回复场景下，图片可能需要 4-5 分钟才能异步生成完成。
-            # 使用 300s 超时并允许多次重试，避免因临时网络问题提前退出。
-            retry_poll_timeout = max(config.image_poll_timeout_secs, 300)
+            # 使用配置的剩余总预算并允许短重试，避免因临时网络问题提前退出。
             MAX_POLL_RETRIES = 3
             for poll_attempt in range(1, MAX_POLL_RETRIES + 1):
+                retry_poll_timeout = _image_remaining_timeout_secs(backend)
+                if retry_poll_timeout <= 0:
+                    break
                 try:
                     polled_file_ids, polled_sediment_ids = backend._poll_image_results(
                         conversation_id,
@@ -1086,7 +1435,7 @@ def stream_image_outputs(
                             "poll_attempt": poll_attempt,
                             "backoff_secs": backoff,
                         })
-                        time.sleep(backoff)
+                        _sleep_image_retry(backend, backoff)
                         continue
                     # 超时错误或重试次数用尽，停止重试
                     break
@@ -1150,8 +1499,7 @@ def stream_image_outputs(
             })
     if should_poll_for_image and conversation_id:
         # 图片可能仍在异步处理中（上游 SSE 流在图片生成完成前就结束了）。
-        # 使用 300s 超时并允许多次重试，避免因临时网络问题或图片尚未提交而提前退出。
-        retry_poll_timeout = max(config.image_poll_timeout_secs, 300)
+        # 使用配置的剩余总预算并允许短重试，避免因临时网络问题或图片尚未提交而提前退出。
         MAX_FALLBACK_POLL_RETRIES = 3
         for poll_attempt in range(1, MAX_FALLBACK_POLL_RETRIES + 1):
             retry_wait_secs = min(30.0 * poll_attempt, config.image_poll_initial_wait_secs * poll_attempt)
@@ -1161,7 +1509,10 @@ def stream_image_outputs(
                 "retry_wait_secs": retry_wait_secs,
                 "poll_attempt": poll_attempt,
             })
-            time.sleep(retry_wait_secs)
+            _sleep_image_retry(backend, retry_wait_secs)
+            retry_poll_timeout = _image_remaining_timeout_secs(backend)
+            if retry_poll_timeout <= 0:
+                break
             try:
                 polled_file_ids, polled_sediment_ids = backend._poll_image_results(
                     conversation_id,
@@ -1198,7 +1549,7 @@ def stream_image_outputs(
                         "poll_attempt": poll_attempt,
                         "backoff_secs": backoff,
                     })
-                    time.sleep(backoff)
+                    _sleep_image_retry(backend, backoff)
                     continue
                 # 超时错误或重试次数用尽，停止重试
                 break
@@ -1305,14 +1656,25 @@ def _generate_single_image(
     MAX_CONN_TIMEOUT_RETRIES = 3
     # 轮询超时错误最大重试次数（换账号重试）
     MAX_POLL_TIMEOUT_RETRIES = 4
+    # 文件服务并发限流最大重试次数（换账号重试）
+    MAX_CONCURRENCY_RETRIES = 3
 
     text_reply_retry_count = 0
     tls_retry_count = 0
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
+    concurrency_retry_count = 0
     account_email = ""
+    request_deadline = time.monotonic() + float(config.image_poll_timeout_secs)
 
     while True:
+        remaining_before_attempt = request_deadline - time.monotonic()
+        if remaining_before_attempt <= 0:
+            raise ImagePollTimeoutError(
+                f"ChatGPT 生图超时（已等待 {config.image_poll_timeout_secs} 秒）。"
+                f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
+                f"也可能是账号被限流或生图队列拥堵导致。"
+            )
         try:
             if request.progress_callback:
                 request.progress_callback("getting_account")
@@ -1341,6 +1703,7 @@ def _generate_single_image(
         backend = None
         try:
             backend = OpenAIBackendAPI(access_token=token)
+            backend.image_request_deadline = request_deadline
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
@@ -1395,7 +1758,7 @@ def _generate_single_image(
             # 轮询超时：换账号重试
             if not emitted_for_token:
                 poll_timeout_retry_count += 1
-                if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
+                if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES and request_deadline > time.monotonic():
                     logger.warning({
                         "event": "image_poll_timeout_retry",
                         "request_token": token,
@@ -1474,7 +1837,10 @@ def _generate_single_image(
             })
             raise
         except Exception as exc:
-            account_service.mark_image_result(token, False)
+            cooldown_secs = float(config.image_timeout_retry_secs) if (
+                isinstance(exc, ImageStreamHardTimeoutError) or is_image_concurrency_error(exc)
+            ) else 0.0
+            account_service.mark_image_result(token, False, cooldown_secs=cooldown_secs)
             last_error = str(exc)
             logger.warning({
                 "event": "image_stream_fail",
@@ -1483,6 +1849,21 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
+            if not emitted_for_token and is_image_concurrency_error(exc):
+                concurrency_retry_count += 1
+                if concurrency_retry_count <= MAX_CONCURRENCY_RETRIES and request_deadline > time.monotonic():
+                    wait_secs = min(float(config.image_timeout_retry_secs), 10.0)
+                    logger.warning({
+                        "event": "image_stream_concurrency_retry",
+                        "request_token": token,
+                        "account_email": account_email,
+                        "retry_count": concurrency_retry_count,
+                        "index": index,
+                        "wait_secs": wait_secs,
+                        "error": last_error[:300],
+                    })
+                    _sleep_until_deadline(request_deadline, wait_secs)
+                    continue
             if not emitted_for_token and is_token_invalid_error(last_error):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:
@@ -1493,21 +1874,23 @@ def _generate_single_image(
             # TLS/SSL 连接错误：自动重试
             if not emitted_for_token and is_tls_connection_error(last_error):
                 tls_retry_count += 1
-                if tls_retry_count <= MAX_TLS_RETRIES:
+                if tls_retry_count <= MAX_TLS_RETRIES and request_deadline > time.monotonic():
+                    wait_secs = min(2.0 * tls_retry_count, 10.0)
                     logger.warning({
                         "event": "image_stream_tls_retry",
                         "request_token": token,
                         "account_email": account_email,
                         "retry_count": tls_retry_count,
                         "index": index,
+                        "wait_secs": wait_secs,
                         "error": last_error[:200],
                     })
-                    time.sleep(min(2.0 * tls_retry_count, 10.0))
+                    _sleep_until_deadline(request_deadline, wait_secs)
                     continue
             # 连接超时错误（curl 28）：同账号短等待重试，不切换账号
             if not emitted_for_token and is_connection_timeout_error(last_error):
                 conn_timeout_retry_count += 1
-                if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
+                if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES and request_deadline > time.monotonic():
                     wait_secs = min(3.0 * conn_timeout_retry_count, 9.0)
                     logger.warning({
                         "event": "image_stream_conn_timeout_retry",
@@ -1518,7 +1901,7 @@ def _generate_single_image(
                         "wait_secs": wait_secs,
                         "error": last_error[:200],
                     })
-                    time.sleep(wait_secs)
+                    _sleep_until_deadline(request_deadline, wait_secs)
                     continue
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
         finally:
@@ -1529,7 +1912,7 @@ def _generate_single_image(
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
     """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
     if not is_supported_image_model(request.model):
-        raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
+        raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(supported_image_models())))
 
     if request.n <= 1:
         # 单张图片，直接执行（无需线程池开销）

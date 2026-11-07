@@ -82,6 +82,18 @@ DEFAULT_THIRD_PARTY_APPS = {
     },
 }
 
+DEFAULT_IMAGE_MODELS = [
+    "gpt-image-2.6-sunburst",
+    "gpt-image-2.6-flare",
+    "gpt-image-2.5-sunburst",
+    "gpt-image-2.5-flare",
+    "gpt-image-2",
+    "gpt-5-5-thinking",
+    "gpt-5-5",
+    "gpt-5-3",
+]
+DEFAULT_IMAGE_MODEL = "gpt-image-2"
+
 
 def _normalize_bool(value: object, default: bool = False) -> bool:
     if isinstance(value, str):
@@ -102,6 +114,36 @@ def _normalize_positive_int(value: object, default: int, minimum: int = 0) -> in
     except (OverflowError, TypeError, ValueError):
         normalized = default
     return max(minimum, normalized)
+
+
+def _model_entries(value: object) -> list[object]:
+    if isinstance(value, str):
+        return value.replace(",", "\n").splitlines()
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return []
+
+
+def _normalize_image_model_list(value: object) -> list[str]:
+    normalized: list[str] = []
+    for item in _model_entries(value):
+        model = str(item or "").strip().lower()
+        if model and model not in normalized:
+            normalized.append(model)
+    return normalized
+
+
+def _normalize_custom_image_models(value: object) -> list[str]:
+    builtin = set(DEFAULT_IMAGE_MODELS)
+    return [model for model in _normalize_image_model_list(value) if model not in builtin]
+
+
+def _image_models_with_cache(cache: object, legacy_custom_models: object = None) -> list[str]:
+    cached = _normalize_image_model_list(cache)
+    if cached:
+        return _normalize_image_model_list([*DEFAULT_IMAGE_MODELS, *cached])
+    legacy = _normalize_custom_image_models(legacy_custom_models)
+    return list(DEFAULT_IMAGE_MODELS) + legacy
 
 
 def _normalize_backup_include(value: object) -> dict[str, bool]:
@@ -416,11 +458,45 @@ class ConfigStore:
             return 10.0
 
     @property
+    def image_timeout_retry_secs(self) -> int:
+        try:
+            return max(1, int(self.data.get("image_timeout_retry_secs", 30)))
+        except (TypeError, ValueError):
+            return 30
+
+    @property
     def image_account_concurrency(self) -> int:
         try:
             return max(1, int(self.data.get("image_account_concurrency", 3)))
         except (TypeError, ValueError):
             return 3
+
+    @property
+    def custom_image_models(self) -> list[str]:
+        """兼容旧配置；新版本由自动拉取的 image_models_cache 管理模型列表。"""
+        return _normalize_custom_image_models(self.data.get("custom_image_models"))
+
+    @property
+    def image_models(self) -> list[str]:
+        return _image_models_with_cache(
+            self.data.get("image_models_cache"),
+            self.data.get("custom_image_models"),
+        )
+
+    @property
+    def image_models_source(self) -> str:
+        if _normalize_image_model_list(self.data.get("image_models_cache")):
+            return str(self.data.get("image_models_source") or "upstream").strip() or "upstream"
+        return "fallback"
+
+    @property
+    def image_models_updated_at(self) -> str:
+        return str(self.data.get("image_models_updated_at") or "").strip()
+
+    @property
+    def default_image_model(self) -> str:
+        model = str(self.data.get("default_image_model") or DEFAULT_IMAGE_MODEL).strip().lower()
+        return model if model in self.image_models else DEFAULT_IMAGE_MODEL
 
     @property
     def image_parallel_generation(self) -> bool:
@@ -472,6 +548,37 @@ class ConfigStore:
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
+
+    @property
+    def strip_ui_markup(self) -> bool:
+        """把上游的组件标记（<box>/<row>/<AsyncImage> 等）降级为 Markdown。"""
+        value = self.data.get("strip_ui_markup", True)
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off"}
+        return bool(value)
+
+    @property
+    def stream_variant_policy(self) -> str:
+        """上游并行生成多条消息时的处理策略。
+
+        - `extend`：只补「已发长度」之后的差额，两条消息的内容都不丢（默认）
+        - `follow_first`：本轮只跟第一条消息，其余整条忽略（绝不重复，但可能被截断）
+        - `merge`：和已发文本做内容对齐拼接（可能重复）
+        """
+        value = str(self.data.get("stream_variant_policy") or "").strip().lower()
+        return value if value in {"extend", "follow_first", "merge"} else "extend"
+
+    @property
+    def upstream_variant_purpose(self) -> str:
+        """上游 conversation 请求里的 `variant_purpose`。
+
+        `comparison_implicit` 会让 ChatGPT 为同一轮并行生成两条回答，这也是流式输出里
+        出现两份内容的原因。配成空字符串表示不发送这个字段。
+        """
+        value = self.data.get("upstream_variant_purpose")
+        if value is None:
+            return "comparison_implicit"
+        return str(value).strip()
 
     @property
     def auto_remove_rate_limited_accounts(self) -> bool:
@@ -567,7 +674,13 @@ class ConfigStore:
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
+        data["image_timeout_retry_secs"] = self.image_timeout_retry_secs
         data["image_account_concurrency"] = self.image_account_concurrency
+        data["custom_image_models"] = self.custom_image_models
+        data["image_models"] = self.image_models
+        data["image_models_source"] = self.image_models_source
+        data["image_models_updated_at"] = self.image_models_updated_at
+        data["default_image_model"] = self.default_image_model
         data["image_parallel_generation"] = self.image_parallel_generation
         data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result
         data["image_remove_conversation_always"] = self.image_remove_conversation_always
@@ -610,8 +723,22 @@ class ConfigStore:
         return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
 
     def update(self, data: dict[str, object]) -> dict[str, object]:
+        incoming = dict(data or {})
         next_data = dict(self.data)
-        next_data.update(dict(data or {}))
+        next_data.update(incoming)
+        if "image_models_cache" in incoming:
+            next_data["image_models_cache"] = _normalize_image_model_list(next_data.get("image_models_cache"))
+        if "custom_image_models" in next_data:
+            next_data["custom_image_models"] = _normalize_custom_image_models(next_data.get("custom_image_models"))
+        next_data.pop("image_models", None)
+        default_image_model = str(next_data.get("default_image_model") or DEFAULT_IMAGE_MODEL).strip().lower()
+        available_image_models = _image_models_with_cache(
+            next_data.get("image_models_cache"),
+            next_data.get("custom_image_models"),
+        )
+        next_data["default_image_model"] = (
+            default_image_model if default_image_model in available_image_models else DEFAULT_IMAGE_MODEL
+        )
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:

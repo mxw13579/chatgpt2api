@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -70,6 +71,9 @@ DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 CODEX_RESPONSES_MODEL = "gpt-5.5"
+TEXT_STREAM_TIMEOUT_SECS = 300.0
+IMAGE_FILE_THROTTLE_RETRIES = 3
+IMAGE_FILE_THROTTLE_BACKOFF_SECS = (1.0, 2.0, 4.0)
 SEARCH_MODEL = "gpt-5-5"
 SEARCH_TIMEOUT_SECS = 300.0
 SEARCH_POLL_INTERVAL_SECS = 3.0
@@ -214,6 +218,130 @@ class OpenAIBackendAPI:
         })
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+
+    def _active_request_deadline(self) -> float | None:
+        for attr_name in ("request_deadline", "image_request_deadline"):
+            deadline = getattr(self, attr_name, None)
+            if deadline is None:
+                continue
+            try:
+                return float(deadline)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @contextmanager
+    def _request_deadline_scope(self, timeout_secs: float) -> Iterator[None]:
+        had_deadline = hasattr(self, "request_deadline")
+        previous_deadline = getattr(self, "request_deadline", None)
+        try:
+            next_deadline = time.monotonic() + max(0.0, float(timeout_secs))
+        except (TypeError, ValueError):
+            next_deadline = time.monotonic()
+
+        previous_deadline_float: float | None = None
+        if previous_deadline is not None:
+            try:
+                previous_deadline_float = float(previous_deadline)
+            except (TypeError, ValueError):
+                previous_deadline_float = None
+        self.request_deadline = min(previous_deadline_float, next_deadline) if previous_deadline_float is not None else next_deadline
+        try:
+            yield
+        finally:
+            if had_deadline:
+                self.request_deadline = previous_deadline
+            elif hasattr(self, "request_deadline"):
+                delattr(self, "request_deadline")
+
+    def _deadline_timeout_secs(self, default_secs: float) -> float:
+        deadline = self._active_request_deadline()
+        if deadline is not None:
+            try:
+                remaining = float(deadline) - time.monotonic()
+                return max(1.0, remaining)
+            except (TypeError, ValueError):
+                pass
+        return float(default_secs)
+
+    def _deadline_expired(self) -> bool:
+        deadline = self._active_request_deadline()
+        return deadline is not None and time.monotonic() >= deadline
+
+    def _sleep_with_request_deadline(self, seconds: float) -> None:
+        sleep_for = max(0.0, float(seconds))
+        deadline = self._active_request_deadline()
+        if deadline is not None:
+            sleep_for = min(sleep_for, max(0.0, deadline - time.monotonic()))
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+    @staticmethod
+    def _is_image_file_concurrency_error(error: UpstreamHTTPError) -> bool:
+        """判断文件服务是否因账号并发限制暂时拒绝请求。"""
+        if error.status_code not in {429, 503}:
+            return False
+        body = error.body
+        try:
+            body_text = json.dumps(body, ensure_ascii=False) if isinstance(body, (dict, list)) else str(body)
+        except (TypeError, ValueError):
+            body_text = repr(body)
+        text = body_text.lower()
+        return "concurrency_limit" in text or "too many concurrent" in text or "throttled" in text
+
+    def _post_image_file_request(self, path: str, **kwargs: Any) -> requests.Response:
+        """请求图片文件服务，并在账号并发限流时做有界退避。"""
+        for attempt in range(IMAGE_FILE_THROTTLE_RETRIES + 1):
+            response = self.session.post(self.base_url + path, **kwargs)
+            try:
+                ensure_ok(response, path)
+                return response
+            except UpstreamHTTPError as exc:
+                if not self._is_image_file_concurrency_error(exc) or attempt >= IMAGE_FILE_THROTTLE_RETRIES:
+                    raise
+                retry_delay = exc.retry_after
+                if retry_delay is None:
+                    retry_delay = IMAGE_FILE_THROTTLE_BACKOFF_SECS[attempt]
+                logger.warning({
+                    "event": "image_file_concurrency_retry",
+                    "path": path,
+                    "attempt": attempt + 1,
+                    "wait_secs": retry_delay,
+                    "status_code": exc.status_code,
+                })
+                self._sleep_with_request_deadline(retry_delay)
+                if self._deadline_expired():
+                    raise
+        raise RuntimeError("unreachable image file request retry state")
+
+    @staticmethod
+    def _request_timeout_message(label: str, timeout_secs: float) -> str:
+        return f"ChatGPT {label}超时（已等待 {timeout_secs:g} 秒）。"
+
+    def _image_request_timeout_secs(self) -> float:
+        return self._deadline_timeout_secs(float(config.image_poll_timeout_secs))
+
+    def _image_stream_hard_cap_secs(self) -> float:
+        deadline = self._active_request_deadline()
+        if deadline is None:
+            return float(config.image_poll_timeout_secs)
+        try:
+            return max(0.001, float(deadline) - time.monotonic())
+        except (TypeError, ValueError):
+            return float(config.image_poll_timeout_secs)
+
+    def _image_timeout_message(self) -> str:
+        return (
+            f"ChatGPT 生图超时（已等待 {config.image_poll_timeout_secs} 秒）。"
+            f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
+            f"也可能是账号被限流或生图队列拥堵导致。"
+        )
+
+    @staticmethod
+    def _close_stream_response(response: Any) -> None:
+        if getattr(response, "_stream_closed", False):
+            return
+        response.close()
 
     def close(self) -> None:
         if getattr(self, "_closed", False):
@@ -544,7 +672,6 @@ class OpenAIBackendAPI:
             "system_hints": [],
             "timezone": timezone,
             "timezone_offset_min": -480,
-            "variant_purpose": "comparison_implicit",
             "websocket_request_id": new_uuid(),
             "client_contextual_info": {
                 "is_dark_mode": False,
@@ -556,26 +683,24 @@ class OpenAIBackendAPI:
                 "screen_width": 2560,
             },
         }
+        variant_purpose = config.upstream_variant_purpose
+        if variant_purpose:
+            payload["variant_purpose"] = variant_purpose
         normalized_effort = self._normalize_thinking_effort(thinking_effort or config.default_thinking_effort)
         if normalized_effort:
             payload["thinking_effort"] = normalized_effort
         return payload
 
-    def _image_model_settings(self, model: str) -> tuple[str, str]:
-        """把标准图片模型名映射为上游模型及思考强度。"""
+    def _image_model_slug(self, model: str) -> str:
+        """把标准图片模型名映射到底层 model slug。"""
         _, base_model = split_image_model(model)
         if not base_model:
-            return "auto", ""
+            return "auto"
         if base_model == "gpt-image-2":
-            upstream_model = config.default_upstream_model_name
-        elif base_model == CODEX_IMAGE_MODEL:
-            upstream_model = base_model
-        else:
-            return "auto", ""
-        model_name, separator, suffix = upstream_model.rpartition("-")
-        if separator and suffix.lower() in {"standard", "extended", "max"}:
-            return model_name, suffix.lower()
-        return upstream_model, self._normalize_thinking_effort(config.default_thinking_effort)
+            return config.default_upstream_model_name or "gpt-5-5-thinking"
+        if base_model == CODEX_IMAGE_MODEL:
+            return base_model
+        return base_model
 
     def _image_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "", accept: str = "*/*") -> \
             Dict[str, str]:
@@ -714,10 +839,24 @@ class OpenAIBackendAPI:
             },
         })
 
-    @staticmethod
-    def _iter_codex_response_events(raw: Any) -> Iterator[Dict[str, Any]]:
+    def _read_codex_response_text(self, raw: Any) -> str:
+        deadline = getattr(self, "image_request_deadline", None)
+        if deadline is None:
+            return raw.read().decode("utf-8", "replace")
+        chunks: list[bytes] = []
+        while True:
+            remaining = float(deadline) - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(self._image_timeout_message())
+            chunk = raw.read(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", "replace")
+
+    def _iter_codex_response_events(self, raw: Any) -> Iterator[Dict[str, Any]]:
         content_type = str(raw.headers.get("content-type") or "").lower()
-        text = raw.read().decode("utf-8", "replace")
+        text = self._read_codex_response_text(raw)
         status_code = getattr(raw, "status", None)
         parse_errors: list[str] = []
         events: list[Dict[str, Any]] = []
@@ -814,7 +953,7 @@ class OpenAIBackendAPI:
             "event": "codex_responses_request_debug",
             "url": self.base_url + path,
             "transport": "urllib.request",
-            "timeout_secs": 1200,
+            "timeout_secs": self._image_request_timeout_secs(),
             "account_email": str(account.get("email") or "").strip(),
             "source_type": str(account.get("source_type") or "").strip(),
             "account_type": str(account.get("type") or "").strip(),
@@ -847,7 +986,7 @@ class OpenAIBackendAPI:
             },
         })
         try:
-            with urllib.request.urlopen(request, timeout=1200) as raw:
+            with urllib.request.urlopen(request, timeout=self._image_request_timeout_secs()) as raw:
                 yield from self._iter_codex_response_events(raw)
         except urllib.error.HTTPError as error:
             body_text = error.read().decode("utf-8", "replace")
@@ -864,12 +1003,11 @@ class OpenAIBackendAPI:
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
         """为图片生成准备 conduit token。"""
         path = "/backend-api/f/conversation/prepare"
-        upstream_model, thinking_effort = self._image_model_settings(model)
         payload = {
             "action": "next",
             "fork_from_shared_post": False,
             "parent_message_id": new_uuid(),
-            "model": upstream_model,
+            "model": self._image_model_slug(model),
             "client_prepare_state": "success",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
@@ -884,13 +1022,11 @@ class OpenAIBackendAPI:
             "supported_encodings": ["v1"],
             "client_contextual_info": {"app_name": "chatgpt.com"},
         }
-        if thinking_effort:
-            payload["thinking_effort"] = thinking_effort
         response = self.session.post(
             self.base_url + path,
             headers=self._image_headers(path, requirements),
             json=payload,
-            timeout=60,
+            timeout=self._deadline_timeout_secs(60),
         )
         ensure_ok(response, path)
         return response.json().get("conduit_token", "")
@@ -927,12 +1063,12 @@ class OpenAIBackendAPI:
         width, height = image.size
         mime_type = Image.MIME.get(image.format, "image/png")
         path = "/backend-api/files"
-        response = self.session.post(
-            self.base_url + path,
+        response = self._post_image_file_request(
+            path,
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
             json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal", "width": width,
                   "height": height},
-            timeout=60,
+            timeout=self._deadline_timeout_secs(60),
         )
         ensure_ok(response, path)
         upload_meta = response.json()
@@ -949,15 +1085,15 @@ class OpenAIBackendAPI:
                 "Accept-Language": "en-US,en;q=0.8",
             },
             data=data,
-            timeout=120,
+            timeout=self._deadline_timeout_secs(120),
         )
         ensure_ok(response, "image_upload")
         path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
-        response = self.session.post(
-            self.base_url + path,
+        response = self._post_image_file_request(
+            path,
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
             data="{}",
-            timeout=60,
+            timeout=self._deadline_timeout_secs(60),
         )
         ensure_ok(response, path)
         return {
@@ -972,7 +1108,6 @@ class OpenAIBackendAPI:
     def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
                                 references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
-        upstream_model, thinking_effort = self._image_model_settings(model)
         references = references or []
         parts = [{
             "content_type": "image_asset_pointer",
@@ -1010,7 +1145,7 @@ class OpenAIBackendAPI:
                 "metadata": metadata,
             }],
             "parent_message_id": new_uuid(),
-            "model": upstream_model,
+            "model": self._image_model_slug(model),
             "client_prepare_state": "sent",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
@@ -1032,24 +1167,22 @@ class OpenAIBackendAPI:
             "paragen_cot_summary_display_override": "allow",
             "force_parallel_switch": "auto",
         }
-        if thinking_effort:
-            payload["thinking_effort"] = thinking_effort
         path = "/backend-api/f/conversation"
         response = self.session.post(
             self.base_url + path,
             headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
             json=payload,
-            timeout=300,
+            timeout=self._image_request_timeout_secs(),
             stream=True,
         )
         ensure_ok(response, path)
         return response
 
-    def _get_conversation(self, conversation_id: str) -> Dict[str, Any]:
+    def _get_conversation(self, conversation_id: str, timeout_secs: float = 60.0) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
         path = f"/backend-api/conversation/{conversation_id}"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=timeout_secs)
         ensure_ok(response, path)
         return response.json()
 
@@ -1233,32 +1366,33 @@ class OpenAIBackendAPI:
         self.session.headers["OAI-Client-Build-Number"] = EDITABLE_FILE_CLIENT_BUILD_NUMBER
         output_path = Path(output_dir).expanduser().resolve()
         output_path.mkdir(parents=True, exist_ok=True)
-        uploaded = [self._upload_editable_base64_image(item, index) for index, item in enumerate(base64_images, start=1)]
-        conduit_token = self._prepare_editable_conversation(prompt, [item["mime_type"] for item in uploaded])
-        conversation_id = self._run_editable_conversation(prompt, uploaded, conduit_token)
-        artifacts = self._wait_editable_output_artifacts(
-            conversation_id,
-            primary_label,
-            primary_suffixes,
-            primary_mime_types,
-            primary_mime_keywords,
-            export_file_re,
-            timeout_secs,
-            poll_interval_secs,
-        )
-        downloaded = [self._download_editable_artifact(
-            conversation_id,
-            item,
-            output_path,
-            primary_mime_types,
-            primary_mime_keywords,
-            primary_default_extension,
-        ) for item in artifacts]
-        primary_path = next((item for item in downloaded if item.suffix.lower() in primary_suffixes), None)
-        zip_path = next((item for item in downloaded if item.suffix.lower() == ".zip"), None)
-        if not primary_path or not zip_path:
-            raise RuntimeError(f"download finished but did not get both {primary_label} and zip files: {downloaded}")
-        return EditableFileExportResult(conversation_id=conversation_id, primary_path=primary_path, zip_path=zip_path)
+        with self._request_deadline_scope(timeout_secs):
+            uploaded = [self._upload_editable_base64_image(item, index) for index, item in enumerate(base64_images, start=1)]
+            conduit_token = self._prepare_editable_conversation(prompt, [item["mime_type"] for item in uploaded])
+            conversation_id = self._run_editable_conversation(prompt, uploaded, conduit_token)
+            artifacts = self._wait_editable_output_artifacts(
+                conversation_id,
+                primary_label,
+                primary_suffixes,
+                primary_mime_types,
+                primary_mime_keywords,
+                export_file_re,
+                timeout_secs,
+                poll_interval_secs,
+            )
+            downloaded = [self._download_editable_artifact(
+                conversation_id,
+                item,
+                output_path,
+                primary_mime_types,
+                primary_mime_keywords,
+                primary_default_extension,
+            ) for item in artifacts]
+            primary_path = next((item for item in downloaded if item.suffix.lower() in primary_suffixes), None)
+            zip_path = next((item for item in downloaded if item.suffix.lower() == ".zip"), None)
+            if not primary_path or not zip_path:
+                raise RuntimeError(f"download finished but did not get both {primary_label} and zip files: {downloaded}")
+            return EditableFileExportResult(conversation_id=conversation_id, primary_path=primary_path, zip_path=zip_path)
 
     def _upload_editable_base64_image(self, base64_image: str, index: int) -> Dict[str, Any]:
         data, file_name, mime_type, width, height = self._decode_editable_base64_image(base64_image, index)
@@ -1275,7 +1409,7 @@ class OpenAIBackendAPI:
                 "store_in_library": True,
                 "library_persistence_mode": "opportunistic",
             },
-            timeout=60,
+            timeout=self._deadline_timeout_secs(60),
         )
         ensure_ok(response, path)
         payload = response.json()
@@ -1296,7 +1430,7 @@ class OpenAIBackendAPI:
                 "Accept-Language": "en-US,en;q=0.8",
             },
             data=data,
-            timeout=120,
+            timeout=self._deadline_timeout_secs(120),
         )
         ensure_ok(response, "image_upload")
         path = f"/backend-api/files/{file_id}/uploaded"
@@ -1304,7 +1438,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json"}),
             data="{}",
-            timeout=60,
+            timeout=self._deadline_timeout_secs(60),
         )
         ensure_ok(response, path)
         return {
@@ -1359,7 +1493,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json", "X-Conduit-Token": "no-token"}),
             json=payload,
-            timeout=60,
+            timeout=self._deadline_timeout_secs(60),
         )
         ensure_ok(response, path)
         conduit_token = str(response.json().get("conduit_token") or "")
@@ -1432,18 +1566,22 @@ class OpenAIBackendAPI:
                 "force_parallel_switch": "auto",
                 "thinking_effort": EDITABLE_FILE_THINKING_EFFORT,
             },
-            timeout=300,
+            timeout=self._deadline_timeout_secs(300),
             stream=True,
         )
         ensure_ok(response, path)
         conversation_id = ""
         try:
-            for payload in iter_sse_payloads(response):
+            for payload in iter_sse_payloads(
+                    response,
+                    deadline=self._active_request_deadline(),
+                    timeout_message=self._request_timeout_message("可编辑文件生成", EDITABLE_FILE_TIMEOUT_SECS),
+            ):
                 if payload == "[DONE]":
                     break
                 conversation_id = conversation_id or self._find_editable_value(payload, "conversation_id")
         finally:
-            response.close()
+            self._close_stream_response(response)
         if not conversation_id:
             raise RuntimeError("conversation_id not found in stream")
         return conversation_id
@@ -1460,12 +1598,12 @@ class OpenAIBackendAPI:
             poll_interval_secs: float,
     ) -> list[EditableFileArtifact]:
         deadline = time.time() + timeout_secs
-        while time.time() < deadline:
+        while time.time() < deadline and not self._deadline_expired():
             try:
                 conversation = self._get_editable_conversation_detail(conversation_id)
             except UpstreamHTTPError as exc:
                 if exc.status_code in {404, 409, 423, 429, 500, 502, 503, 504}:
-                    time.sleep(poll_interval_secs)
+                    self._sleep_with_request_deadline(poll_interval_secs)
                     continue
                 raise
             targeted = self._pick_editable_target_artifacts(
@@ -1476,12 +1614,16 @@ class OpenAIBackendAPI:
             )
             if targeted:
                 return targeted
-            time.sleep(poll_interval_secs)
+            self._sleep_with_request_deadline(poll_interval_secs)
         raise RuntimeError(f"timed out waiting for {primary_label}/zip outputs")
 
     def _get_editable_conversation_detail(self, conversation_id: str) -> Dict[str, Any]:
         path = f"/backend-api/conversation/{conversation_id}"
-        response = self.session.get(self.base_url + path, headers=self._editable_conversation_document_headers(path, conversation_id), timeout=60)
+        response = self.session.get(
+            self.base_url + path,
+            headers=self._editable_conversation_document_headers(path, conversation_id),
+            timeout=self._deadline_timeout_secs(60),
+        )
         ensure_ok(response, path)
         return response.json()
 
@@ -1590,7 +1732,7 @@ class OpenAIBackendAPI:
         download_url = self._resolve_editable_download_url(conversation_id, artifact)
         if not download_url:
             raise RuntimeError(f"download url not found for artifact: {artifact}")
-        response = self.session.get(download_url, timeout=300)
+        response = self.session.get(download_url, timeout=self._deadline_timeout_secs(300))
         ensure_ok(response, "artifact_download")
         content_type = self._clean_editable_mime_type(response.headers.get("Content-Type") or artifact.mime_type)
         file_name = self._resolve_editable_output_name(artifact, response.url, response.headers.get("Content-Disposition"), content_type, primary_mime_types, primary_mime_keywords, primary_default_extension)
@@ -1609,7 +1751,7 @@ class OpenAIBackendAPI:
                 self.base_url + path,
                 headers=self._editable_download_headers(path, conversation_id, "/backend-api/conversation/{conversation_id}/interpreter/download"),
                 params={"message_id": artifact.message_id, "sandbox_path": artifact.sandbox_path},
-                timeout=60,
+                timeout=self._deadline_timeout_secs(60),
             )
             if 200 <= response.status_code < 300:
                 url = self._download_url_from_response(response)
@@ -1620,7 +1762,7 @@ class OpenAIBackendAPI:
             response = self.session.get(
                 self.base_url + path,
                 headers=self._editable_download_headers(path, conversation_id, "/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"),
-                timeout=60,
+                timeout=self._deadline_timeout_secs(60),
             )
             if 200 <= response.status_code < 300:
                 url = self._download_url_from_response(response)
@@ -1632,7 +1774,7 @@ class OpenAIBackendAPI:
                 self.base_url + path,
                 headers=self._editable_download_headers(path, conversation_id, "/backend-api/files/download/{file_id}"),
                 params={"post_id": "", "inline": "false"},
-                timeout=60,
+                timeout=self._deadline_timeout_secs(60),
             )
             if 200 <= response.status_code < 300:
                 url = self._download_url_from_response(response)
@@ -1643,7 +1785,7 @@ class OpenAIBackendAPI:
             response = self.session.get(
                 self.base_url + path,
                 headers=self._editable_download_headers(path, conversation_id, "/backend-api/files/download/{file_id}"),
-                timeout=60,
+                timeout=self._deadline_timeout_secs(60),
             )
             if 200 <= response.status_code < 300:
                 url = self._download_url_from_response(response)
@@ -1825,10 +1967,11 @@ class OpenAIBackendAPI:
                poll_interval_secs: float = SEARCH_POLL_INTERVAL_SECS) -> Dict[str, Any]:
         if not self.access_token:
             raise RuntimeError("access_token is required for search")
-        conduit_token = self._prepare_search_conversation(prompt, model)
-        self._bootstrap()
-        conversation_id = self._run_search_conversation(prompt, conduit_token, model)
-        return self._wait_search_result(conversation_id, timeout_secs, poll_interval_secs)
+        with self._request_deadline_scope(timeout_secs):
+            conduit_token = self._prepare_search_conversation(prompt, model)
+            self._bootstrap()
+            conversation_id = self._run_search_conversation(prompt, conduit_token, model)
+            return self._wait_search_result(conversation_id, timeout_secs, poll_interval_secs)
 
     def _prepare_search_conversation(self, prompt: str, model: str) -> str:
         path = "/backend-api/f/conversation/prepare"
@@ -1850,7 +1993,7 @@ class OpenAIBackendAPI:
                 "supported_encodings": ["v1"],
                 "client_contextual_info": {"app_name": "chatgpt.com"},
             },
-            timeout=60,
+            timeout=self._deadline_timeout_secs(60),
         )
         ensure_ok(response, path)
         token = str(response.json().get("conduit_token") or "")
@@ -1895,18 +2038,22 @@ class OpenAIBackendAPI:
                 "paragen_cot_summary_display_override": "allow",
                 "force_parallel_switch": "auto",
             },
-            timeout=300,
+            timeout=self._deadline_timeout_secs(300),
             stream=True,
         )
         ensure_ok(response, path)
         conversation_id = ""
         try:
-            for payload in iter_sse_payloads(response):
+            for payload in iter_sse_payloads(
+                    response,
+                    deadline=self._active_request_deadline(),
+                    timeout_message=self._request_timeout_message("联网搜索", SEARCH_TIMEOUT_SECS),
+            ):
                 conversation_id = conversation_id or self._find_search_value(payload, "conversation_id")
                 if payload == "[DONE]":
                     break
         finally:
-            response.close()
+            self._close_stream_response(response)
         if not conversation_id:
             raise RuntimeError("conversation_id not found in stream")
         return conversation_id
@@ -1916,7 +2063,7 @@ class OpenAIBackendAPI:
         last_result: Dict[str, Any] | None = None
         last_answer = ""
         stable_hits = 0
-        while time.time() < deadline:
+        while time.time() < deadline and not self._deadline_expired():
             try:
                 last_result = self._extract_search_result(conversation_id, self._get_search_conversation(conversation_id))
             except UpstreamHTTPError as exc:
@@ -1930,7 +2077,7 @@ class OpenAIBackendAPI:
                 last_answer = answer
                 if stable_hits >= 2:
                     return last_result
-            time.sleep(poll_interval_secs)
+            self._sleep_with_request_deadline(poll_interval_secs)
         if last_result:
             return last_result
         raise RuntimeError(f"timed out waiting for search result: {conversation_id}")
@@ -1940,7 +2087,7 @@ class OpenAIBackendAPI:
         headers = self._headers(path, {"Accept": "*/*"})
         headers["Referer"] = f"{self.base_url}/c/{conversation_id}"
         headers["X-OpenAI-Target-Route"] = "/backend-api/conversation/{conversation_id}"
-        response = self.session.get(self.base_url + path, headers=headers, timeout=60)
+        response = self.session.get(self.base_url + path, headers=headers, timeout=self._deadline_timeout_secs(60))
         ensure_ok(response, path)
         return response.json()
 
@@ -2208,7 +2355,10 @@ class OpenAIBackendAPI:
             # 内容政策违规检测通过对话文本进行（在 _find_content_policy_error_in_conversation 中）
             last_task_error = ""
             try:
-                tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
+                tasks = self._query_backend_tasks(
+                    conversation_id=conversation_id,
+                    timeout_secs=min(5.0, max(0.001, _remaining())),
+                )
                 for task in tasks:
                     is_error, error_msg, metadata = self.check_task_error(task)
                     if is_error and error_msg:
@@ -2230,7 +2380,10 @@ class OpenAIBackendAPI:
                 })
 
             try:
-                conversation = self._get_conversation(conversation_id)
+                conversation = self._get_conversation(
+                    conversation_id,
+                    timeout_secs=min(60.0, max(0.001, _remaining())),
+                )
             except UpstreamHTTPError as exc:
                 if exc.status_code in (429, 500, 502, 503, 504):
                     if _retry_sleep("upstream_status", exc.status_code, None, exc.retry_after):
@@ -2316,20 +2469,25 @@ class OpenAIBackendAPI:
             setattr(exc, "task_error", last_task_error)
         raise exc
 
-    def _get_file_download_url(self, file_id: str) -> str:
+    def _get_file_download_url(self, file_id: str, timeout_secs: float = 60.0) -> str:
         """获取文件下载地址。"""
         path = f"/backend-api/files/{file_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=timeout_secs)
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
 
-    def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
+    def _get_attachment_download_url(
+        self,
+        conversation_id: str,
+        attachment_id: str,
+        timeout_secs: float = 60.0,
+    ) -> str:
         """通过 conversation 附件接口获取下载地址。"""
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=timeout_secs)
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -2420,7 +2578,7 @@ class OpenAIBackendAPI:
                 })
                 continue
             try:
-                url = self._get_file_download_url(file_id)
+                url = self._get_file_download_url(file_id, timeout_secs=self._deadline_timeout_secs(60))
             except Exception as exc:
                 logger.debug({
                     "event": "image_download_url_failed",
@@ -2451,7 +2609,11 @@ class OpenAIBackendAPI:
             return urls
         for sediment_id in sediment_ids:
             try:
-                url = self._get_attachment_download_url(conversation_id, sediment_id)
+                url = self._get_attachment_download_url(
+                    conversation_id,
+                    sediment_id,
+                    timeout_secs=self._deadline_timeout_secs(60),
+                )
             except Exception as exc:
                 logger.debug({
                     "event": "image_download_url_failed",
@@ -2549,7 +2711,7 @@ class OpenAIBackendAPI:
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
         for url in urls:
-            response = self.session.get(url, timeout=120)
+            response = self.session.get(url, timeout=self._deadline_timeout_secs(120))
             ensure_ok(response, "image_download")
             if response.content not in images:
                 images.append(response.content)
@@ -2569,23 +2731,28 @@ class OpenAIBackendAPI:
             yield from self._stream_picture_conversation(prompt, model, images or [])
             return
 
-        normalized = messages or [{"role": "user", "content": prompt}]
-        self._bootstrap()
-        requirements = self._get_chat_requirements()
-        path, timezone = self._chat_target()
-        payload = self._conversation_payload(normalized, model, timezone, thinking_effort=thinking_effort)
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._conversation_headers(path, requirements),
-            json=payload,
-            timeout=300,
-            stream=True,
-        )
-        ensure_ok(response, path)
-        try:
-            yield from iter_sse_payloads(response)
-        finally:
-            response.close()
+        with self._request_deadline_scope(TEXT_STREAM_TIMEOUT_SECS):
+            normalized = messages or [{"role": "user", "content": prompt}]
+            self._bootstrap()
+            requirements = self._get_chat_requirements()
+            path, timezone = self._chat_target()
+            payload = self._conversation_payload(normalized, model, timezone, thinking_effort=thinking_effort)
+            response = self.session.post(
+                self.base_url + path,
+                headers=self._conversation_headers(path, requirements),
+                json=payload,
+                timeout=self._deadline_timeout_secs(TEXT_STREAM_TIMEOUT_SECS),
+                stream=True,
+            )
+            ensure_ok(response, path)
+            try:
+                yield from iter_sse_payloads(
+                    response,
+                    deadline=self._active_request_deadline(),
+                    timeout_message=self._request_timeout_message("文本生成", TEXT_STREAM_TIMEOUT_SECS),
+                )
+            finally:
+                self._close_stream_response(response)
 
     def _report_progress(self, step: str) -> None:
         """Report progress step to the callback if set."""
@@ -2614,47 +2781,64 @@ class OpenAIBackendAPI:
         self._report_progress("starting_generation")
         response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
         self._report_progress("generating")
-        yield from self._iter_sse_payloads_capped(response, float(config.image_poll_timeout_secs))
+        yield from self._iter_sse_payloads_capped(response, self._image_stream_hard_cap_secs())
 
     def _iter_sse_payloads_capped(self, response: Any, hard_cap_secs: float) -> Iterator[str]:
-        """按墙钟硬上限消费图片 SSE 流，避免上游异常时长连接被无限挂起。
-
-        curl_cffi 在 stream=True + 标量 timeout 下不限制流式 body 的总读取时长，
-        上游未生成图片却保持连接时，读取会一直阻塞直到边缘重置（曾观测到单条流
-        挂起约 29.5 分钟才失败）。这里复用「图片轮询超时」作为硬上限：到点后关闭
-        底层连接以解除阻塞，并抛出明确错误，让任务快速失败而非长时间挂起。
-        """
-        deadline = time.monotonic() + hard_cap_secs
-        # 看门狗：SSE 读取可能阻塞在底层 curl 调用中，超时后关闭连接以强制解除阻塞
-        watchdog = threading.Timer(hard_cap_secs, response.close)
-        watchdog.daemon = True
-        watchdog.start()
-        timeout_message = f"图片生成流已超过硬上限 {int(hard_cap_secs)} 秒，已强制中断（上游可能未生成图片）"
+        """按墙钟硬上限消费图片 SSE 流，超时后关闭连接，避免上游长连接一直挂起。"""
         try:
-            for payload in iter_sse_payloads(response):
-                yield payload
-                if time.monotonic() >= deadline:
-                    raise ImageStreamHardTimeoutError(timeout_message)
-        except ImageStreamHardTimeoutError:
-            raise
-        except Exception as exc:
-            # 看门狗关闭连接后，底层读取会抛出 curl 错误，这里统一转成明确的硬上限错误
-            if time.monotonic() >= deadline:
-                raise ImageStreamHardTimeoutError(timeout_message) from exc
-            raise
-        finally:
-            watchdog.cancel()
+            normalized_cap = max(0.001, float(hard_cap_secs))
+        except (TypeError, ValueError):
+            normalized_cap = float(config.image_poll_timeout_secs)
+        deadline = time.monotonic() + normalized_cap
+        forced_close = threading.Event()
+
+        def close_blocked_stream() -> None:
+            forced_close.set()
             try:
                 response.close()
             except Exception:
                 pass
+
+        watchdog = threading.Timer(normalized_cap, close_blocked_stream)
+        watchdog.daemon = True
+        watchdog.start()
+        timeout_message = (
+            f"图片生成流已超过硬上限 {normalized_cap:g} 秒，"
+            "已强制中断（上游可能未生成图片）"
+        )
+        try:
+            for payload in iter_sse_payloads(
+                response,
+                deadline=deadline,
+                timeout_message=timeout_message,
+            ):
+                if forced_close.is_set() or time.monotonic() >= deadline:
+                    raise ImageStreamHardTimeoutError(timeout_message)
+                yield payload
+            if forced_close.is_set() or time.monotonic() >= deadline:
+                raise ImageStreamHardTimeoutError(timeout_message)
+        except ImageStreamHardTimeoutError:
+            raise
+        except TimeoutError as exc:
+            raise ImageStreamHardTimeoutError(timeout_message) from exc
+        except Exception as exc:
+            if forced_close.is_set() or time.monotonic() >= deadline:
+                raise ImageStreamHardTimeoutError(timeout_message) from exc
+            raise
+        finally:
+            watchdog.cancel()
+            if not forced_close.is_set():
+                try:
+                    self._close_stream_response(response)
+                except Exception:
+                    pass
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
         response = self.session.get(
             self.base_url + "/",
             headers=self._bootstrap_headers(),
-            timeout=30,
+            timeout=self._deadline_timeout_secs(30),
         )
         ensure_ok(response, "bootstrap")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
@@ -2671,7 +2855,7 @@ class OpenAIBackendAPI:
             self.base_url + prepare_path,
             headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
             json={"p": p_token},
-            timeout=30,
+            timeout=self._deadline_timeout_secs(30),
         )
         ensure_ok(response, "chat_requirements_prepare")
         prepare_data = response.json()
@@ -2704,7 +2888,7 @@ class OpenAIBackendAPI:
                 "proof_token": proof_token,
                 "turnstile_token": turnstile_token,
             },
-            timeout=30,
+            timeout=self._deadline_timeout_secs(30),
         )
         ensure_ok(response, "chat_requirements_finalize")
         data = response.json()

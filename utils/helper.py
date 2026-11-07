@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import mimetypes
+import queue
 import re
 import time
 import uuid
@@ -10,13 +11,25 @@ from typing import Any, Iterator
 from urllib.parse import urlparse
 
 from curl_cffi import requests
+from curl_cffi.requests.exceptions import RequestException
+from curl_cffi.requests.models import STREAM_END
 from fastapi import HTTPException
 from services.proxy_service import proxy_settings
 from utils.log import logger
 
-BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
+DEFAULT_WEB_IMAGE_MODELS = {
+    "gpt-image-2.6-sunburst",
+    "gpt-image-2.6-flare",
+    "gpt-image-2.5-sunburst",
+    "gpt-image-2.5-flare",
+    "gpt-image-2",
+    "gpt-5-5-thinking",
+    "gpt-5-5",
+    "gpt-5-3",
+}
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
+BASE_IMAGE_MODELS = DEFAULT_WEB_IMAGE_MODELS | {CODEX_IMAGE_MODEL}
 PREFIXED_CODEX_IMAGE_MODELS = {
     f"{plan_type}-{CODEX_IMAGE_MODEL}"
     for plan_type in IMAGE_MODEL_PLAN_TYPES
@@ -106,11 +119,24 @@ def new_uuid() -> str:
     return str(uuid.uuid4())
 
 
+def configured_web_image_models() -> set[str]:
+    try:
+        from services.config import config
+
+        return {str(model or "").strip().lower() for model in config.image_models if str(model or "").strip()}
+    except Exception:
+        return set(DEFAULT_WEB_IMAGE_MODELS)
+
+
+def supported_image_models() -> set[str]:
+    return configured_web_image_models() | {CODEX_IMAGE_MODEL} | PREFIXED_CODEX_IMAGE_MODELS
+
+
 def split_image_model(model: object) -> tuple[str | None, str | None]:
     normalized = str(model or "").strip().lower()
     if not normalized:
         return None, None
-    if normalized in BASE_IMAGE_MODELS:
+    if normalized == CODEX_IMAGE_MODEL or normalized in configured_web_image_models():
         return None, normalized
     for plan_type in IMAGE_MODEL_PLAN_TYPES:
         prefix = f"{plan_type}-"
@@ -226,8 +252,71 @@ def anthropic_sse_stream(items) -> Iterator[str]:
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
 
-def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
-    for raw_line in response.iter_lines():
+def _detach_stream_response(response: requests.Response) -> None:
+    quit_now = getattr(response, "quit_now", None)
+    if quit_now is not None:
+        try:
+            quit_now.set()
+        except Exception:
+            pass
+    try:
+        response._stream_closed = True
+    except Exception:
+        pass
+
+
+def _iter_sse_chunks(response: requests.Response, deadline: float | None, timeout_message: str) -> Iterator[object]:
+    if deadline is None:
+        yield from response.iter_content()
+        return
+
+    stream_queue = getattr(response, "queue", None)
+    if stream_queue is None:
+        yield from response.iter_content()
+        return
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _detach_stream_response(response)
+            raise TimeoutError(timeout_message)
+        try:
+            raw_line = stream_queue.get(timeout=remaining)
+        except queue.Empty as exc:
+            _detach_stream_response(response)
+            raise TimeoutError(timeout_message) from exc
+        if isinstance(raw_line, RequestException):
+            _detach_stream_response(response)
+            raise raw_line
+        if raw_line is STREAM_END:
+            break
+        yield raw_line
+
+
+def _iter_sse_lines(response: requests.Response, deadline: float | None, timeout_message: str) -> Iterator[object]:
+    pending = None
+    for chunk in _iter_sse_chunks(response, deadline, timeout_message):
+        if pending is not None:
+            chunk = pending + chunk
+        lines = chunk.splitlines()
+        pending = (
+            lines.pop()
+            if lines and lines[-1] and chunk and lines[-1][-1] == chunk[-1]
+            else None
+        )
+        yield from lines
+
+    if pending is not None:
+        yield pending
+
+
+def iter_sse_payloads(
+    response: requests.Response,
+    *,
+    deadline: float | None = None,
+    timeout_message: str = "SSE stream timed out",
+) -> Iterator[str]:
+    for raw_line in _iter_sse_lines(response, deadline, timeout_message):
         if not raw_line:
             continue
         line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)

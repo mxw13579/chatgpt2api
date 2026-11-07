@@ -68,6 +68,21 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(updated["quota"], 0)
             self.assertEqual(updated["status"], "限流")
 
+    def test_image_failure_cooldown_excludes_account_temporarily(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([
+                {"access_token": "token-1", "type": "Plus", "status": "正常", "quota": 2},
+                {"access_token": "token-2", "type": "Plus", "status": "正常", "quota": 2},
+            ])
+            service.fetch_remote_info = lambda access_token, event="fetch_remote_info": service.get_account(access_token)
+            with patch("services.account_service.time.monotonic", return_value=100.0):
+                token = service.get_available_access_token(plan_type="plus")
+                service.mark_image_result(token, success=False, cooldown_secs=30)
+                candidates = service._list_available_candidate_tokens(plan_type="plus")
+
+            self.assertNotIn(token, candidates)
+
     def test_split_image_model_supports_plan_type_prefix(self) -> None:
         self.assertEqual(split_image_model("gpt-image-2"), (None, "gpt-image-2"))
         self.assertEqual(split_image_model("plus-codex-gpt-image-2"), ("plus", "codex-gpt-image-2"))
@@ -75,6 +90,20 @@ class AccountCapabilityTests(unittest.TestCase):
         self.assertEqual(split_image_model("pro-codex-gpt-image-2"), ("pro", "codex-gpt-image-2"))
         self.assertEqual(split_image_model("plus-gpt-image-2"), (None, None))
         self.assertEqual(split_image_model("unknown-image-model"), (None, None))
+
+    def test_split_image_model_supports_configured_web_image_versions(self) -> None:
+        original_custom_models = config.data.get("custom_image_models")
+        config.data["custom_image_models"] = ["custom-image-v1"]
+        try:
+            self.assertEqual(split_image_model("gpt-5-5-thinking"), (None, "gpt-5-5-thinking"))
+            self.assertEqual(split_image_model("gpt-5-5"), (None, "gpt-5-5"))
+            self.assertEqual(split_image_model("gpt-5-3"), (None, "gpt-5-3"))
+            self.assertEqual(split_image_model("custom-image-v1"), (None, "custom-image-v1"))
+        finally:
+            if original_custom_models is None:
+                config.data.pop("custom_image_models", None)
+            else:
+                config.data["custom_image_models"] = original_custom_models
 
     def test_get_available_access_token_filters_by_plan_type(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

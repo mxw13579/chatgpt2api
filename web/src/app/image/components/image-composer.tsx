@@ -1,5 +1,5 @@
 "use client";
-import { ArrowUp, ChevronDown, ImagePlus, Info, LoaderCircle, RectangleHorizontal, RectangleVertical, Square, X } from "lucide-react";
+import { ArrowUp, Brush, ChevronDown, ImagePlus, Info, LoaderCircle, RectangleHorizontal, RectangleVertical, Square, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type RefObject } from "react";
 
 import { ImageLightbox } from "@/components/image-lightbox";
@@ -23,6 +23,7 @@ type ImageComposerProps = {
   availableQuota: string;
   activeTaskCount: number;
   referenceImages: Array<{ name: string; dataUrl: string }>;
+  maskImages: Array<{ name: string; dataUrl: string }>;
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   fileInputRef: RefObject<HTMLInputElement | null>;
   onPromptChange: (value: string) => void;
@@ -37,6 +38,7 @@ type ImageComposerProps = {
   onPickReferenceImage: () => void;
   onReferenceImageChange: (files: File[]) => void | Promise<void>;
   onRemoveReferenceImage: (index: number) => void;
+  onOpenSketch: () => void;
 };
 
 const imageFileNamePattern = /\.(avif|bmp|gif|heic|heif|ico|jpe?g|png|svg|tiff?|webp)$/i;
@@ -62,6 +64,8 @@ const qualityOptions = [
   { value: "low", label: "低" },
   { value: "medium", label: "中" },
   { value: "high", label: "高" },
+  { value: "xhigh", label: "超高" },
+  { value: "max", label: "最高" },
 ];
 const aspectOptions = [
   { ratio: "1:1", tier: "1k", width: "1024", height: "1024", label: "1:1", icon: Square },
@@ -93,6 +97,7 @@ export function ImageComposer({
   availableQuota,
   activeTaskCount,
   referenceImages,
+  maskImages,
   textareaRef,
   fileInputRef,
   onPromptChange,
@@ -107,6 +112,7 @@ export function ImageComposer({
   onPickReferenceImage,
   onReferenceImageChange,
   onRemoveReferenceImage,
+  onOpenSketch,
 }: ImageComposerProps) {
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [lightboxIndex, setLightboxIndex] = useState(0);
@@ -116,8 +122,11 @@ export function ImageComposer({
   const sizeMenuRef = useRef<HTMLDivElement>(null);
   const sizeMenuBtnRef = useRef<HTMLButtonElement>(null);
   const lightboxImages = useMemo(
-    () => referenceImages.map((image, index) => ({ id: `${image.name}-${index}`, src: image.dataUrl })),
-    [referenceImages],
+    () => [
+      ...referenceImages.map((image, index) => ({ id: `${image.name}-${index}`, src: image.dataUrl })),
+      ...maskImages.map((image, index) => ({ id: `mask-${image.name}-${index}`, src: image.dataUrl })),
+    ],
+    [referenceImages, maskImages],
   );
   const modelOptions = useMemo(
     () => imageModels.map((model) => ({ value: model, label: model })),
@@ -128,6 +137,16 @@ export function ImageComposer({
   const imageSizeLabel = `${qualityLabel} · ${ratioLabel} · ${imageCount || 1} 张`;
   const selectedModelLabel = modelOptions.find((option) => option.value === imageModel)?.label || imageModel;
   const isCodexModel = imageModel.toLowerCase().includes("codex");
+  const supportsExtendedQuality = imageModel.toLowerCase().includes("image-2.5");
+  const visibleQualityOptions = supportsExtendedQuality
+    ? qualityOptions
+    : qualityOptions.filter((option) => option.value !== "xhigh" && option.value !== "max");
+
+  useEffect(() => {
+    if (!supportsExtendedQuality && (imageQuality === "xhigh" || imageQuality === "max")) {
+      onImageQualityChange("auto");
+    }
+  }, [imageQuality, onImageQualityChange, supportsExtendedQuality]);
 
   useEffect(() => {
     if (!isSizeMenuOpen) {
@@ -251,6 +270,22 @@ export function ImageComposer({
                 </button>
               </div>
             ))}
+            {maskImages.map((mask, index) => (
+              <button
+                key={`mask-${mask.name}-${index}`}
+                type="button"
+                onClick={() => {
+                  setLightboxIndex(referenceImages.length + index);
+                  setLightboxOpen(true);
+                }}
+                className="relative size-14 shrink-0 overflow-hidden rounded-2xl border border-stone-300 bg-stone-300 sm:size-16"
+                aria-label={`预览标注遮罩 ${index + 1}（透明区域将重绘）`}
+                title="标注遮罩：透明区域将重绘"
+              >
+                <img src={mask.dataUrl} alt={`标注遮罩 ${index + 1}`} className="h-full w-full object-contain" />
+                <span className="absolute inset-x-0 bottom-0 bg-stone-900/75 py-0.5 text-center text-[10px] text-white">遮罩</span>
+              </button>
+            ))}
           </div>
         ) : null}
 
@@ -316,6 +351,16 @@ export function ImageComposer({
                   >
                     <ImagePlus className="size-3.5 sm:size-4" />
                     <span className="hidden sm:inline">{referenceImages.length > 0 ? "添加参考图" : "上传"}</span>
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-9 shrink-0 rounded-full border-stone-200 bg-white px-3 text-xs font-medium text-stone-700 shadow-none sm:h-10 sm:px-4 sm:text-sm"
+                    onClick={onOpenSketch}
+                    aria-label="绘制草图"
+                  >
+                    <Brush className="size-3.5 sm:size-4" />
+                    <span className="hidden sm:inline">草图</span>
                   </Button>
                   <div className="shrink-0 rounded-full bg-stone-100 px-2 py-1 text-[10px] font-medium text-stone-600 sm:px-3 sm:py-2 sm:text-xs">
                     <span className="hidden sm:inline">剩余额度 </span>{availableQuota}
@@ -395,8 +440,8 @@ export function ImageComposer({
                         </div>
                         <div className="mb-3">
                           <div className="mb-2 text-sm font-medium text-stone-900">质量</div>
-                          <div className="grid grid-cols-4 gap-2">
-                            {qualityOptions.map((option) => {
+                          <div className={cn("grid gap-2", supportsExtendedQuality ? "grid-cols-3 sm:grid-cols-6" : "grid-cols-4")}>
+                            {visibleQualityOptions.map((option) => {
                               const active = option.value === imageQuality;
                               return (
                                 <button
