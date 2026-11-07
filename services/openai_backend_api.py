@@ -697,7 +697,7 @@ class OpenAIBackendAPI:
         if not base_model:
             return "auto"
         if base_model == "gpt-image-2":
-            return config.default_upstream_model_name or "gpt-5-5-thinking"
+            return "gpt-5-5-thinking"
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
         return base_model
