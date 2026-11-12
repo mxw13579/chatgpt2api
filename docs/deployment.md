@@ -72,6 +72,8 @@ docker login ghcr.io -u mxw13579
 
 版本标签构建还会提供保留 3 天的 `deployment-image-amd64` Actions artifact，供没有私有 GHCR 读取权限的服务器离线导入。下载后先验证 `SHA256SUMS`，再执行 `docker load -i image.tar.gz`，核对导入镜像 ID 与 `image-id.txt`、提交与 `revision.txt` 一致。使用归档内的 `sha-<完整提交 SHA>` 镜像标签部署，并在该次 `up` 使用 `--pull never`，避免误拉其它版本。常规长期部署仍建议将包设为 Public，或配置专用的只读包凭据。
 
+归档中的镜像标识应使用 image config 的 SHA256。`v1.9.6` 首次归档的 `image-id.txt` 由 CI 的 containerd image store 产生，记录的是 OCI index digest；旧 Docker 导入后显示 config digest，二者可能不同。此时应验证归档校验值，以及 OCI index → linux/amd64 manifest → config 的摘要链，并以 `manifest.json` 引用的 Config 内容 SHA256 核对本地镜像，不能仅忽略 ID 不一致。后续工作流已改为直接导出可跨两种存储后端核对的 config digest。
+
 不要将 PAT、生产 `.env`、账号数据或生产密钥提交到仓库。镜像内初始化空 `config.json`，构建上下文排除本机配置和数据；生产配置通过服务器原有挂载和环境变量提供，并设置强认证密钥。
 
 ### 将已有服务器切换到自己的镜像

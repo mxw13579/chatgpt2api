@@ -88,10 +88,12 @@ jobs:
           image="${IMAGE_NAME}:sha-${GITHUB_SHA}"
           docker pull --platform linux/amd64 "${IMAGE_NAME}@${IMAGE_DIGEST}"
           docker tag "${IMAGE_NAME}@${IMAGE_DIGEST}" "$image"
-          docker image inspect "$image" --format '{{.Id}}' > deployment-image/image-id.txt
           printf '%s\n' "${IMAGE_NAME}@${IMAGE_DIGEST}" > deployment-image/registry-digest.txt
           printf '%s\n' "$GITHUB_SHA" > deployment-image/revision.txt
           docker save "$image" | gzip -1 > deployment-image/image.tar.gz
+          # containerd's inspect ID can be an OCI index, while classic Docker
+          # reports the config digest. Export the portable config digest.
+          python -c 'import hashlib,json,tarfile; t=tarfile.open("deployment-image/image.tar.gz","r:gz"); c=json.load(t.extractfile("manifest.json"))[0]["Config"]; print("sha256:"+hashlib.sha256(t.extractfile(c).read()).hexdigest()); t.close()' > deployment-image/image-id.txt
           (cd deployment-image && sha256sum image.tar.gz > SHA256SUMS)
 
       - name: Upload amd64 deployment archive
