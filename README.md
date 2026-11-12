@@ -135,6 +135,7 @@ environment:
 - 兼容 `POST /v1/images/edits` 图片编辑接口
 - 兼容面向图片场景的 `POST /v1/chat/completions`
 - 兼容面向图片场景的 `POST /v1/responses`
+- 明确图片模型可自动适配 Chat / Responses 请求，无需额外声明图片工具；支持 `prompt/messages/input` 兼容输入并保留对应接口返回格式，详见[图片 API 兼容说明](docs/image-api-compatibility.md)
 - `GET /v1/models` 返回 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、
   `gpt-5-mini`
 - 支持通过 `n` 返回多张生成结果

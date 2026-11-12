@@ -26,7 +26,86 @@ git --version
 | `.env` | Docker compose 环境变量 |
 | `data/` | 账号、日志、图片、任务记录等运行数据 |
 
-升级和迁移时重点保留以上内容。
+升级和迁移时重点保留以上内容。使用 PostgreSQL 时还需要单独备份数据库。
+
+## 使用 GitHub Actions 发布自己的镜像
+
+工作流：`.github/workflows/docker-publish.yml`（Actions 页面名称为 `Publish Docker Image`）。
+
+镜像在 GitHub Actions 上构建并发布到 **GitHub Container Registry（GHCR）**，不是 Docker Hub；工作流不会自动连接或更新服务器。
+镜像路径自动使用当前 GitHub 仓库名并转为小写。本仓库 `mxw13579/chatgpt2api` 对应：
+
+```text
+ghcr.io/mxw13579/chatgpt2api
+```
+
+### 触发方式和标签
+
+| 操作 | 发布的镜像标签 |
+| --- | --- |
+| 推送到 `main` | `latest`、`main`、`sha-<完整提交 SHA>` |
+| 推送版本标签，例如 `v1.9.6` | `v1.9.6`、`1.9.6`、`1.9`、`sha-<完整提交 SHA>` |
+| 在 Actions 页面手动运行 | 所选分支或标签对应的镜像标签，以及 `sha-<完整提交 SHA>`；只有选择 `main` 才更新 `latest` |
+
+`latest` 跟随 `main`，版本标签构建不会覆盖它。预发布版本建议使用完整标签，例如 `v1.9.6-rc.1`。
+镜像同时支持 `linux/amd64` 和 `linux/arm64`。构建成功后，Actions 的 Summary 页面会列出镜像标签及可固定部署的 digest 引用。
+
+首次使用：
+
+1. 将工作流提交并推送到自己的 GitHub 仓库。Fork 仓库如尚未启用 Actions，需要先在 Actions 页面启用。
+2. 在 Actions 页面查看 `Publish Docker Image`，或通过 `Run workflow` 选择 `main` 手动触发。
+3. 工作流使用 GitHub 自动提供的 `GITHUB_TOKEN`，已声明 `contents: read` 和 `packages: write`，无需额外配置发布凭据。
+4. 如果已有同名 GHCR 包但发布提示权限不足，在包的设置中确认当前仓库具有 Actions 写入权限；组织策略也必须允许发布包。
+
+发布版本示例（标签名请使用尚未发布的新版本，并同步维护 `VERSION`）：
+
+```bash
+git tag v1.9.6
+git push origin v1.9.6
+```
+
+GHCR 包首次发布通常为私有。可在 GitHub 的 Packages 中将包设为 Public，允许服务器匿名拉取；若保持私有，在服务器上使用具有 `read:packages` 权限的 PAT（classic）登录，交互提示的密码填写该令牌：
+
+```bash
+docker login ghcr.io -u mxw13579
+```
+
+版本标签构建还会提供保留 3 天的 `deployment-image-amd64` Actions artifact，供没有私有 GHCR 读取权限的服务器离线导入。下载后先验证 `SHA256SUMS`，再执行 `docker load -i image.tar.gz`，核对导入镜像 ID 与 `image-id.txt`、提交与 `revision.txt` 一致。使用归档内的 `sha-<完整提交 SHA>` 镜像标签部署，并在该次 `up` 使用 `--pull never`，避免误拉其它版本。常规长期部署仍建议将包设为 Public，或配置专用的只读包凭据。
+
+不要将 PAT、生产 `.env`、账号数据或生产密钥提交到仓库。镜像内初始化空 `config.json`，构建上下文排除本机配置和数据；生产配置通过服务器原有挂载和环境变量提供，并设置强认证密钥。
+
+### 将已有服务器切换到自己的镜像
+
+仓库默认的 `docker-compose.yml` 仍引用上游 `ghcr.io/basketikun/chatgpt2api:latest`。仅添加工作流不会自动修改服务器上的镜像来源。
+
+已有部署应在**服务器原有 Compose 文件**中，只修改主应用服务的 `image`，不要用仓库模板覆盖整个文件。以下假设主服务名为 `app`：
+
+```yaml
+services:
+  app:
+    image: ghcr.io/mxw13579/chatgpt2api:latest
+    # 原有 ports、volumes、environment、depends_on 等配置保持不变。
+```
+
+如果该服务原来有 `build:` 配置，切换为拉取镜像后可将其移除。保留原有的 PostgreSQL 服务、数据库卷、`STORAGE_BACKEND=postgres`、数据库连接配置，以及原有 `57950:80` 端口映射。
+
+确认镜像发布成功、完成配置和数据库备份后，在已有部署目录执行：
+
+```bash
+cd /data/docker/codex-pool/chatgpt2api
+# 先确认主应用服务名；若不是 app，请替换下面命令中的 app。
+docker compose config --services
+docker compose pull app
+docker compose up -d --no-deps --no-build app
+docker compose ps
+docker compose logs --tail=100 app
+```
+
+此流程只更新主应用容器，不重新部署数据库。生产环境也可以将 `latest` 换成版本标签，或 Actions Summary 中的 `ghcr.io/mxw13579/chatgpt2api@sha256:...` 引用，以固定版本和便于回滚。
+
+### 1.9.6 升级注意
+
+账号热路径改为按键增量持久化，无需数据库 schema 迁移。业务日志开始分片轮转，完成的账号刷新/重登进度增加 TTL 与容量限制。默认仍按单进程运行；升级前备份需要长期保留的日志，并为 Docker stdout 设置独立轮转。详细默认值、兼容边界及回滚说明见[存储、日志与进度保留](performance-and-retention.md)。
 
 ## 方式一：普通 Docker 部署
 

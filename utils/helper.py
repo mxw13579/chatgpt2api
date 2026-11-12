@@ -157,10 +157,19 @@ def is_codex_image_model(model: object) -> bool:
     return base_model == CODEX_IMAGE_MODEL
 
 
+def is_explicit_image_model(model: object) -> bool:
+    """Recognize image-only model names, independently of the capability catalog."""
+    normalized = str(model or "").strip().lower()
+    return (
+        normalized.startswith(("gpt-image-", "chatgpt-image-"))
+        or normalized == CODEX_IMAGE_MODEL
+        or normalized in PREFIXED_CODEX_IMAGE_MODELS
+    )
+
+
 def is_image_chat_request(body: dict[str, object]) -> bool:
-    model = str(body.get("model") or "").strip()
     modalities = body.get("modalities")
-    if is_supported_image_model(model):
+    if is_explicit_image_model(body.get("model")) or has_response_image_generation_tool(body):
         return True
     return isinstance(modalities, list) and "image" in {str(item or "").strip().lower() for item in modalities}
 
@@ -219,10 +228,14 @@ def ensure_ok(response: requests.Response, context: str) -> None:
 
 def sse_json_stream(items) -> Iterator[str]:
     yield ": stream-open\n\n"
+    failed = False
     try:
         for item in items:
+            if isinstance(item, dict) and (item.get("type") in {"response.failed", "error"} or item.get("error")):
+                failed = True
             yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
     except Exception as exc:
+        failed = True
         logger.warning({
             "event": "sse_stream_error",
             "error_type": exc.__class__.__name__,
@@ -232,7 +245,8 @@ def sse_json_stream(items) -> Iterator[str]:
             "error": {"message": str(exc), "type": exc.__class__.__name__}
         }
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
-    yield "data: [DONE]\n\n"
+    if not failed:
+        yield "data: [DONE]\n\n"
 
 
 def anthropic_sse_stream(items) -> Iterator[str]:
@@ -382,10 +396,10 @@ def has_response_image_generation_tool(body: dict[str, object]) -> bool:
     tools = body.get("tools")
     if isinstance(tools, list):
         for tool in tools:
-            if isinstance(tool, dict) and str(tool.get("type") or "").strip() == "image_generation":
+            if isinstance(tool, dict) and str(tool.get("type") or "").strip().lower() == "image_generation":
                 return True
     tool_choice = body.get("tool_choice")
-    return isinstance(tool_choice, dict) and str(tool_choice.get("type") or "").strip() == "image_generation"
+    return isinstance(tool_choice, dict) and str(tool_choice.get("type") or "").strip().lower() == "image_generation"
 
 
 def extract_prompt_from_message_content(content: object) -> str:

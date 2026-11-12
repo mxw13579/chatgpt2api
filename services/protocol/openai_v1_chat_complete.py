@@ -6,22 +6,22 @@ from typing import Any, Iterable, Iterator
 
 from fastapi import HTTPException
 
-from services.config import config
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
 from services.protocol.conversation import (
     ConversationRequest,
+    ImageGenerationError,
     ImageOutput,
     collect_image_outputs,
     collect_text,
     count_message_image_tokens,
     count_message_text_tokens,
     count_text_tokens,
-    encode_images,
     normalize_messages,
     stream_image_outputs_with_pool,
     stream_text_deltas,
     text_backend,
 )
+from services.protocol.image_compat import is_image_request, normalize_image_request, require_image_outputs
 from services.protocol.web_search_tool import (
     WEB_SEARCH_TOOL_TYPES,
     has_unsupported_tools,
@@ -30,7 +30,7 @@ from services.protocol.web_search_tool import (
     search_query_from_messages,
     text_with_url_citations,
 )
-from utils.helper import build_chat_image_markdown_content, extract_chat_image, extract_chat_prompt, is_image_chat_request, parse_image_count
+from utils.helper import build_chat_image_markdown_content
 from utils.image_tokens import (
     chat_usage_from_image_usage,
     count_image_inputs_tokens,
@@ -163,15 +163,9 @@ def chat_messages_from_body(body: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[bytes, str, str]]]:
-    model = str(body.get("model") or config.default_image_model).strip() or config.default_image_model
-    prompt = extract_chat_prompt(body)
-    if not prompt:
-        raise HTTPException(status_code=400, detail={"error": "prompt is required"})
-    images = [
-        (data, f"image_{idx}.png", mime)
-        for idx, (data, mime) in enumerate(extract_chat_image(body), start=1)
-    ]
-    return model, prompt, parse_image_count(body.get("n")), images
+    normalized = normalize_image_request(body, protocol="chat")
+    request = normalized.request
+    return request.model, request.prompt, request.n, normalized.images
 
 
 def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
@@ -225,56 +219,54 @@ def stream_web_search_chat_completion(messages: list[dict[str, Any]], model: str
 
 def image_result_content(result: dict[str, Any]) -> str:
     data = result.get("data")
-    if isinstance(data, list) and data:
-        return build_chat_image_markdown_content(result)
-    return str(result.get("message") or "Image generation completed.")
+    # Chat images must be inline; never use the Markdown helper's text-only fallback.
+    if not isinstance(data, list) or not data or not all(
+        isinstance(item, dict) and str(item.get("b64_json") or "").strip()
+        for item in data
+    ):
+        raise ImageGenerationError("Image generation returned no inline image data.")
+    return build_chat_image_markdown_content(result)
 
 
 def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
-    model, prompt, n, images = chat_image_args(body)
-    result = collect_image_outputs(stream_image_outputs_with_pool(ConversationRequest(
-        prompt=prompt,
-        model=model,
-        n=n,
-        response_format="b64_json",
-        images=encode_images(images) or None,
-    )))
-    response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
+    normalized = normalize_image_request(body, protocol="chat")
+    request = normalized.request
+    result = collect_image_outputs(require_image_outputs(
+        stream_image_outputs_with_pool(request),
+        expected_count=request.n,
+    ))
+    response = completion_response(request.model, image_result_content(result), int(result.get("created") or 0) or None)
     usage = image_usage(
-        input_text_tokens=count_text_tokens(prompt, model),
-        input_image_tokens=count_image_inputs_tokens(images, model),
-        output_tokens=count_image_output_items_tokens(result.get("data")),
+        input_text_tokens=count_text_tokens(request.prompt, request.model),
+        input_image_tokens=count_image_inputs_tokens(normalized.images, request.model),
+        output_tokens=count_image_output_items_tokens(result.get("data"), request.size, request.quality),
     )
     response["usage"] = chat_usage_from_image_usage(usage)
     return response
 
 
 def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
-    model, prompt, n, images = chat_image_args(body)
-    image_outputs = stream_image_outputs_with_pool(ConversationRequest(
-        prompt=prompt,
-        model=model,
-        n=n,
-        response_format="b64_json",
-        images=encode_images(images) or None,
-    ))
-    yield from stream_image_chat_completion(image_outputs, model)
+    normalized = normalize_image_request(body, protocol="chat")
+    request = normalized.request
+    image_outputs = stream_image_outputs_with_pool(request)
+    yield from stream_image_chat_completion(image_outputs, request.model, expected_count=request.n)
 
 
-def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: str) -> Iterator[dict[str, Any]]:
+def stream_image_chat_completion(
+    image_outputs: Iterable[ImageOutput],
+    model: str,
+    *,
+    expected_count: int = 1,
+) -> Iterator[dict[str, Any]]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     sent_role = False
-    sent_text = ""
-    for output in image_outputs:
+    for output in require_image_outputs(image_outputs, expected_count=expected_count):
         content = ""
         if output.kind == "progress":
             content = output.text
-            sent_text += content
         elif output.kind == "result":
-            content = build_chat_image_markdown_content({"data": output.data})
-        elif output.kind == "message":
-            content = output.text[len(sent_text):] if output.text.startswith(sent_text) else output.text
+            content = image_result_content({"data": output.data})
         if not content:
             continue
         if not sent_role:
@@ -282,31 +274,27 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
             yield completion_chunk(model, {"role": "assistant", "content": content}, None, completion_id, created)
         else:
             yield completion_chunk(model, {"content": content}, None, completion_id, created)
-    if not sent_role:
-        yield completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
     yield completion_chunk(model, {}, "stop", completion_id, created)
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    if is_image_request(body):
+        return image_chat_events(body) if body.get("stream") else image_chat_response(body)
     if body.get("stream"):
-        if is_image_chat_request(body):
-            return image_chat_events(body)
         model, messages = text_chat_parts(body)
         if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
             return stream_web_search_chat_completion(messages, model)
         thinking_effort = thinking_effort_from_body(body)
-        key = cache_key(body, messages, stream=True)
+        key = "chat:" + cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
             lambda: stream_text_chat_completion(text_backend(model), messages, model, thinking_effort),
         )
-    if is_image_chat_request(body):
-        return image_chat_response(body)
     model, messages = text_chat_parts(body)
     if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
         return web_search_chat_response(messages, model)
     thinking_effort = thinking_effort_from_body(body)
-    key = cache_key(body, messages, stream=False)
+    key = "chat:" + cache_key(body, messages, stream=False)
     return chat_completion_cache.get_or_compute_response(
         key,
         lambda: completion_response(

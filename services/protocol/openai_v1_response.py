@@ -6,20 +6,21 @@ from typing import Any, Iterable, Iterator
 
 from fastapi import HTTPException
 
-from services.config import config
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
 from services.protocol.conversation import (
     ConversationRequest,
+    ImageGenerationError,
     ImageOutput,
     count_message_image_tokens,
     count_message_text_tokens,
     count_text_tokens,
-    encode_images,
     normalize_messages,
     stream_image_outputs_with_pool,
     stream_text_deltas,
     text_backend,
 )
+from services.protocol.error_response import openai_error_payload
+from services.protocol.image_compat import is_image_request, normalize_image_request, require_image_outputs
 from services.protocol.web_search_tool import (
     WEB_SEARCH_TOOL_TYPES,
     has_unsupported_tools,
@@ -29,9 +30,9 @@ from services.protocol.web_search_tool import (
     search_query_from_messages,
     text_with_url_citations,
 )
-from utils.helper import extract_image_from_message_content, extract_response_prompt, has_response_image_generation_tool
+from utils.helper import extract_image_from_message_content, extract_response_prompt
 from utils.image_tokens import (
-    count_image_content_tokens,
+    count_image_inputs_tokens,
     count_image_output_items_tokens,
     image_usage,
     token_usage,
@@ -69,7 +70,7 @@ def thinking_effort_from_body(body: dict[str, Any]) -> str:
 
 
 def is_text_response_request(body: dict[str, Any]) -> bool:
-    return not has_response_image_generation_tool(body)
+    return not is_image_request(body)
 
 
 def has_unsupported_response_tools(body: dict[str, Any]) -> bool:
@@ -233,11 +234,12 @@ def web_search_call_item(
 
 def image_output_items(prompt: str, data: list[dict[str, Any]], item_id: str | None = None) -> list[dict[str, Any]]:
     output = []
+    id_prefix = item_id or f"ig_{uuid.uuid4().hex}"
     for item in data:
         b64_json = str(item.get("b64_json") or "").strip()
         if b64_json:
             output.append({
-                "id": item_id or f"ig_{len(output) + 1}",
+                "id": id_prefix if not output else f"{id_prefix}_{len(output)}",
                 "type": "image_generation_call",
                 "status": "completed",
                 "result": b64_json,
@@ -367,38 +369,36 @@ def stream_image_response(
     input_image_tokens: int = 0,
     size: object = None,
     quality: str = "auto",
+    expected_count: int = 1,
 ) -> Iterator[dict[str, Any]]:
     response_id = f"resp_{uuid.uuid4().hex}"
     created = int(time.time())
+    items: list[dict[str, Any]] = []
+    output_tokens = 0
     yield response_created(response_id, model, created)
-    for output in image_outputs:
-        if output.kind == "message":
-            text = output.text
-            item = text_output_item(text)
-            usage = token_usage(
-                input_text_tokens=count_text_tokens(prompt, model),
-                input_image_tokens=input_image_tokens,
-                output_text_tokens=count_text_tokens(text, model),
-            )
-            yield {"type": "response.output_text.delta", "item_id": item["id"], "output_index": 0, "content_index": 0, "delta": text}
-            yield {"type": "response.output_text.done", "item_id": item["id"], "output_index": 0, "content_index": 0, "text": text}
-            yield {"type": "response.output_item.done", "output_index": 0, "item": item}
-            yield response_completed(response_id, model, created, [item], usage)
-            return
+    for output in require_image_outputs(image_outputs, expected_count=expected_count):
         if output.kind != "result":
             continue
-        items = image_output_items(prompt, output.data)
-        if items:
-            usage = image_usage(
-                input_text_tokens=count_text_tokens(prompt, model),
-                input_image_tokens=input_image_tokens,
-                output_tokens=count_image_output_items_tokens(output.data, size, quality),
-            )
-            for output_index, item in enumerate(items):
-                yield {"type": "response.output_item.done", "output_index": output_index, "item": item}
-            yield response_completed(response_id, model, created, items, usage)
-            return
-    raise RuntimeError("image generation failed")
+        batch = image_output_items(prompt, output.data)
+        output_tokens += count_image_output_items_tokens(
+            [{"b64_json": item["result"]} for item in batch], size, quality,
+        )
+        for item in batch:
+            output_index = len(items)
+            # Only announce final images; upstream progress is not a partial-image preview.
+            pending_item = {**item, "status": "in_progress", "result": None}
+            yield {"type": "response.output_item.added", "output_index": output_index, "item": pending_item}
+            items.append(item)
+            yield {"type": "response.output_item.done", "output_index": output_index, "item": item}
+    # Responses requires inline image results, even if an upstream result only has a URL.
+    if not items or len(items) < expected_count:
+        raise ImageGenerationError("The requested images were not generated.", code="no_image_generated")
+    usage = image_usage(
+        input_text_tokens=count_text_tokens(prompt, model),
+        input_image_tokens=input_image_tokens,
+        output_tokens=output_tokens,
+    )
+    yield response_completed(response_id, model, created, items, usage)
 
 
 def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -417,38 +417,63 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         if has_web_search_tool(body) and not has_unsupported_response_tools(body):
             yield from stream_web_search_response(body, messages)
             return
-        key = cache_key(body, messages, stream=bool(body.get("stream")))
+        key = "responses:" + cache_key(body, messages, stream=bool(body.get("stream")))
         yield from chat_completion_cache.get_or_compute_stream(
             key,
             lambda: stream_text_response(text_backend(model), body, messages),
         )
         return
 
-    prompt = extract_response_prompt(body.get("input"))
-    if not prompt:
-        raise HTTPException(status_code=400, detail={"error": "input text is required"})
-    model = str(body.get("model") or config.default_image_model).strip() or config.default_image_model
-    image_info = extract_response_image(body.get("input"))
-    if image_info:
-        image_data, mime_type = image_info
-        images = encode_images([(image_data, "image.png", mime_type)])
-    else:
-        images = None
-    input_image_tokens = count_image_content_tokens(_input_image_parts(body.get("input")), model)
-    tool = response_image_tool(body)
-    image_outputs = stream_image_outputs_with_pool(ConversationRequest(
-        prompt=prompt,
-        model=model,
-        size=tool.get("size"),
-        quality=str(tool.get("quality") or "auto"),
-        response_format="b64_json",
-        images=images,
-    ))
-    yield from stream_image_response(image_outputs, prompt, model, input_image_tokens, tool.get("size"), str(tool.get("quality") or "auto"))
+    normalized = normalize_image_request(body, protocol="responses")
+    request = normalized.request
+    input_image_tokens = count_image_inputs_tokens(normalized.images, request.model)
+    image_outputs = stream_image_outputs_with_pool(request)
+    yield from stream_image_response(
+        image_outputs,
+        request.prompt,
+        request.model,
+        input_image_tokens,
+        request.size,
+        request.quality,
+        expected_count=request.n,
+    )
+
+
+def _image_events_with_errors(events: Iterable[dict[str, Any]], body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    response: dict[str, Any] | None = None
+    items: list[dict[str, Any]] = []
+    try:
+        for event in events:
+            if event.get("type") == "response.created":
+                response = event["response"]
+            elif event.get("type") == "response.output_item.done":
+                items.append(event["item"])
+            yield event
+    except Exception as exc:
+        if response is None:
+            model = str(body.get("model") or "auto").strip() or "auto"
+            response = response_created(f"resp_{uuid.uuid4().hex}", model, int(time.time()))["response"]
+        status_code = exc.status_code if isinstance(exc, (ImageGenerationError, HTTPException)) else 502
+        image_error = exc if isinstance(exc, ImageGenerationError) else None
+        # Never expose upstream text, account identifiers or exception details in SSE.
+        message = "The image generation request failed."
+        if image_error and image_error.code == "no_image_generated":
+            message = "The requested images were not generated."
+        error = openai_error_payload(
+            message,
+            status_code,
+            error_type=image_error.error_type if image_error else None,
+            code=image_error.code if image_error else None,
+            param=image_error.param if image_error else None,
+        )["error"]
+        yield {
+            "type": "response.failed",
+            "response": {**response, "status": "failed", "error": error, "output": items},
+        }
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     events = response_events(body)
     if body.get("stream"):
-        return events
+        return _image_events_with_errors(events, body) if not is_text_response_request(body) else events
     return collect_response(events)

@@ -364,6 +364,7 @@ class ConversationRequest:
     response_format: str = "b64_json"
     base_url: str | None = None
     message_as_error: bool = False
+    strict_image_results: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
 
 
@@ -673,7 +674,8 @@ def sanitize_output_text(text: str) -> str:
     text = re.sub(r"(\s*)\ue200([^\ue201]*)\ue201(?=[.,;:!?])", replace_annotation_before_punctuation, text)
     text = re.sub(r"\ue200([^\ue201]*)\ue201", replace_annotation, text)
     text = re.sub(r"\ue200[^\ue201]*$", "", text)
-    text = re.sub(r"\s+([.,;:!?])", r"\1", text)
+    # Only the annotation-specific substitution above may consume spaces.
+    # Global punctuation cleanup corrupts commands such as `find .` and `if !`.
     if config.strip_ui_markup:
         text = strip_ui_markup(text)
     return text
@@ -1715,6 +1717,13 @@ def _generate_single_image(
                     if account_email and not output.account_email:
                         output.account_email = account_email
                     if output.kind == "message" and request.message_as_error:
+                        if request.strict_image_results:
+                            raise ImageGenerationError(
+                                "Image generation returned text instead of an image.",
+                                code="no_image_generated",
+                                account_email=account_email,
+                                conversation_id=output.conversation_id,
+                            )
                         raise ImageGenerationError(
                             output.text or "Image generation was rejected by upstream policy.",
                             status_code=400,
@@ -1960,6 +1969,13 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                     "index": index,
                     "error": str(exc)[:300],
                 })
+
+    if errors and request.strict_image_results:
+        # 一次任务偶然返回多张图，也不能掩盖其他任务的失败。
+        raise ImageGenerationError(
+            "Some requested image generations failed. Please retry the request.",
+            code="incomplete_image_generation",
+        ) from next(iter(errors.values()))
 
     # yield 结果：跳过索引顺序限制，不再让低索引失败阻塞高索引成功结果
     emitted = False

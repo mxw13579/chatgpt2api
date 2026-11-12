@@ -43,7 +43,8 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY main.py ./
-COPY config.json ./
+# Runtime settings belong in the mounted config, never in a published image.
+RUN printf '{}\n' > /app/config.json
 COPY VERSION ./
 COPY api ./api
 COPY services ./services

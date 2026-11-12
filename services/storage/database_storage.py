@@ -40,6 +40,9 @@ class AuthKeyModel(Base):
 class DatabaseStorageBackend(StorageBackend):
     """数据库存储后端（支持 SQLite、PostgreSQL、MySQL 等）"""
 
+    # IN 参数及每批待写入行数有界；兼容旧 SQLite 的 999 参数上限。
+    _ACCOUNT_CHANGE_BATCH_SIZE = 400
+
     def __init__(self, database_url: str):
         self.database_url = database_url
         self.engine = create_engine(
@@ -90,6 +93,54 @@ class DatabaseStorageBackend(StorageBackend):
     def save_accounts(self, accounts: list[dict[str, Any]]) -> None:
         """保存账号数据到数据库"""
         self._save_rows(AccountModel, accounts, "access_token")
+
+    def apply_account_changes(
+        self,
+        upserts: list[dict],
+        deleted_tokens: list[str],
+        *,
+        snapshot: list[dict] | None = None,
+    ) -> None:
+        """只读写指定键，所有分块在同一事务内提交（包括 token 轮换）。
+
+        snapshot 仅供全量后端使用；这里只检查其容器类型，不遍历或持久化
+        其内容。upsert 与删除同键时保留原行并更新，未变账号的 ID 不变。
+        """
+        serialized, deletions = self._prepare_account_changes(
+            upserts, deleted_tokens, snapshot=snapshot,
+        )
+        if not serialized and not deletions:
+            return
+
+        tokens = list(serialized)
+        batch_size = self._ACCOUNT_CHANGE_BATCH_SIZE
+        try:
+            with self.Session() as session, session.begin():
+                for offset in range(0, len(deletions), batch_size):
+                    session.query(AccountModel).filter(
+                        AccountModel.access_token.in_(deletions[offset:offset + batch_size])
+                    ).delete(synchronize_session=False)
+
+                for offset in range(0, len(tokens), batch_size):
+                    batch = tokens[offset:offset + batch_size]
+                    existing = {
+                        row.access_token: row
+                        for row in session.query(AccountModel).filter(
+                            AccountModel.access_token.in_(batch)
+                        ).all()
+                    }
+                    for token in batch:
+                        row = existing.get(token)
+                        data = serialized[token]
+                        if row is None:
+                            session.add(AccountModel(access_token=token, data=data))
+                        elif row.data != data:
+                            row.data = data
+                    # 限制每次 flush 的参数/待写入行数，但不提前 commit。
+                    session.flush()
+        except Exception:
+            # Session 上下文负责回滚；SQLAlchemy 异常常含 token/完整 JSON。
+            raise RuntimeError("Failed to apply account changes") from None
 
     def load_auth_keys(self) -> list[dict[str, Any]]:
         """从数据库加载鉴权密钥数据"""

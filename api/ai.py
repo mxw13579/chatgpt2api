@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
@@ -11,6 +11,7 @@ from services.content_filter import check_request, request_shape, request_text
 from services.config import config
 from services.editable_file_task_service import editable_file_task_service
 from services.log_service import LoggedCall
+from services.protocol.image_compat import image_request_prompt, is_image_request
 from services.protocol import (
     anthropic_v1_messages,
     openai_v1_chat_complete,
@@ -37,7 +38,7 @@ class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str | None = None
     prompt: str | None = None
-    n: int | None = None
+    n: StrictInt | None = None
     stream: bool | None = None
     modalities: list[str] | None = None
     messages: list[dict[str, object]] | None = None
@@ -132,8 +133,15 @@ def create_router() -> APIRouter:
             model,
             "文本生成",
             request_text=request_preview,
-            request_shape=request_shape(payload.get("messages")),
+            request_shape=request_shape(payload.get("messages") if payload.get("messages") is not None else payload.get("input")),
         )
+        if is_image_request(payload):
+            try:
+                request_preview = image_request_prompt(payload, protocol="chat")
+            except HTTPException as exc:
+                call.log("调用失败", status="failed", error=str(exc.detail))
+                raise
+            call.request_text = request_preview
         await filter_or_log(call, request_preview)
         return await call.run(openai_v1_chat_complete.handle, payload)
 
@@ -149,8 +157,15 @@ def create_router() -> APIRouter:
             model,
             "Responses",
             request_text=request_preview,
-            request_shape=request_shape(payload.get("input")),
+            request_shape=request_shape(payload.get("input") if payload.get("input") is not None else payload.get("messages")),
         )
+        if is_image_request(payload):
+            try:
+                request_preview = image_request_prompt(payload, protocol="responses")
+            except HTTPException as exc:
+                call.log("调用失败", status="failed", error=str(exc.detail))
+                raise
+            call.request_text = request_preview
         await filter_or_log(call, request_preview)
         return await call.run(openai_v1_response.handle, payload)
 

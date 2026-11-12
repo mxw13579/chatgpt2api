@@ -23,7 +23,7 @@ from api.support import (
     sanitize_sub2api_server,
     sanitize_sub2api_servers,
 )
-from services.account_service import account_service
+from services.account_service import ProgressCapacityError, account_service
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
 from services.oauth_login_service import OAuthLoginError, oauth_login_service
 from services.sub2api_service import (
@@ -249,21 +249,32 @@ def create_router() -> APIRouter:
     @router.post("/api/accounts/refresh")
     async def refresh_accounts(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        access_tokens = [str(token or "").strip() for token in body.access_tokens if str(token or "").strip()]
+        access_tokens = _unique_tokens(body.access_tokens)
         if not access_tokens:
             access_tokens = account_service.list_tokens()
         if not access_tokens:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
 
         progress_id = str(uuid.uuid4())
+        # 返回 ID / 启动 worker 前预留容量，首次轮询不会遇到尚未 init 的 404。
+        try:
+            account_service.init_refresh_progress(progress_id, len(access_tokens))
+        except ProgressCapacityError:
+            raise HTTPException(status_code=429, detail={"error": "account progress capacity reached; retry later"}) from None
 
         async def _do_refresh():
             try:
                 await run_in_threadpool(account_service.refresh_accounts, access_tokens, progress_id, False)
-            except Exception as e:
-                account_service.finish_refresh_progress(progress_id, error=str(e))
+            except Exception:
+                account_service.finish_refresh_progress(progress_id, error="refresh task failed")
 
-        asyncio.create_task(_do_refresh())
+        worker = _do_refresh()
+        try:
+            asyncio.create_task(worker)
+        except Exception:
+            worker.close()
+            account_service.finish_refresh_progress(progress_id, error="refresh task start failed")
+            raise HTTPException(status_code=503, detail={"error": "refresh task start failed"}) from None
 
         return {"progress_id": progress_id}
 
@@ -279,19 +290,29 @@ def create_router() -> APIRouter:
     async def re_login_accounts(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
         """对选中账号执行密码重新登录流程（密码登录→验证码登录→刷新token）。"""
         require_admin(authorization)
-        access_tokens = [str(token or "").strip() for token in body.access_tokens if str(token or "").strip()]
+        access_tokens = _unique_tokens(body.access_tokens)
         if not access_tokens:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
 
         progress_id = str(uuid.uuid4())
+        try:
+            account_service.init_relogin_progress(progress_id, len(access_tokens))
+        except ProgressCapacityError:
+            raise HTTPException(status_code=429, detail={"error": "account progress capacity reached; retry later"}) from None
 
         async def _do_relogin():
             try:
                 await run_in_threadpool(account_service.re_login_accounts, access_tokens, progress_id)
-            except Exception as e:
-                account_service.finish_relogin_progress(progress_id, error=str(e))
+            except Exception:
+                account_service.finish_relogin_progress(progress_id, error="relogin task failed")
 
-        asyncio.create_task(_do_relogin())
+        worker = _do_relogin()
+        try:
+            asyncio.create_task(worker)
+        except Exception:
+            worker.close()
+            account_service.finish_relogin_progress(progress_id, error="relogin task start failed")
+            raise HTTPException(status_code=503, detail={"error": "relogin task start failed"}) from None
 
         return {"progress_id": progress_id}
 
