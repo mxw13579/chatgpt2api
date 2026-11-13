@@ -19,6 +19,10 @@ MODEL = "gpt-image-2"
 PROMPT = "Draw a synthetic blue square."
 
 
+def collect_chat_content(chunks):
+    return "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
+
+
 def synthetic_png(rgb: tuple[int, int, int]) -> bytes:
     def chunk(kind: bytes, data: bytes) -> bytes:
         return (
@@ -154,7 +158,7 @@ class ChatImageCompatTests(unittest.TestCase):
                     result = chat.handle({"model": MODEL, "stream": stream, **payload})
                     if stream:
                         chunks = list(result)
-                        content = chat.collect_chat_content(chunks)
+                        content = collect_chat_content(chunks)
                         self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
                     else:
                         content = result["choices"][0]["message"]["content"]
@@ -178,7 +182,7 @@ class ChatImageCompatTests(unittest.TestCase):
                 self.pool.return_value = outputs
                 with mock.patch.object(chat, "require_image_outputs", wraps=chat.require_image_outputs) as require:
                     result = chat.handle(body)
-                    content = chat.collect_chat_content(result) if stream else result["choices"][0]["message"]["content"]
+                    content = collect_chat_content(result) if stream else result["choices"][0]["message"]["content"]
                 require.assert_called_once_with(outputs, expected_count=2)
                 request = self.pool.call_args.args[0]
                 self.assertEqual(request.model, MODEL)
@@ -316,7 +320,7 @@ class ChatImageCompatTests(unittest.TestCase):
             self.assertTrue(chunk["choices"][0]["delta"]["content"])
         self.assertEqual(sum("role" in chunk["choices"][0]["delta"] for chunk in chunks), 1)
         self.assertEqual(chunks[-1]["choices"][0], {"index": 0, "delta": {}, "finish_reason": "stop"})
-        content = chat.collect_chat_content(chunks)
+        content = collect_chat_content(chunks)
         self.assertTrue(content.startswith("Drawing synthetic images.\n"))
         for url in IMAGE_URLS:
             self.assertIn(f"]({url})", content)
@@ -346,7 +350,7 @@ class ChatImageCompatTests(unittest.TestCase):
                     result = chat.handle(body)
                     if stream:
                         chunks = list(result)
-                        self.assertEqual(chat.collect_chat_content(chunks), "Synthetic text answer.")
+                        self.assertEqual(collect_chat_content(chunks), "Synthetic text answer.")
                         self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
                         request = self.deltas.call_args.args[1]
                     else:
@@ -392,7 +396,7 @@ class ChatImageCompatTests(unittest.TestCase):
                 if stream:
                     chunks = list(result)
                     self.assertTrue(all(chunk["object"] == "chat.completion.chunk" for chunk in chunks))
-                    self.assertIn("Synthetic search answer.", chat.collect_chat_content(chunks))
+                    self.assertIn("Synthetic search answer.", collect_chat_content(chunks))
                     self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
                 else:
                     message = result["choices"][0]["message"]

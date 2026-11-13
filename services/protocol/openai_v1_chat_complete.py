@@ -139,18 +139,6 @@ def stream_text_chat_completion(
     yield completion_chunk(model, {}, "stop", completion_id, created)
 
 
-def collect_chat_content(chunks: Iterable[dict[str, Any]]) -> str:
-    parts: list[str] = []
-    for chunk in chunks:
-        choices = chunk.get("choices")
-        first = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
-        delta = first.get("delta") if isinstance(first.get("delta"), dict) else {}
-        content = str(delta.get("content") or "")
-        if content:
-            parts.append(content)
-    return "".join(parts)
-
-
 def chat_messages_from_body(body: dict[str, Any]) -> list[dict[str, Any]]:
     messages = body.get("messages")
     if isinstance(messages, list) and messages:

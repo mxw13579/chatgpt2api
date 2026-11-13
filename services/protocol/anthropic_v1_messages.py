@@ -11,8 +11,14 @@ from typing import Any
 
 from services.account_service import account_service
 from services.openai_backend_api import OpenAIBackendAPI
-from services.protocol.conversation import count_message_tokens, count_text_tokens, normalize_messages
-from services.protocol.openai_v1_chat_complete import collect_chat_content, stream_text_chat_completion
+from services.protocol.conversation import (
+    ConversationRequest,
+    collect_text,
+    count_message_tokens,
+    count_text_tokens,
+    normalize_messages,
+    stream_text_deltas,
+)
 
 XML_TOOL_RULE = """Tool output adapter: when calling tools, output ONLY this XML and no prose/markdown:
 <tool_calls><tool_call><tool_name>TOOL_NAME</tool_name><parameters><PARAM><![CDATA[value]]></PARAM></parameters></tool_call></tool_calls>"""
@@ -222,7 +228,7 @@ def parse_tool_value(raw: str) -> object:
         return value
 
 
-def stream_events(chunks: Iterable[dict[str, object]], model: str, input_tokens: int, output_tokens: Callable[[str], int], tools: object = None) -> Iterator[dict[str, object]]:
+def stream_events(deltas: Iterable[str], model: str, input_tokens: int, output_tokens: Callable[[str], int], tools: object = None) -> Iterator[dict[str, object]]:
     message_id = f"msg_{uuid.uuid4()}"
     created = int(time.time())
     current_text = ""
@@ -234,10 +240,7 @@ def stream_events(chunks: Iterable[dict[str, object]], model: str, input_tokens:
     if not tool_mode:
         text_open = True
         yield {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}
-    for chunk in chunks:
-        choice = (chunk.get("choices") or [{}])[0]
-        delta = choice.get("delta") or {}
-        text_delta = delta.get("content", "") if isinstance(delta, dict) else ""
+    for text_delta in deltas:
         if text_delta:
             current_text += text_delta
             if not tool_started:
@@ -251,25 +254,23 @@ def stream_events(chunks: Iterable[dict[str, object]], model: str, input_tokens:
                         streamed_text = visible_text
                         yield {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text_delta}}
                 tool_started = tool_mode and visible_text != current_text
-        if choice.get("finish_reason"):
-            content, stop_reason = content_blocks(current_text, tools)
-            if text_open:
-                yield {"type": "content_block_stop", "index": 0}
-            if stop_reason == "tool_use":
-                start_index = 1 if text_open else 0
-                if content and content[0]["type"] == "text":
-                    remaining = str(content[0].get("text") or "")[len(streamed_text):]
-                    if remaining:
-                        if not text_open:
-                            yield {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}
-                        yield {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": remaining}}
-                        if not text_open:
-                            yield {"type": "content_block_stop", "index": 0}
-                    start_index = 1
-                    content = content[1:]
-                yield from _stream_buffered_blocks(content, start_index)
-            yield {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": output_tokens(current_text)}}
-            break
+    content, stop_reason = content_blocks(current_text, tools)
+    if text_open:
+        yield {"type": "content_block_stop", "index": 0}
+    if stop_reason == "tool_use":
+        start_index = 1 if text_open else 0
+        if content and content[0]["type"] == "text":
+            remaining = str(content[0].get("text") or "")[len(streamed_text):]
+            if remaining:
+                if not text_open:
+                    yield {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}
+                yield {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": remaining}}
+                if not text_open:
+                    yield {"type": "content_block_stop", "index": 0}
+            start_index = 1
+            content = content[1:]
+        yield from _stream_buffered_blocks(content, start_index)
+    yield {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": output_tokens(current_text)}}
     yield {"type": "message_stop", "created": created}
 
 
@@ -289,15 +290,16 @@ def _stream_buffered_blocks(content: list[dict[str, object]], start_index: int =
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     request = message_request(body)
+    conversation_request = ConversationRequest(model=request.model, messages=request.messages)
     if body.get("stream"):
         return stream_events(
-            stream_text_chat_completion(request.backend, request.messages, request.model),
+            stream_text_deltas(request.backend, conversation_request),
             request.model,
             count_message_tokens(request.messages, request.model),
             lambda text: count_text_tokens(text, request.model),
             request.tools,
         )
-    text = collect_chat_content(stream_text_chat_completion(request.backend, request.messages, request.model))
+    text = collect_text(request.backend, conversation_request)
     return message_response(
         request.model,
         text,
