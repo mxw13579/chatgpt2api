@@ -18,7 +18,7 @@ from unittest import mock
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from api import ai
+from api import ai, support
 from services.log_service import log_service
 from services.protocol import chat_completion_cache as cache_module
 from services.protocol import conversation
@@ -150,7 +150,7 @@ class ImageCompatHTTPFixture(unittest.TestCase):
             "id": "synthetic-key-id", "name": "Synthetic HTTP fixture", "role": "admin",
         })
         # Keep this a Mock: the filtering tests assert the actual inspected text.
-        self.request_filter = self.patch_object(ai, "check_request", return_value=None)
+        self.request_filter = self.patch_object(support, "check_request", return_value=None)
         self.log_add = self.patch_object(log_service, "add", return_value=None)
         self.patches.enter_context(mock.patch("utils.helper.logger"))
         self.remote_get = self.patches.enter_context(mock.patch(

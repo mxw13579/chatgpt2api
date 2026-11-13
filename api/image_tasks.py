@@ -5,8 +5,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
-from api.support import require_identity, resolve_image_base_url
-from services.content_filter import check_request
+from api.support import filter_or_log, require_identity, resolve_image_base_url
 from services.config import config
 from services.image_task_service import image_task_service
 from services.log_service import LoggedCall
@@ -26,14 +25,6 @@ class ResumePollRequest(BaseModel):
 
 def _parse_task_ids(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
-
-
-async def filter_or_log(call: LoggedCall, text: str) -> None:
-    try:
-        await run_in_threadpool(check_request, text)
-    except HTTPException as exc:
-        call.log("调用失败", status="failed", error=str(exc.detail))
-        raise
 
 
 def create_router() -> APIRouter:

@@ -4,10 +4,13 @@ from pathlib import Path
 from threading import Event, Thread
 
 from fastapi import HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 
 from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config
+from services.content_filter import check_request
+from services.log_service import LoggedCall
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
@@ -44,6 +47,14 @@ def require_admin(authorization: str | None) -> dict[str, object]:
     if identity.get("role") != "admin":
         raise HTTPException(status_code=403, detail={"error": "需要管理员权限才能执行这个操作"})
     return identity
+
+
+async def filter_or_log(call: LoggedCall, text: str) -> None:
+    try:
+        await run_in_threadpool(check_request, text)
+    except HTTPException as exc:
+        call.log("调用失败", status="failed", error=str(exc.detail))
+        raise
 
 
 def resolve_image_base_url(request: Request) -> str:
