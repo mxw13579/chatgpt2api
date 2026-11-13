@@ -567,10 +567,11 @@ class ImageCompatTests(unittest.TestCase):
                     [{"b64_json": " " + PNG_B64 + " "}], "draw", response_format,
                 )["data"]
                 if response_format == "b64_json":
+                    self.assertEqual(data, [{"b64_json": PNG_B64, "revised_prompt": "draw"}])
                     result = self.output(data=data)
                     self.assertIs(list(self.compat.require_image_outputs([result]))[0], result)
                 else:
-                    self.assertNotIn("b64_json", data[0])
+                    self.assertEqual(data, [{"url": "https://synthetic.invalid/image.png", "revised_prompt": "draw"}])
                 decode.assert_called_once_with(PNG_B64, validate=True)
                 save.assert_called_once_with(PNG_BYTES, None)
 

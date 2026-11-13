@@ -247,7 +247,7 @@ curl http://localhost:8000/v1/images/generations \
 | `model`           | 图片模型，当前可用值以 `/v1/models` 返回结果为准，推荐使用 `gpt-image-2` |
 | `prompt`          | 图片生成提示词                                            |
 | `n`               | 生成数量，当前后端限制为 `1-4`                                 |
-| `response_format` | 当前请求模型中包含该字段，默认值为 `b64_json`                       |
+| `response_format` | 默认 `b64_json`，仅返回 Base64；设为 `url` 时仅返回图片 URL，不同时返回两者 |
 
 <br>
 </details>

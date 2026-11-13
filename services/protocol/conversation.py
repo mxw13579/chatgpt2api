@@ -340,12 +340,12 @@ def format_image_result(
         except (ValueError, binascii.Error):
             raise ImageGenerationError("Image generation returned invalid base64 image data.", code="no_image_generated") from None
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
-        result_item = {
-            "url": save_image_bytes(image_data, base_url),
-            "revised_prompt": revised_prompt,
-        }
+        image_url = save_image_bytes(image_data, base_url)
+        result_item = {"revised_prompt": revised_prompt}
         if response_format == "b64_json":
             result_item["b64_json"] = b64_json
+        else:
+            result_item["url"] = image_url
         data.append(result_item)
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if message and not data:
