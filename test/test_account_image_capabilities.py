@@ -36,20 +36,6 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(service._normalize_account_type("prolite"), "ProLite")
             self.assertEqual(service._normalize_account_type("pro_lite"), "ProLite")
 
-    def test_search_account_type_ignores_unrelated_scalar_values(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
-            self.assertIsNone(
-                service._search_account_type(
-                    {
-                        "amr": ["pwd", "otp", "mfa"],
-                        "chatgpt_compute_residency": "no_constraint",
-                        "chatgpt_data_residency": "no_constraint",
-                        "user_id": "user-I52GFfLGFM0dokFk2dBiKEBn",
-                    }
-                )
-            )
-
     def test_mark_image_result_consumes_quota(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
@@ -79,9 +65,10 @@ class AccountCapabilityTests(unittest.TestCase):
             with patch("services.account_service.time.monotonic", return_value=100.0):
                 token = service.get_available_access_token(plan_type="plus")
                 service.mark_image_result(token, success=False, cooldown_secs=30)
-                candidates = service._list_available_candidate_tokens(plan_type="plus")
+                next_token = service.get_available_access_token(plan_type="plus")
+                service.release_image_slot(next_token)
 
-            self.assertNotIn(token, candidates)
+            self.assertNotEqual(token, next_token)
 
     def test_split_image_model_supports_plan_type_prefix(self) -> None:
         self.assertEqual(split_image_model("gpt-image-2"), (None, "gpt-image-2"))

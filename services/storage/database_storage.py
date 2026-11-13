@@ -76,19 +76,7 @@ class DatabaseStorageBackend(StorageBackend):
 
     def load_accounts(self) -> list[dict[str, Any]]:
         """从数据库加载账号数据"""
-        session = self.Session()
-        try:
-            accounts = []
-            for row in session.query(AccountModel).all():
-                try:
-                    account_data = json.loads(row.data)
-                    if isinstance(account_data, dict):
-                        accounts.append(account_data)
-                except json.JSONDecodeError:
-                    continue
-            return accounts
-        finally:
-            session.close()
+        return self._load_rows(AccountModel)
 
     def save_accounts(self, accounts: list[dict[str, Any]]) -> None:
         """保存账号数据到数据库"""

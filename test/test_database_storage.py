@@ -24,6 +24,18 @@ def _account_rows(backend: DatabaseStorageBackend) -> dict[str, AccountModel]:
         session.close()
 
 
+def test_load_accounts_skips_invalid_json_and_non_objects(delta_backend):
+    account = {"access_token": "synthetic-valid", "quota": 2}
+    with delta_backend.Session() as session, session.begin():
+        session.add_all([
+            AccountModel(access_token="synthetic-valid", data=json.dumps(account)),
+            AccountModel(access_token="synthetic-invalid-json", data="{"),
+            AccountModel(access_token="synthetic-list", data="[]"),
+            AccountModel(access_token="synthetic-null", data="null"),
+        ])
+    assert delta_backend.load_accounts() == [account]
+
+
 def test_save_accounts_accepts_access_token_longer_than_legacy_varchar_limit(tmp_path):
     backend = DatabaseStorageBackend(f"sqlite:///{tmp_path / 'accounts.db'}")
     token = "eyJ" + ("a" * 4000)

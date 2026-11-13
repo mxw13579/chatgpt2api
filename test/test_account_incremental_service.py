@@ -164,10 +164,57 @@ class IncrementalAccountTests(unittest.TestCase):
         self.assert_last_delta(["fixture-a"])
         self.service._record_invalid_token_seen("fixture-a", "fixture", "fixture-invalid")
         self.assert_last_delta(["fixture-a"])
-        self.service._record_refresh_success("fixture-a")
-        self.assert_last_delta(["fixture-a"])
-        self.assertEqual(self.storage.rows["fixture-a"]["invalid_count"], 0)
-        self.assertEqual(len(self.storage.change_calls), 5)
+        self.assertEqual(self.storage.rows["fixture-a"]["invalid_count"], 1)
+        self.assertEqual(len(self.storage.change_calls), 4)
+
+    def test_candidate_selection_scans_ready_once_and_preserves_round_robin(self):
+        self.service._index = 1
+        with patch.object(
+            self.service, "_list_ready_candidate_tokens", wraps=self.service._list_ready_candidate_tokens,
+        ) as ready:
+            token = self.service._acquire_next_candidate_token()
+        ready.assert_called_once_with(None, None, None, None)
+        self.assertEqual(token, "fixture-b")
+        self.assertEqual(self.service._index, 2)
+        self.assertEqual(self.service._image_inflight, {"fixture-b": 1})
+
+    def test_candidate_selection_recomputes_ready_after_busy_wait(self):
+        for blocker in ("concurrency", "cooldown"):
+            with self.subTest(blocker=blocker):
+                self.service._accounts["fixture-a"]["quota"] = 4
+                self.service._accounts["fixture-b"]["quota"] = 0
+                self.service._image_inflight = (
+                    {"fixture-a": self.fixture.config.image_account_concurrency} if blocker == "concurrency" else {}
+                )
+                self.service._image_cooldown_until = {"fixture-a": 10} if blocker == "cooldown" else {}
+
+                def change_ready_after_wait(*, timeout):
+                    self.assertEqual(wait.call_count, 1, "candidate selection must use the updated ready list")
+                    self.assertTrue(self.service._lock.locked())
+                    self.service._accounts["fixture-a"]["quota"] = 0
+                    self.service._accounts["fixture-b"]["quota"] = 3
+
+                with patch.object(
+                    self.service, "_list_ready_candidate_tokens", wraps=self.service._list_ready_candidate_tokens,
+                ) as ready, patch.object(
+                    self.service._image_slot_condition, "wait", side_effect=change_ready_after_wait,
+                ) as wait:
+                    self.assertEqual(self.service._acquire_next_candidate_token(), "fixture-b")
+                wait.assert_called_once_with(timeout=1.0)
+                self.assertEqual(ready.call_count, 2)
+
+    def test_candidate_selection_without_ready_accounts_does_not_wait(self):
+        for account in self.service._accounts.values():
+            account["quota"] = 0
+        with patch.object(
+            self.service, "_list_ready_candidate_tokens", wraps=self.service._list_ready_candidate_tokens,
+        ) as ready, patch.object(
+            self.service._image_slot_condition, "wait", side_effect=AssertionError("unexpected wait"),
+        ) as wait:
+            with self.assertRaisesRegex(RuntimeError, "^no available image quota$"):
+                self.service._acquire_next_candidate_token()
+        ready.assert_called_once_with(None, None, None, None)
+        wait.assert_not_called()
 
     def test_image_result_updates_quota_and_releases_slot_even_on_failure(self):
         token = self.service._acquire_next_candidate_token()
@@ -398,6 +445,13 @@ class IncrementalAccountTests(unittest.TestCase):
                 self.assertEqual(storage.rows["fixture-new"], before)
 
     def test_fetch_remote_fixture_combines_success_and_quota_in_one_write(self):
+        self.service._accounts["fixture-a"].update({
+            "invalid_count": 2,
+            "last_invalid_at": "2024-01-01T00:00:00+00:00",
+            "last_refresh_error": "fixture-invalid",
+            "last_refresh_error_at": "2024-01-01T00:00:00+00:00",
+        })
+        self.service._accounts = NoPoolTraversal(self.service._accounts)
         backend = Mock()
         backend.get_user_info.return_value = {"quota": 8, "status": "正常"}
         with patch("services.openai_backend_api.OpenAIBackendAPI", return_value=backend) as backend_class:
@@ -407,6 +461,8 @@ class IncrementalAccountTests(unittest.TestCase):
         self.assert_last_delta(["fixture-a"])
         self.assertEqual(self.storage.rows["fixture-a"]["quota"], 8)
         self.assertEqual(self.storage.rows["fixture-a"]["invalid_count"], 0)
+        for field in ("last_invalid_at", "last_refresh_error", "last_refresh_error_at"):
+            self.assertIsNone(self.storage.rows["fixture-a"][field])
         backend.close.assert_called_once()
 
     def test_persistence_failure_not_swallowed_by_candidate_selection(self):

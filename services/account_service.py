@@ -250,23 +250,6 @@ class AccountService:
         }
         return aliases.get(compact) or aliases.get(key) or raw
 
-    def _search_account_type(self, payload: object) -> str | None:
-        if isinstance(payload, dict):
-            for key in ("plan_type", "account_plan", "account_type", "subscription_type", "type"):
-                plan = self._normalize_account_type(payload.get(key))
-                if plan:
-                    return plan
-            for value in payload.values():
-                plan = self._search_account_type(value)
-                if plan:
-                    return plan
-        elif isinstance(payload, list):
-            for value in payload:
-                plan = self._search_account_type(value)
-                if plan:
-                    return plan
-        return None
-
     def _normalize_account(self, item: dict) -> dict | None:
         if not isinstance(item, dict):
             return None
@@ -952,22 +935,6 @@ class AccountService:
                and token not in excluded
         ]
 
-    def _list_available_candidate_tokens(
-            self,
-            excluded_tokens: set[str] | None = None,
-            plan_type: str | None = None,
-            source_type: str | None = None,
-            plan_types: set[str] | tuple[str, ...] | None = None,
-    ) -> list[str]:
-        max_concurrency = max(1, int(config.image_account_concurrency or 1))
-        now = time.monotonic()
-        return [
-            token
-            for token in self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
-            if int(self._image_inflight.get(token, 0)) < max_concurrency
-               and float(self._image_cooldown_until.get(token, 0.0)) <= now
-        ]
-
     def _acquire_next_candidate_token(
             self,
             excluded_tokens: set[str] | None = None,
@@ -977,12 +944,19 @@ class AccountService:
     ) -> str:
         with self._image_slot_condition:
             while True:
-                if not self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
+                ready_tokens = self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
+                if not ready_tokens:
                     raise RuntimeError(
                         f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
                         if plan_type or source_type else "no available image quota"
                     )
-                tokens = self._list_available_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
+                max_concurrency = max(1, int(config.image_account_concurrency or 1))
+                now = time.monotonic()
+                tokens = [
+                    token for token in ready_tokens
+                    if int(self._image_inflight.get(token, 0)) < max_concurrency
+                       and float(self._image_cooldown_until.get(token, 0.0)) <= now
+                ]
                 if tokens:
                     access_token = tokens[self._index % len(tokens)]
                     self._index += 1
@@ -1278,21 +1252,6 @@ class AccountService:
                 )
             return dict(account)
         return None
-
-    def _record_refresh_success(self, access_token: str) -> None:
-        with self._lock:
-            access_token = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(access_token)
-            if current is None:
-                return
-            next_item = dict(current)
-            next_item["invalid_count"] = 0
-            next_item["last_invalid_at"] = None
-            next_item["last_refresh_error"] = None
-            next_item["last_refresh_error_at"] = None
-            account = self._normalize_account(next_item)
-            if account is not None:
-                self._apply_account_changes_locked([account], [])
 
     def _should_defer_invalid_token(self, account: dict | None, now: datetime) -> bool:
         if not isinstance(account, dict):
