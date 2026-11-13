@@ -233,19 +233,17 @@ def web_search_call_item(
 
 
 def image_output_items(prompt: str, data: list[dict[str, Any]], item_id: str | None = None) -> list[dict[str, Any]]:
-    output = []
     id_prefix = item_id or f"ig_{uuid.uuid4().hex}"
-    for item in data:
-        b64_json = str(item.get("b64_json") or "").strip()
-        if b64_json:
-            output.append({
-                "id": id_prefix if not output else f"{id_prefix}_{len(output)}",
-                "type": "image_generation_call",
-                "status": "completed",
-                "result": b64_json,
-                "revised_prompt": str(item.get("revised_prompt") or prompt).strip() or prompt,
-            })
-    return output
+    return [
+        {
+            "id": id_prefix if index == 0 else f"{id_prefix}_{index}",
+            "type": "image_generation_call",
+            "status": "completed",
+            "result": item["b64_json"],
+            "revised_prompt": str(item.get("revised_prompt") or prompt).strip() or prompt,
+        }
+        for index, item in enumerate(data)
+    ]
 
 
 def response_created(response_id: str, model: str, created: int) -> dict[str, Any]:
@@ -390,9 +388,6 @@ def stream_image_response(
             yield {"type": "response.output_item.added", "output_index": output_index, "item": pending_item}
             items.append(item)
             yield {"type": "response.output_item.done", "output_index": output_index, "item": item}
-    # Responses requires inline image results, even if an upstream result only has a URL.
-    if not items or len(items) < expected_count:
-        raise ImageGenerationError("The requested images were not generated.", code="no_image_generated")
     usage = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
         input_image_tokens=input_image_tokens,

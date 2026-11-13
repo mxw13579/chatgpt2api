@@ -276,7 +276,6 @@ class ResponsesImageCompatTests(unittest.TestCase):
         cases = [
             ("empty", [], 1),
             ("empty_result", [image_result()], 1),
-            ("blank_image", [image_result(" ")], 1),
             ("message_only", [text_only_output()], 1),
             ("short", [image_result(PNG_FIRST)], 2),
         ]

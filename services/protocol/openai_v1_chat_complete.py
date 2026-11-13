@@ -9,7 +9,6 @@ from fastapi import HTTPException
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
 from services.protocol.conversation import (
     ConversationRequest,
-    ImageGenerationError,
     ImageOutput,
     collect_image_outputs,
     collect_text,
@@ -217,17 +216,6 @@ def stream_web_search_chat_completion(messages: list[dict[str, Any]], model: str
     yield completion_chunk(model, {}, "stop", completion_id, created)
 
 
-def image_result_content(result: dict[str, Any]) -> str:
-    data = result.get("data")
-    # Chat images must be inline; never use the Markdown helper's text-only fallback.
-    if not isinstance(data, list) or not data or not all(
-        isinstance(item, dict) and str(item.get("b64_json") or "").strip()
-        for item in data
-    ):
-        raise ImageGenerationError("Image generation returned no inline image data.")
-    return build_chat_image_markdown_content(result)
-
-
 def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
     normalized = normalize_image_request(body, protocol="chat")
     request = normalized.request
@@ -235,7 +223,7 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         stream_image_outputs_with_pool(request),
         expected_count=request.n,
     ))
-    response = completion_response(request.model, image_result_content(result), int(result.get("created") or 0) or None)
+    response = completion_response(request.model, build_chat_image_markdown_content(result), int(result.get("created") or 0) or None)
     usage = image_usage(
         input_text_tokens=count_text_tokens(request.prompt, request.model),
         input_image_tokens=count_image_inputs_tokens(normalized.images, request.model),
@@ -266,7 +254,7 @@ def stream_image_chat_completion(
         if output.kind == "progress":
             content = output.text
         elif output.kind == "result":
-            content = image_result_content({"data": output.data})
+            content = build_chat_image_markdown_content({"data": output.data})
         if not content:
             continue
         if not sent_role:

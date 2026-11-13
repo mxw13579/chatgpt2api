@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import re
 import threading
@@ -333,18 +334,19 @@ def format_image_result(
         b64_json = str(item.get("b64_json") or "").strip()
         if not b64_json:
             continue
+        # Decode upstream data once, at the same boundary that saves the image.
+        try:
+            image_data = base64.b64decode(b64_json, validate=True)
+        except (ValueError, binascii.Error):
+            raise ImageGenerationError("Image generation returned invalid base64 image data.", code="no_image_generated") from None
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
+        result_item = {
+            "url": save_image_bytes(image_data, base_url),
+            "revised_prompt": revised_prompt,
+        }
         if response_format == "b64_json":
-            data.append({
-                "b64_json": b64_json,
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
-                "revised_prompt": revised_prompt,
-            })
-        else:
-            data.append({
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
-                "revised_prompt": revised_prompt,
-            })
+            result_item["b64_json"] = b64_json
+        data.append(result_item)
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if message and not data:
         result["message"] = message

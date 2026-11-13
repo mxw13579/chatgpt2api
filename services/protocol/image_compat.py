@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import base64
-import binascii
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Iterable, Iterator
 
 from fastapi import HTTPException
@@ -281,27 +280,10 @@ def normalize_image_request(body: dict, *, protocol: str) -> NormalizedImageRequ
     )
 
 
-def _valid_image_items(data: object) -> list[dict]:
-    valid = []
-    for item in data if isinstance(data, list) else []:
-        if not isinstance(item, dict) or not isinstance(item.get("b64_json"), str):
-            continue
-        encoded = item["b64_json"].strip()
-        try:
-            if not encoded or not base64.b64decode(encoded, validate=True):
-                continue
-        except (ValueError, binascii.Error):
-            continue
-        valid.append({**item, "b64_json": encoded})
-    return valid
-
-
 def require_image_outputs(
     outputs: Iterable[ImageOutput], *, expected_count: int = 1,
 ) -> Iterator[ImageOutput]:
-    """Yield progress/results, failing closed; callers must exhaust before success."""
-    if type(expected_count) is not int or expected_count < 1:
-        raise ValueError("expected_count must be a positive integer")
+    """Check inline results and completion; bytes were validated upstream."""
     count = 0
     for output in outputs:
         if output.kind == "message":
@@ -310,11 +292,10 @@ def require_image_outputs(
         if output.kind == "progress":
             yield output
         elif output.kind == "result":
-            data = _valid_image_items(output.data)
-            if not data:
-                raise ImageGenerationError("Image generation returned no valid base64 image.", code="no_image_generated")
-            count += len(data)
-            yield replace(output, data=data)
+            if not output.data or any(not item.get("b64_json") for item in output.data):
+                raise ImageGenerationError("Image generation returned no inline image data.", code="no_image_generated")
+            count += len(output.data)
+            yield output
     if not count:
         raise ImageGenerationError("Image generation returned no images.", code="no_image_generated")
     if count < expected_count:

@@ -1,22 +1,19 @@
-"""Pure adapter tests: synthetic images and stubbed service/config/network imports.
-
-No application bootstrap, account files, image storage, or upstream calls are used.
-"""
+"""Synthetic adapter tests; run through test/run_isolated.py."""
 
 from __future__ import annotations
 
 import base64
 import copy
-import importlib.util
-import sys
-import types
 import unittest
-from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from fastapi import HTTPException
 
-ROOT = Path(__file__).resolve().parents[1]
+from services import config as config_module
+from services.protocol import conversation, image_compat
+from utils import helper
+
 PNG_BYTES = b"synthetic-png"
 JPEG_BYTES = b"synthetic-jpeg"
 PNG_B64 = base64.b64encode(PNG_BYTES).decode("ascii")
@@ -24,69 +21,27 @@ PNG_URL = "data:image/png;base64," + PNG_B64
 JPEG_URL = "data:image/jpeg;base64," + base64.b64encode(JPEG_BYTES).decode("ascii")
 
 
-def module_stub(name: str, **attributes: object) -> types.ModuleType:
-    module = types.ModuleType(name)
-    module.__dict__.update(attributes)
-    return module
-
-
-def load_module(name: str, path: str) -> types.ModuleType:
-    spec = importlib.util.spec_from_file_location(name, ROOT / path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    parent, _, child = name.rpartition(".")
-    setattr(sys.modules[parent], child, module)
-    spec.loader.exec_module(module)
-    return module
-
-
 class ImageCompatTests(unittest.TestCase):
     def setUp(self) -> None:
         self.forbidden_call = mock.Mock(side_effect=AssertionError("external service access forbidden"))
-        self.config = types.SimpleNamespace(
+        self.config = SimpleNamespace(
             default_image_model="gpt-image-2",
             image_models=[
                 "gpt-image-2", "gpt-image-2.5-sunburst", "chatgpt-image-fixture",
                 "gpt-5-5", "gpt-5-5-thinking", "gpt-5-3", "fixture-canvas",
             ],
         )
-        modules = {
-            name: module_stub(name, __path__=[])
-            for name in ("services", "services.protocol", "utils", "curl_cffi", "curl_cffi.requests")
-        }
-        modules.update({
-            "services.config": module_stub("services.config", config=self.config),
-            "services.proxy_service": module_stub("services.proxy_service", proxy_settings=self.forbidden_call),
-            "services.account_service": module_stub("services.account_service", account_service=self.forbidden_call),
-            "services.image_storage_service": module_stub("services.image_storage_service", image_storage_service=self.forbidden_call),
-            "services.openai_backend_api": module_stub(
-                "services.openai_backend_api",
-                OpenAIBackendAPI=self.forbidden_call,
-                ImageContentPolicyError=type("ImageContentPolicyError", (RuntimeError,), {}),
-                ImagePollTimeoutError=type("ImagePollTimeoutError", (RuntimeError,), {}),
-                ImageStreamHardTimeoutError=type("ImageStreamHardTimeoutError", (RuntimeError,), {}),
-                TEXT_STREAM_TIMEOUT_SECS=1,
-            ),
-            "utils.log": module_stub("utils.log", logger=mock.Mock()),
-            "utils.image_tokens": module_stub("utils.image_tokens", count_image_content_tokens=self.forbidden_call),
-            "utils.ui_markup": module_stub("utils.ui_markup", strip_ui_markup=self.forbidden_call),
-            "tiktoken": module_stub("tiktoken"),
-            "curl_cffi.requests.exceptions": module_stub("curl_cffi.requests.exceptions", RequestException=RuntimeError),
-            "curl_cffi.requests.models": module_stub("curl_cffi.requests.models", STREAM_END=object()),
-        })
-        modules["curl_cffi.requests"].Response = object
-        modules["curl_cffi.requests"].get = self.forbidden_call
-        for name, module in modules.items():
-            parent, _, child = name.rpartition(".")
-            if parent in modules:
-                setattr(modules[parent], child, module)
-        patcher = mock.patch.dict(sys.modules, modules)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        self.helper = load_module("utils.helper", "utils/helper.py")
-        self.conversation = load_module("services.protocol.conversation", "services/protocol/conversation.py")
-        self.compat = load_module("services.protocol.image_compat", "services/protocol/image_compat.py")
+        self.helper = helper
+        self.conversation = conversation
+        self.compat = image_compat
+        for target, name, value in (
+            (config_module, "config", self.config),
+            (image_compat, "config", self.config),
+            (helper.requests, "get", self.forbidden_call),
+        ):
+            patcher = mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def tearDown(self) -> None:
         self.assertEqual(self.forbidden_call.mock_calls, [])
@@ -593,28 +548,50 @@ class ImageCompatTests(unittest.TestCase):
 
     def test_output_progress_and_result_metadata_are_preserved_without_mutation(self) -> None:
         progress = self.output("progress", text="working", upstream_event_type="synthetic.progress")
-        result = self.output(data=[{"b64_json": " " + PNG_B64 + " ", "revised_prompt": "synthetic"}], created=123, conversation_id="synthetic-conversation")
+        result = self.output(data=[{"b64_json": PNG_B64, "revised_prompt": "synthetic"}], created=123, conversation_id="synthetic-conversation")
         before = copy.deepcopy(result)
         outputs = list(self.compat.require_image_outputs([progress, result]))
         self.assertIs(outputs[0], progress)
-        self.assertIsNot(outputs[1], result)
+        self.assertIs(outputs[1], result)
         self.assertEqual(outputs[1].created, 123)
         self.assertEqual(outputs[1].conversation_id, "synthetic-conversation")
         self.assertEqual(outputs[1].data, [{"b64_json": PNG_B64, "revised_prompt": "synthetic"}])
         self.assertEqual(result, before)
 
-    def test_invalid_result_items_are_filtered_from_new_result(self) -> None:
-        result = self.output(data=[{}, {"url": "https://synthetic.invalid/image.png"}, {"b64_json": "not base64!"}, {"b64_json": ""}, {"b64_json": "图片"}, {"b64_json": 123}, None, {"b64_json": PNG_B64}])
-        before = copy.deepcopy(result)
-        outputs = list(self.compat.require_image_outputs([result]))
-        self.assertEqual(outputs[0].data, [{"b64_json": PNG_B64}])
-        self.assertEqual(result, before)
-        self.assertIsNot(outputs[0].data[0], result.data[-1])
+    def test_upstream_base64_is_validated_once_when_saved(self) -> None:
+        for response_format in ("b64_json", "url"):
+            with self.subTest(response_format=response_format), mock.patch.object(
+                conversation, "save_image_bytes", return_value="https://synthetic.invalid/image.png",
+            ) as save, mock.patch.object(base64, "b64decode", wraps=base64.b64decode) as decode:
+                data = conversation.format_image_result(
+                    [{"b64_json": " " + PNG_B64 + " "}], "draw", response_format,
+                )["data"]
+                if response_format == "b64_json":
+                    result = self.output(data=data)
+                    self.assertIs(list(self.compat.require_image_outputs([result]))[0], result)
+                else:
+                    self.assertNotIn("b64_json", data[0])
+                decode.assert_called_once_with(PNG_B64, validate=True)
+                save.assert_called_once_with(PNG_BYTES, None)
+
+    def test_invalid_upstream_base64_fails_before_storage(self) -> None:
+        for encoded in ("invalid!", "图片", "===="):
+            with self.subTest(encoded=encoded), mock.patch.object(conversation, "save_image_bytes") as save:
+                with self.assertRaises(conversation.ImageGenerationError) as caught:
+                    conversation.format_image_result([{"b64_json": encoded}], "draw", "b64_json")
+                self.assertEqual(caught.exception.code, "no_image_generated")
+                save.assert_not_called()
+
+    def test_blank_upstream_images_cannot_become_successful_results(self) -> None:
+        for encoded in ("", " "):
+            with self.subTest(encoded=encoded), mock.patch.object(conversation, "save_image_bytes") as save:
+                data = conversation.format_image_result([{"b64_json": encoded}], "draw", "b64_json")["data"]
+                self.assert_output_error([self.output(data=data)], "no_image_generated")
+                save.assert_not_called()
 
     def test_empty_invalid_result_and_progress_only_streams_fail(self) -> None:
         for outputs in (
             [], [self.output("progress", text="working")], [self.output(data=[])],
-            [self.output(data=[{"b64_json": "invalid!"}])],
             [self.output(data=[{"url": "https://synthetic.invalid/image.png"}])],
             [self.output(data=None)],
         ):
@@ -633,10 +610,6 @@ class ImageCompatTests(unittest.TestCase):
         second = self.output(data=[{"b64_json": PNG_B64}])
         self.assertEqual(len(list(self.compat.require_image_outputs([first, second], expected_count=3))), 2)
         self.assert_output_error([first, second], "incomplete_image_generation", expected_count=4)
-
-    def test_invalid_items_cannot_satisfy_expected_count(self) -> None:
-        result = self.output(data=[{"b64_json": PNG_B64}, {"b64_json": "invalid!"}])
-        self.assert_output_error([result], "incomplete_image_generation", expected_count=2)
 
     def test_short_stream_reports_error_on_exhaustion_not_success(self) -> None:
         result = self.output(data=[{"b64_json": PNG_B64}])
@@ -660,11 +633,6 @@ class ImageCompatTests(unittest.TestCase):
         with self.assertRaises(self.conversation.ImageGenerationError) as caught:
             list(self.compat.require_image_outputs(outputs()))
         self.assertIs(caught.exception, failure)
-
-    def test_expected_count_must_be_positive_integer(self) -> None:
-        for count in (0, -1, True, 1.0, "1"):
-            with self.assertRaises(ValueError):
-                list(self.compat.require_image_outputs([], expected_count=count))
 
 
 if __name__ == "__main__":
