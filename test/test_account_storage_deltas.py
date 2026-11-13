@@ -230,25 +230,19 @@ def test_json_fallback_does_not_reapply_delta_to_supplied_snapshot(tmp_path, mon
     assert JSONStorageBackend.load_accounts(backend) == final
 
 
-@pytest.mark.parametrize(
-    "snapshot",
-    [
-        pytest.param([None], id="invalid-record"),
-        pytest.param([{"password": _PASSWORD}], id="missing-key"),
-        pytest.param([{"access_token": _TOKEN}] * 2, id="duplicate-key"),
-        pytest.param([{"access_token": _TOKEN, "password": {_PASSWORD}}], id="invalid-json"),
-    ],
-)
-def test_json_fallback_validates_snapshot_before_io(tmp_path, monkeypatch, snapshot):
+def test_json_snapshot_is_encoded_once_when_saved(tmp_path, monkeypatch):
+    import json
+
     backend = JSONStorageBackend(tmp_path / "synthetic-accounts.json")
+    snapshot = [{"access_token": _TOKEN, "quota": 3}]
+    encode = Mock(wraps=json.dumps)
+    monkeypatch.setattr(json, "dumps", encode)
     monkeypatch.setattr(backend, "load_accounts", _reject_io)
-    monkeypatch.setattr(backend, "save_accounts", _reject_io)
 
-    with pytest.raises(ValueError) as exc_info:
-        backend.apply_account_changes([], [], snapshot=snapshot)
+    backend.apply_account_changes([], [], snapshot=snapshot)
 
-    _assert_redacted(exc_info.value)
-    assert not backend.file_path.exists()
+    encode.assert_called_once_with(snapshot, ensure_ascii=False, indent=2)
+    assert JSONStorageBackend.load_accounts(backend) == snapshot
 
 
 @pytest.mark.parametrize("method", ["load_accounts", "save_accounts"])

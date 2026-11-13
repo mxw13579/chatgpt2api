@@ -33,9 +33,7 @@ class StorageBackend(ABC):
         serialized, deletions = self._prepare_account_changes(
             upserts, deleted_tokens, snapshot=snapshot,
         )
-        if snapshot is not None:
-            self._serialize_account_items(snapshot)
-        elif not serialized and not deletions:
+        if snapshot is None and not serialized and not deletions:
             return
 
         try:

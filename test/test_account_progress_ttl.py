@@ -1,30 +1,31 @@
-"""Isolated progress/API fixtures: no app import, real credentials, HTTP or login.
+"""Real service/API modules with synthetic fixtures for the isolated-copy runner.
 
-Execution is intentionally left to the coordinator's approved isolated test run.
+Do not execute in the live working directory; no real authentication is exercised.
 """
 from __future__ import annotations
 
-import ast
 import asyncio
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from copy import deepcopy
-from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, patch
 
-from test.test_account_incremental_service import (
-    MemoryIncrementalStorage,
-    install_log_io_failure,
-    load_isolated_service,
-)
+from fastapi import HTTPException
+
+from api import accounts as accounts_api
+import services.account_service as account_service_module
+from test.test_account_incremental_service import MemoryIncrementalStorage, account_service_fixture
 
 
 class ProgressTTLTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = load_isolated_service(MemoryIncrementalStorage([
+        self.patches = ExitStack()
+        self.addCleanup(self.patches.close)
+        self.fixture = self.patches.enter_context(account_service_fixture(MemoryIncrementalStorage([
             {"access_token": "fixture-a", "quota": 3, "password": "fixture-old-password"},
-        ]))
+        ])))
         self.service = self.fixture.service
         self.clock = self.fixture.clock
 
@@ -221,8 +222,8 @@ class ProgressTTLTests(unittest.TestCase):
             assert_progress_lock_free()
             return list_accounts()
 
-        self.service.get_account = checked_get
-        self.service.list_accounts = checked_list
+        self.patches.enter_context(patch.object(self.service, "get_account", checked_get))
+        self.patches.enter_context(patch.object(self.service, "list_accounts", checked_list))
         self.service.init_refresh_progress("refresh", 1)
         self.service.update_refresh_progress("refresh", "fixture-a")
         self.service.finish_refresh_progress("refresh", {"refreshed": 1, "errors": []})
@@ -276,12 +277,14 @@ class ProgressTTLTests(unittest.TestCase):
             self.assertIsNotNone(progress["result"])
 
     def test_executor_start_failure_finishes_before_propagating(self):
-        self.fixture.namespace["ThreadPoolExecutor"] = Mock(side_effect=RuntimeError("fixture-start-failure"))
-        with self.assertRaisesRegex(RuntimeError, "fixture-start-failure"):
-            self.service.refresh_accounts(["fixture-a"], "start-failure")
+        with patch.object(
+            account_service_module, "ThreadPoolExecutor", side_effect=RuntimeError("fixture-start-failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "fixture-start-failure"):
+                self.service.refresh_accounts(["fixture-a"], "start-failure")
         self.assertTrue(self.service.get_refresh_progress("start-failure")["done"])
 
-    def test_relogin_workers_finish_once_and_expire_despite_log_io_failures(self):
+    def test_relogin_workers_finish_once_and_expire_despite_log_failure(self):
         outcomes = [
             ("success", {"ok": True, "access_token": "fixture-new", "refresh_token": "fixture-new-refresh"}, "成功"),
             ("rejected", {"ok": False, "error": "invalid_password"}, "异常"),
@@ -292,172 +295,161 @@ class ProgressTTLTests(unittest.TestCase):
                                         "access_token": "synthetic-detail-secret"}}, "禁用"),
             ("exception", RuntimeError("synthetic-auth-secret"), "异常"),
         ]
-        for operation in ("append", "rotation"):
-            for label, outcome, status in outcomes:
-                for stderr_fails in (False, True):
-                    with self.subTest(operation=operation, outcome=label, stderr_fails=stderr_fails):
-                        fixture = load_isolated_service(MemoryIncrementalStorage([{
-                            "access_token": "fixture-a", "quota": 3, "status": "异常",
-                            "password": "fixture-password", "refresh_token": "fixture-refresh",
-                        }]))
-                        service = fixture.service
-                        fixture.config.auto_remove_invalid_accounts = True
-                        failure = install_log_io_failure(fixture, operation)
-                        stderr = fixture.namespace["sys"].stderr.write
-                        if stderr_fails:
-                            stderr.side_effect = OSError("synthetic-stderr-secret")
-                        service._login_with_password = (
-                            Mock(side_effect=outcome) if isinstance(outcome, Exception)
-                            else Mock(return_value=outcome)
-                        )
-                        service.remove_invalid_token = Mock(wraps=service.remove_invalid_token)
-                        service.update_relogin_progress = Mock(wraps=service.update_relogin_progress)
-                        service._PROGRESS_MAX_ENTRIES = 1
-                        service.init_relogin_progress("worker", 1)
-                        fixture.clock.now = 25
-                        service._password_re_login_thread(
-                            "fixture-a", "fixture@example.invalid", "fixture-password", "fixture", "worker",
-                        )
-                        error = "account operation failed" if status == "异常" else None
-                        service.update_relogin_progress.assert_called_once_with("worker", "fixture-a", status, error)
-                        progress = service.get_relogin_progress("worker")
-                        self.assertTrue(progress["done"])
-                        self.assertEqual(progress["processed"], 1)
-                        self.assertEqual(len(progress["results"]), 1)
-                        self.assertEqual(progress["results"][0]["status"], status)
-                        self.assertEqual(progress["result"]["relogined"], int(status == "成功"))
-                        self.assertEqual(len(progress["result"]["errors"]), int(status == "异常"))
-                        if status == "异常":
-                            service.remove_invalid_token.assert_called_once()
-                            self.assertEqual(service.storage.rows, {})
-                            self.assertEqual(service._accounts, {})
-                        else:
-                            service.remove_invalid_token.assert_not_called()
-                            account = service.get_account("fixture-a")
-                            self.assertEqual(account["status"], "正常" if status == "成功" else "禁用")
-                            self.assertEqual(account["quota"], 3 if status == "成功" else 0)
-                            self.assertEqual(account["password"], "fixture-password")
-                            self.assertEqual(account, service.storage.rows[account["access_token"]])
-                            if status == "成功":
-                                self.assertEqual(account["access_token"], "fixture-new")
-                                self.assertEqual(account["refresh_token"], "fixture-new-refresh")
-                                self.assertEqual(account["source_type"], "password")
-                                self.assertEqual(len(service.storage.change_calls), 2)
-                        getattr(failure, "append" if operation == "append" else "replace").assert_called()
-                        getattr(failure, "replace" if operation == "append" else "append").assert_not_called()
-                        self.assertEqual(stderr.call_count, failure.logger.add.call_count)
-                        for call in stderr.call_args_list:
-                            self.assertEqual(call.args, ("AccountService: account log write failed\n",))
-                            self.assertEqual(call.kwargs, {})
-                        for secret in ("synthetic-auth-secret", "synthetic-detail-secret", "synthetic-log-secret"):
-                            self.assertNotIn(secret, repr(failure.logger.add.call_args_list))
-                            self.assertNotIn(secret, repr(service._relogin_progress))
-                        fixture.clock.now = 1824.999
-                        with self.assertRaises(fixture.capacity_error):
-                            service.init_refresh_progress("too-early", 1)
-                        fixture.clock.now = 1825
-                        service.init_refresh_progress("capacity-recovered", 1)
-                        self.assertIsNone(service.get_relogin_progress("worker"))
-
-    def test_relogin_storage_failures_never_report_success_even_when_logging_fails(self):
-        for operation in ("append", "rotation"):
-            for failed_write in (1, 2):
-                with self.subTest(operation=operation, failed_write=failed_write):
-                    storage = MemoryIncrementalStorage([{
-                        "access_token": "fixture-a", "status": "异常", "quota": 3,
-                        "password": "fixture-password", "refresh_token": "fixture-refresh",
-                    }])
-                    fixture = load_isolated_service(storage)
-                    service = fixture.service
-                    fixture.config.auto_remove_invalid_accounts = True
-                    failure = install_log_io_failure(fixture, operation)
-                    fixture.namespace["sys"].stderr.write.side_effect = OSError("synthetic-stderr-secret")
-                    before_accounts = deepcopy(service._accounts)
-                    before_rows = deepcopy(storage.rows)
-                    service._image_inflight["fixture-a"] = 2
-                    service._image_cooldown_until["fixture-a"] = 50
-
-                    def fail_selected_write():
-                        storage.fail = len(storage.change_calls) + 1 == failed_write
-
-                    storage.lock_probe = fail_selected_write
-                    service._login_with_password = Mock(return_value={
-                        "ok": True, "access_token": "fixture-new", "refresh_token": "fixture-new-refresh",
-                    })
-                    service.remove_invalid_token = Mock(wraps=service.remove_invalid_token)
-                    service.update_relogin_progress = Mock(wraps=service.update_relogin_progress)
-                    service.init_relogin_progress("worker", 1)
-                    service._password_re_login_thread(
-                        "fixture-a", "fixture@example.invalid", "fixture-password", "fixture", "worker",
-                    )
-                    service.remove_invalid_token.assert_not_called()
-                    service.update_relogin_progress.assert_called_once_with(
-                        "worker", "fixture-a", "异常", "account persistence failed",
-                    )
-                    progress = service.get_relogin_progress("worker")
-                    self.assertTrue(progress["done"])
-                    self.assertEqual(progress["processed"], 1)
-                    self.assertEqual(progress["result"]["relogined"], 0)
-                    self.assertEqual(len(progress["result"]["errors"]), 1)
-                    self.assertEqual(len(storage.change_calls), failed_write)
-                    self.assertEqual(storage.save_calls, [])
-                    if failed_write == 1:
-                        self.assertEqual(service._accounts, before_accounts)
-                        self.assertEqual(storage.rows, before_rows)
-                        self.assertEqual(service._token_aliases, {})
-                        token = "fixture-a"
-                    else:
-                        # The first delta committed; the second must not alter memory or delete it.
-                        token = "fixture-new"
-                        self.assertEqual(service._accounts, storage.rows)
-                        self.assertEqual(set(storage.rows), {token})
-                        self.assertEqual(storage.rows[token]["status"], "异常")
-                        self.assertEqual(storage.rows[token]["source_type"], "web")
-                        self.assertEqual(service._token_aliases, {"fixture-a": token})
-                    self.assertEqual(service._image_inflight, {token: 2})
-                    self.assertEqual(service._image_cooldown_until, {token: 50})
-                    self.assertNotIn("synthetic-storage-secret", repr(failure.logger.add.call_args_list))
-                    self.assertNotIn("synthetic-storage-secret", repr(service._relogin_progress))
-
-    def test_relogin_exception_cleanup_storage_failure_still_finishes_once(self):
-        for operation in ("append", "rotation"):
-            with self.subTest(operation=operation):
-                fixture = load_isolated_service(MemoryIncrementalStorage([{"access_token": "fixture-a"}]))
+        for label, outcome, status in outcomes:
+            storage = MemoryIncrementalStorage([{
+                "access_token": "fixture-a", "quota": 3, "status": "异常",
+                "password": "fixture-password", "refresh_token": "fixture-refresh",
+            }])
+            with self.subTest(outcome=label), account_service_fixture(storage) as fixture, ExitStack() as patches:
                 service = fixture.service
                 fixture.config.auto_remove_invalid_accounts = True
-                service.storage.fail = True
-                before = deepcopy(service._accounts)
-                install_log_io_failure(fixture, operation)
-                fixture.namespace["sys"].stderr.write.side_effect = OSError("synthetic-stderr-secret")
-                service._login_with_password = Mock(side_effect=RuntimeError("synthetic-auth-secret"))
-                service.update_relogin_progress = Mock(wraps=service.update_relogin_progress)
+                fixture.log_add.side_effect = OSError("synthetic-log-secret")
+                fixture.stderr.side_effect = OSError("synthetic-stderr-secret")
+                login = Mock(side_effect=outcome) if isinstance(outcome, Exception) else Mock(return_value=outcome)
+                patches.enter_context(patch.object(service, "_login_with_password", login))
+                remove = patches.enter_context(patch.object(service, "remove_invalid_token", wraps=service.remove_invalid_token))
+                update = patches.enter_context(patch.object(service, "update_relogin_progress", wraps=service.update_relogin_progress))
+                service._PROGRESS_MAX_ENTRIES = 1
                 service.init_relogin_progress("worker", 1)
-                with self.assertRaisesRegex(fixture.persistence_error, "^account persistence failed$"):
-                    service._password_re_login_thread(
-                        "fixture-a", "fixture@example.invalid", "fixture-password", "fixture", "worker",
-                    )
-                service.update_relogin_progress.assert_called_once_with(
-                    "worker", "fixture-a", "异常", "account operation failed",
+                fixture.clock.now = 25
+                service._password_re_login_thread(
+                    "fixture-a", "fixture@example.invalid", "fixture-password", "fixture", "worker",
                 )
+                error = "account operation failed" if status == "异常" else None
+                update.assert_called_once_with("worker", "fixture-a", status, error)
+                progress = service.get_relogin_progress("worker")
+                self.assertTrue(progress["done"])
+                self.assertEqual(progress["processed"], 1)
+                self.assertEqual(len(progress["results"]), 1)
+                self.assertEqual(progress["results"][0]["status"], status)
+                self.assertEqual(progress["result"]["relogined"], int(status == "成功"))
+                self.assertEqual(len(progress["result"]["errors"]), int(status == "异常"))
+                if status == "异常":
+                    remove.assert_called_once()
+                    self.assertEqual(storage.rows, {})
+                    self.assertEqual(service._accounts, {})
+                else:
+                    remove.assert_not_called()
+                    account = service.get_account("fixture-a")
+                    self.assertEqual(account["status"], "正常" if status == "成功" else "禁用")
+                    self.assertEqual(account["quota"], 3 if status == "成功" else 0)
+                    self.assertEqual(account["password"], "fixture-password")
+                    self.assertEqual(account, storage.rows[account["access_token"]])
+                    if status == "成功":
+                        self.assertEqual(account["access_token"], "fixture-new")
+                        self.assertEqual(account["refresh_token"], "fixture-new-refresh")
+                        self.assertEqual(account["source_type"], "password")
+                        self.assertEqual(len(storage.change_calls), 2)
+                fixture.log_add.assert_called()
+                self.assertEqual(fixture.stderr.call_count, fixture.log_add.call_count)
+                for call in fixture.stderr.call_args_list:
+                    self.assertEqual(call.args, ("AccountService: account log write failed\n",))
+                    self.assertEqual(call.kwargs, {})
+                for secret in ("synthetic-auth-secret", "synthetic-detail-secret", "synthetic-log-secret"):
+                    self.assertNotIn(secret, repr(fixture.log_add.call_args_list))
+                    self.assertNotIn(secret, repr(service._relogin_progress))
+                fixture.clock.now = 1824.999
+                with self.assertRaises(fixture.capacity_error):
+                    service.init_refresh_progress("too-early", 1)
+                fixture.clock.now = 1825
+                service.init_refresh_progress("capacity-recovered", 1)
+                self.assertIsNone(service.get_relogin_progress("worker"))
+
+    def test_relogin_storage_failures_never_report_success_even_when_logging_fails(self):
+        for failed_write in (1, 2):
+            storage = MemoryIncrementalStorage([{
+                "access_token": "fixture-a", "status": "异常", "quota": 3,
+                "password": "fixture-password", "refresh_token": "fixture-refresh",
+            }])
+            with self.subTest(failed_write=failed_write), account_service_fixture(storage) as fixture, ExitStack() as patches:
+                service = fixture.service
+                fixture.config.auto_remove_invalid_accounts = True
+                fixture.log_add.side_effect = OSError("synthetic-log-secret")
+                fixture.stderr.side_effect = OSError("synthetic-stderr-secret")
+                before_accounts = deepcopy(service._accounts)
+                before_rows = deepcopy(storage.rows)
+                service._image_inflight["fixture-a"] = 2
+                service._image_cooldown_until["fixture-a"] = 50
+
+                def fail_selected_write():
+                    storage.fail = len(storage.change_calls) + 1 == failed_write
+
+                storage.lock_probe = fail_selected_write
+                patches.enter_context(patch.object(service, "_login_with_password", return_value={
+                    "ok": True, "access_token": "fixture-new", "refresh_token": "fixture-new-refresh",
+                }))
+                remove = patches.enter_context(patch.object(service, "remove_invalid_token", wraps=service.remove_invalid_token))
+                update = patches.enter_context(patch.object(service, "update_relogin_progress", wraps=service.update_relogin_progress))
+                service.init_relogin_progress("worker", 1)
+                service._password_re_login_thread(
+                    "fixture-a", "fixture@example.invalid", "fixture-password", "fixture", "worker",
+                )
+                remove.assert_not_called()
+                update.assert_called_once_with("worker", "fixture-a", "异常", "account persistence failed")
                 progress = service.get_relogin_progress("worker")
                 self.assertTrue(progress["done"])
                 self.assertEqual(progress["processed"], 1)
                 self.assertEqual(progress["result"]["relogined"], 0)
                 self.assertEqual(len(progress["result"]["errors"]), 1)
-                self.assertEqual(service._accounts, before)
-                self.assertEqual(set(service.storage.rows), {"fixture-a"})
+                self.assertEqual(len(storage.change_calls), failed_write)
+                self.assertEqual(storage.save_calls, [])
+                if failed_write == 1:
+                    self.assertEqual(service._accounts, before_accounts)
+                    self.assertEqual(storage.rows, before_rows)
+                    self.assertEqual(service._token_aliases, {})
+                    token = "fixture-a"
+                else:
+                    # The first delta committed; the second must not alter memory or delete it.
+                    token = "fixture-new"
+                    self.assertEqual(service._accounts, storage.rows)
+                    self.assertEqual(set(storage.rows), {token})
+                    self.assertEqual(storage.rows[token]["status"], "异常")
+                    self.assertEqual(storage.rows[token]["source_type"], "web")
+                    self.assertEqual(service._token_aliases, {"fixture-a": token})
+                self.assertEqual(service._image_inflight, {token: 2})
+                self.assertEqual(service._image_cooldown_until, {token: 50})
+                self.assertNotIn("synthetic-storage-secret", repr(fixture.log_add.call_args_list))
+                self.assertNotIn("synthetic-storage-secret", repr(service._relogin_progress))
+
+    def test_relogin_exception_cleanup_storage_failure_still_finishes_once(self):
+        self.fixture.config.auto_remove_invalid_accounts = True
+        self.service.storage.fail = True
+        before = deepcopy(self.service._accounts)
+        self.fixture.log_add.side_effect = OSError("synthetic-log-secret")
+        self.fixture.stderr.side_effect = OSError("synthetic-stderr-secret")
+        self.patches.enter_context(patch.object(
+            self.service, "_login_with_password", side_effect=RuntimeError("synthetic-auth-secret"),
+        ))
+        update = self.patches.enter_context(patch.object(
+            self.service, "update_relogin_progress", wraps=self.service.update_relogin_progress,
+        ))
+        self.service.init_relogin_progress("worker", 1)
+        with self.assertRaisesRegex(self.fixture.persistence_error, "^account persistence failed$"):
+            self.service._password_re_login_thread(
+                "fixture-a", "fixture@example.invalid", "fixture-password", "fixture", "worker",
+            )
+        update.assert_called_once_with("worker", "fixture-a", "异常", "account operation failed")
+        progress = self.service.get_relogin_progress("worker")
+        self.assertTrue(progress["done"])
+        self.assertEqual(progress["processed"], 1)
+        self.assertEqual(progress["result"]["relogined"], 0)
+        self.assertEqual(len(progress["result"]["errors"]), 1)
+        self.assertEqual(self.service._accounts, before)
+        self.assertEqual(set(self.service.storage.rows), {"fixture-a"})
 
     def test_relogin_progress_callback_error_is_not_retried_as_authentication_failure(self):
-        install_log_io_failure(self.fixture, "append")
-        self.service._login_with_password = Mock(return_value={"ok": True, "access_token": "fixture-new"})
-        self.service.remove_invalid_token = Mock(wraps=self.service.remove_invalid_token)
+        self.fixture.log_add.side_effect = OSError("synthetic-log-secret")
+        self.patches.enter_context(patch.object(
+            self.service, "_login_with_password", return_value={"ok": True, "access_token": "fixture-new"},
+        ))
+        self.patches.enter_context(patch.object(self.service, "remove_invalid_token", wraps=self.service.remove_invalid_token))
         update = self.service.update_relogin_progress
 
         def update_then_raise(*args):
             update(*args)
             raise RuntimeError("fixture-progress-failure")
 
-        self.service.update_relogin_progress = Mock(side_effect=update_then_raise)
+        self.patches.enter_context(patch.object(self.service, "update_relogin_progress", side_effect=update_then_raise))
         self.service.init_relogin_progress("worker", 1)
         with self.assertRaisesRegex(RuntimeError, "^fixture-progress-failure$"):
             self.service._password_re_login_thread(
@@ -472,9 +464,9 @@ class ProgressTTLTests(unittest.TestCase):
         self.assertEqual(self.service.get_account("fixture-new")["status"], "正常")
 
     def test_relogin_worker_abort_still_finishes_once_before_propagating(self):
-        self.service._login_with_password = Mock(side_effect=SystemExit("fixture-abort"))
-        self.service.remove_invalid_token = Mock(wraps=self.service.remove_invalid_token)
-        self.service.update_relogin_progress = Mock(wraps=self.service.update_relogin_progress)
+        self.patches.enter_context(patch.object(self.service, "_login_with_password", side_effect=SystemExit("fixture-abort")))
+        self.patches.enter_context(patch.object(self.service, "remove_invalid_token", wraps=self.service.remove_invalid_token))
+        self.patches.enter_context(patch.object(self.service, "update_relogin_progress", wraps=self.service.update_relogin_progress))
         self.service.init_relogin_progress("worker", 1)
         with self.assertRaises(SystemExit):
             self.service._password_re_login_thread(
@@ -491,8 +483,8 @@ class ProgressTTLTests(unittest.TestCase):
 
     def test_relogin_thread_start_failure_is_tracked_without_authentication(self):
         self.service.update_account("fixture-a", {"email": "fixture@example.invalid"})
-        self.fixture.namespace["Thread"] = Mock(side_effect=RuntimeError("fixture-thread-failure"))
-        result = self.service.re_login_accounts(["fixture-a"], "thread-failure")
+        with patch.object(account_service_module, "Thread", side_effect=RuntimeError("fixture-thread-failure")):
+            result = self.service.re_login_accounts(["fixture-a"], "thread-failure")
         self.assertEqual(result["relogined"], 0)
         self.assertEqual(len(result["errors"]), 1)
         progress = self.service.get_relogin_progress("thread-failure")
@@ -501,84 +493,44 @@ class ProgressTTLTests(unittest.TestCase):
         self.assertEqual(len(progress["results"]), 1)
 
 
-class FixtureHTTPException(Exception):
-    def __init__(self, status_code, detail):
-        super().__init__("fixture HTTP error")
-        self.status_code = status_code
-        self.detail = detail
-
-
-class FixtureRouter:
-    def __init__(self):
-        self.routes = {}
-
-    def register(self, method, path):
-        def decorate(function):
-            self.routes[(method, path)] = function
-            return function
-        return decorate
-
-    def get(self, path):
-        return self.register("GET", path)
-
-    def post(self, path):
-        return self.register("POST", path)
-
-    def delete(self, path):
-        return self.register("DELETE", path)
-
-
-def load_isolated_routes(fixture, create_task, run_in_threadpool):
-    path = Path(__file__).resolve().parents[1] / "api" / "accounts.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    definitions = [
-        node for node in tree.body
-        if (isinstance(node, ast.ImportFrom) and node.module == "__future__")
-        or (isinstance(node, ast.FunctionDef) and node.name in {"_unique_tokens", "create_router"})
-    ]
-    namespace = {
-        "__name__": "isolated_account_routes_fixture",
-        "__builtins__": fixture.namespace["__builtins__"],
-        "APIRouter": FixtureRouter,
-        "Header": lambda **kwargs: None,
-        "HTTPException": FixtureHTTPException,
-        "require_admin": Mock(),
-        "account_service": fixture.service,
-        "ProgressCapacityError": fixture.capacity_error,
-        "uuid": SimpleNamespace(uuid4=lambda: "fixture-job"),
-        "asyncio": SimpleNamespace(create_task=create_task),
-        "run_in_threadpool": run_in_threadpool,
-    }
-    exec(compile(ast.Module(body=definitions, type_ignores=[]), str(path), "exec"), namespace)
-    return namespace["create_router"]().routes
-
-
 class ProgressAPIRaceTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = load_isolated_service(MemoryIncrementalStorage([
+        self.patches = ExitStack()
+        self.addCleanup(self.patches.close)
+        self.fixture = self.patches.enter_context(account_service_fixture(MemoryIncrementalStorage([
             {"access_token": "fixture-a", "quota": 2},
-        ]))
+        ])))
         self.service = self.fixture.service
         self.pending = []
+        self.addCleanup(self.close_pending)
+        self.create_task = Mock(side_effect=self.pending.append)
+        self.run_in_threadpool = AsyncMock(side_effect=lambda function, *args: function(*args))
+        self.patches.enter_context(patch.object(accounts_api, "account_service", self.service))
+        self.patches.enter_context(patch.object(accounts_api, "require_admin"))
+        self.patches.enter_context(patch.object(accounts_api, "uuid", SimpleNamespace(uuid4=lambda: "fixture-job")))
+        self.patches.enter_context(patch.object(accounts_api, "asyncio", SimpleNamespace(create_task=self.create_task)))
+        self.patches.enter_context(patch.object(accounts_api, "run_in_threadpool", self.run_in_threadpool))
+        self.routes = {
+            (method, route.path): route.endpoint
+            for route in accounts_api.create_router().routes
+            for method in route.methods
+        }
 
-        async def run_in_threadpool(function, *args):
-            return function(*args)
-
-        self.run_in_threadpool = run_in_threadpool
-        self.routes = load_isolated_routes(self.fixture, self.pending.append, run_in_threadpool)
-
-    def tearDown(self):
+    def close_pending(self):
         for worker in self.pending:
             worker.close()
+        self.pending.clear()
 
     def post(self, kind):
         return self.routes[("POST", f"/api/accounts/{kind}")]
 
     def test_first_poll_exists_before_worker_runs_and_double_init_is_safe(self):
-        self.service.fetch_remote_info = lambda token, *args: self.service.get_account(token)
+        self.patches.enter_context(patch.object(
+            self.service, "fetch_remote_info", side_effect=lambda token, *args: self.service.get_account(token),
+        ))
         for path, kind in (("refresh", "refresh"), ("re-login", "relogin")):
             with self.subTest(path=path):
-                body = SimpleNamespace(access_tokens=[" fixture-a ", "fixture-a"])
+                body = accounts_api.AccountRefreshRequest(access_tokens=[" fixture-a ", "fixture-a"])
                 response = asyncio.run(self.post(path)(body, "fixture-admin"))
                 self.assertEqual(response, {"progress_id": "fixture-job"})
                 poll = self.routes[("GET", f"/api/accounts/{path}/progress/{{progress_id}}")]
@@ -597,53 +549,33 @@ class ProgressAPIRaceTests(unittest.TestCase):
         self.service.init_refresh_progress("occupied", 1)
         for path in ("refresh", "re-login"):
             with self.subTest(path=path):
-                with self.assertRaises(FixtureHTTPException) as caught:
-                    asyncio.run(self.post(path)(SimpleNamespace(access_tokens=["fixture-a"]), "fixture-admin"))
+                with self.assertRaises(HTTPException) as caught:
+                    asyncio.run(self.post(path)(
+                        accounts_api.AccountRefreshRequest(access_tokens=["fixture-a"]), "fixture-admin",
+                    ))
                 self.assertEqual(caught.exception.status_code, 429)
+                self.create_task.assert_not_called()
                 self.assertEqual(self.pending, [])
                 self.assertIsNone(self.service.get_refresh_progress("fixture-job"))
                 self.assertIsNone(self.service.get_relogin_progress("fixture-job"))
                 self.assertFalse(self.service.get_refresh_progress("occupied")["done"])
 
     def test_expired_poll_returns_not_found_for_both_task_types(self):
-        for path, kind in (("refresh", "refresh"), ("re-login", "relogin")):
+        for kind in ("refresh", "relogin"):
             getattr(self.service, f"init_{kind}_progress")("expired", 0)
             getattr(self.service, f"finish_{kind}_progress")("expired")
         self.fixture.clock.now = 1800
         for path in ("refresh", "re-login"):
             poll = self.routes[("GET", f"/api/accounts/{path}/progress/{{progress_id}}")]
-            with self.assertRaises(FixtureHTTPException) as caught:
+            with self.assertRaises(HTTPException) as caught:
                 asyncio.run(poll("expired", "fixture-admin"))
             self.assertEqual(caught.exception.status_code, 404)
 
-    def test_scheduling_failure_closes_coroutine_and_finishes_reserved_record(self):
-        closed = []
-
-        def fail_schedule(worker):
-            closed.append(worker)
-            raise RuntimeError("fixture-scheduler-failure")
-
-        routes = load_isolated_routes(self.fixture, fail_schedule, self.run_in_threadpool)
-        for path, kind in (("refresh", "refresh"), ("re-login", "relogin")):
-            with self.subTest(path=path):
-                with self.assertRaises(FixtureHTTPException) as caught:
-                    asyncio.run(routes[("POST", f"/api/accounts/{path}")](
-                        SimpleNamespace(access_tokens=["fixture-a"]), "fixture-admin",
-                    ))
-                self.assertEqual(caught.exception.status_code, 503)
-                self.assertIsNone(closed[-1].cr_frame)
-                progress = getattr(self.service, f"get_{kind}_progress")("fixture-job")
-                self.assertTrue(progress["done"])
-                self.assertIsNotNone(progress["error"])
-
     def test_background_failure_is_recorded_without_exception_credentials(self):
-        async def fail_worker(function, *args):
-            raise RuntimeError("fixture-exception-credential")
-
-        routes = load_isolated_routes(self.fixture, self.pending.append, fail_worker)
+        self.run_in_threadpool.side_effect = RuntimeError("fixture-exception-credential")
         for path, kind in (("refresh", "refresh"), ("re-login", "relogin")):
-            asyncio.run(routes[("POST", f"/api/accounts/{path}")](
-                SimpleNamespace(access_tokens=["fixture-a"]), "fixture-admin",
+            asyncio.run(self.post(path)(
+                accounts_api.AccountRefreshRequest(access_tokens=["fixture-a"]), "fixture-admin",
             ))
             asyncio.run(self.pending.pop(0))
             progress = getattr(self.service, f"get_{kind}_progress")("fixture-job")

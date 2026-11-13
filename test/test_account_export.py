@@ -1,12 +1,15 @@
 import base64
 import json
 import unittest
+from contextlib import ExitStack
 from typing import Any
+from unittest.mock import patch
 
 from services.account_service import AccountService
+from services.storage.base import StorageBackend
 
 
-class MemoryStorage:
+class MemoryStorage(StorageBackend):
     def __init__(self, accounts: list[dict[str, Any]] | None = None) -> None:
         self.accounts = list(accounts or [])
 
@@ -38,6 +41,13 @@ def make_jwt(payload: dict[str, Any]) -> str:
 
 
 class AccountExportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        patches = ExitStack()
+        self.addCleanup(patches.close)
+        patches.enter_context(patch.object(AccountService, "_load_cumulative_total", lambda self: len(self._accounts)))
+        patches.enter_context(patch.object(AccountService, "_save_cumulative_total"))
+        patches.enter_context(patch("services.account_service.log_service"))
+
     def test_build_export_items_uses_codex_shape_and_jwt_claims(self) -> None:
         access_token = make_jwt(
             {

@@ -268,13 +268,7 @@ def create_router() -> APIRouter:
             except Exception:
                 account_service.finish_refresh_progress(progress_id, error="refresh task failed")
 
-        worker = _do_refresh()
-        try:
-            asyncio.create_task(worker)
-        except Exception:
-            worker.close()
-            account_service.finish_refresh_progress(progress_id, error="refresh task start failed")
-            raise HTTPException(status_code=503, detail={"error": "refresh task start failed"}) from None
+        asyncio.create_task(_do_refresh())
 
         return {"progress_id": progress_id}
 
@@ -306,13 +300,7 @@ def create_router() -> APIRouter:
             except Exception:
                 account_service.finish_relogin_progress(progress_id, error="relogin task failed")
 
-        worker = _do_relogin()
-        try:
-            asyncio.create_task(worker)
-        except Exception:
-            worker.close()
-            account_service.finish_relogin_progress(progress_id, error="relogin task start failed")
-            raise HTTPException(status_code=503, detail={"error": "relogin task start failed"}) from None
+        asyncio.create_task(_do_relogin())
 
         return {"progress_id": progress_id}
 

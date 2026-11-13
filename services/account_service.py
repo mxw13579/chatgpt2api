@@ -153,26 +153,18 @@ class AccountService:
         """持有账号锁时调用。只提交明确的变更，成功后才更新内存。
 
         基类实现需要完整快照（JSON/Git），覆盖该方法的增量后端不需要。
-        旧测试 stub 没有新方法时才使用 save_accounts；写入失败不能降级重试。
         """
         if not upserts and not deleted_tokens:
             return
-        apply_changes = getattr(self.storage, "apply_account_changes", None)
         snapshot = None
-        if not callable(apply_changes) or (
-            getattr(apply_changes, "__func__", None)
-            is getattr(StorageBackend, "apply_account_changes", None)
-        ):
+        if type(self.storage).apply_account_changes is StorageBackend.apply_account_changes:
             snapshot_by_token = dict(self._accounts)
             for token in deleted_tokens:
                 snapshot_by_token.pop(token, None)
             snapshot_by_token.update((item["access_token"], item) for item in upserts)
             snapshot = list(snapshot_by_token.values())
         try:
-            if callable(apply_changes):
-                apply_changes(upserts, deleted_tokens, snapshot=snapshot)
-            else:
-                self.storage.save_accounts(snapshot)
+            self.storage.apply_account_changes(upserts, deleted_tokens, snapshot=snapshot)
         except Exception:
             # DB 异常可能带 SQL 参数（包括 token），不要透传到 API/日志。
             raise AccountPersistenceError("account persistence failed") from None
