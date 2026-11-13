@@ -281,11 +281,6 @@ export type SystemLog = {
   [key: string]: unknown;
 };
 
-export type ImageResponse = {
-  created: number;
-  data: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
-};
-
 export type ImageTask = {
   id: string;
   status: "queued" | "running" | "success" | "error";
@@ -418,49 +413,6 @@ export async function updateAccount(
       ...updates,
     },
   });
-}
-
-export async function generateImage(prompt: string, model?: ImageModel, size?: string, quality = "auto") {
-  return httpRequest<ImageResponse>(
-    "/v1/images/generations",
-    {
-      method: "POST",
-      body: {
-        prompt,
-        ...(model ? { model } : {}),
-        ...(size ? { size } : {}),
-        quality,
-        n: 1,
-        response_format: "b64_json",
-      },
-    },
-  );
-}
-
-export async function editImage(files: File | File[], prompt: string, model?: ImageModel, size?: string, quality = "auto") {
-  const formData = new FormData();
-  const uploadFiles = Array.isArray(files) ? files : [files];
-
-  uploadFiles.forEach((file) => {
-    formData.append("image", file);
-  });
-  formData.append("prompt", prompt);
-  if (model) {
-    formData.append("model", model);
-  }
-  if (size) {
-    formData.append("size", size);
-  }
-  formData.append("quality", quality);
-  formData.append("n", "1");
-
-  return httpRequest<ImageResponse>(
-    "/v1/images/edits",
-    {
-      method: "POST",
-      body: formData,
-    },
-  );
 }
 
 export async function createImageGenerationTask(clientTaskId: string, prompt: string, model?: ImageModel, size?: string, quality = "auto") {
@@ -896,11 +848,6 @@ export async function fetchSub2APIImportJob(serverId: string) {
 
 // ── Upstream proxy ────────────────────────────────────────────────
 
-export type ProxySettings = {
-  enabled: boolean;
-  url: string;
-};
-
 export type ProxyTestResult = {
   ok: boolean;
   status: number;
@@ -919,17 +866,6 @@ export type ClearanceTestResult = {
   error: string | null;
   runtime: ProxyRuntimeStatus;
 };
-
-export async function fetchProxy() {
-  return httpRequest<{ proxy: ProxySettings }>("/api/proxy");
-}
-
-export async function updateProxy(updates: { enabled?: boolean; url?: string }) {
-  return httpRequest<{ proxy: ProxySettings }>("/api/proxy", {
-    method: "POST",
-    body: updates,
-  });
-}
 
 export async function testProxy(url?: string) {
   return httpRequest<{ result: ProxyTestResult }>("/api/proxy/test", {

@@ -485,7 +485,6 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [referenceImageFiles, setReferenceImageFiles] = useState<File[]>([]);
   const [referenceImages, setReferenceImages] = useState<StoredReferenceImage[]>([]);
-  const [maskFiles, setMaskFiles] = useState<File[]>([]);
   const [maskImages, setMaskImages] = useState<StoredReferenceImage[]>([]);
   const [conversations, setConversations] = useState<ImageConversation[]>([]);
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
@@ -958,7 +957,6 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     setImagePrompt("");
     setReferenceImageFiles([]);
     setReferenceImages([]);
-    setMaskFiles([]);
     setMaskImages([]);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
@@ -1163,7 +1161,6 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       return next;
     });
     setReferenceImages((prev) => prev.filter((_, currentIndex) => currentIndex !== index));
-    setMaskFiles([]);
     setMaskImages([]);
   }, []);
 
@@ -1185,7 +1182,6 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
         setReferenceImages((prev) => [...prev, nextReference.referenceImage]);
         setReferenceImageFiles((prev) => [...prev, nextReference.file]);
-        setMaskFiles([]);
         setMaskImages([]);
         setImagePrompt("");
         textareaRef.current?.focus();
@@ -1230,7 +1226,6 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       setSelectedConversationId(drawingDialog.conversationId);
       setReferenceImageFiles([source.file]);
       setReferenceImages([source.referenceImage]);
-      setMaskFiles([file]);
       setMaskImages([storedDrawing]);
       setImagePrompt("");
       textareaRef.current?.focus();
@@ -1261,7 +1256,6 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     setReferenceImageFiles(
       turn.referenceImages.map((image) => dataUrlToFile(image.dataUrl, image.name, image.type)),
     );
-    setMaskFiles(turn.maskImages.map((image) => dataUrlToFile(image.dataUrl, image.name, image.type)));
     await updateConversation(conversationId, (current) => ({
       ...(current ?? conversation),
       model: turn.model,
