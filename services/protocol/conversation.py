@@ -321,6 +321,35 @@ def count_text_tokens(text: str, model: str) -> int:
     return len(encoding_for_model(model).encode(text))
 
 
+def _format_image_result_item(
+    image_data: bytes,
+    revised_prompt: str,
+    response_format: str,
+    base_url: str | None,
+    b64_json: str = "",
+) -> dict[str, Any]:
+    image_url = save_image_bytes(image_data, base_url)
+    result_item = {"revised_prompt": revised_prompt}
+    if response_format == "b64_json":
+        result_item["b64_json"] = b64_json or base64.b64encode(image_data).decode("ascii")
+    else:
+        result_item["url"] = image_url
+    return result_item
+
+
+def _format_image_bytes(
+    images: Iterable[bytes],
+    prompt: str,
+    response_format: str,
+    base_url: str | None = None,
+) -> list[dict[str, Any]]:
+    revised_prompt = str(prompt).strip() or prompt
+    return [
+        _format_image_result_item(image_data, revised_prompt, response_format, base_url)
+        for image_data in images if image_data
+    ]
+
+
 def format_image_result(
     items: list[dict[str, Any]],
     prompt: str,
@@ -340,13 +369,7 @@ def format_image_result(
         except (ValueError, binascii.Error):
             raise ImageGenerationError("Image generation returned invalid base64 image data.", code="no_image_generated") from None
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
-        image_url = save_image_bytes(image_data, base_url)
-        result_item = {"revised_prompt": revised_prompt}
-        if response_format == "b64_json":
-            result_item["b64_json"] = b64_json
-        else:
-            result_item["url"] = image_url
-        data.append(result_item)
+        data.append(_format_image_result_item(image_data, revised_prompt, response_format, base_url, b64_json))
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if message and not data:
         result["message"] = message
@@ -1352,17 +1375,12 @@ def stream_image_outputs(
     if image_urls:
         if request.progress_callback:
             request.progress_callback("receiving_image")
-        image_items = [
-            {"b64_json": base64.b64encode(image_data).decode("ascii")}
-            for image_data in backend.download_image_bytes(image_urls)
-        ]
-        data = format_image_result(
-            image_items,
+        data = _format_image_bytes(
+            backend.download_image_bytes(image_urls),
             request.prompt,
             request.response_format,
             request.base_url,
-            int(time.time()),
-        )["data"]
+        )
         if data:
             yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
         return
@@ -1451,17 +1469,12 @@ def stream_image_outputs(
                 if image_urls:
                     if request.progress_callback:
                         request.progress_callback("receiving_image")
-                    image_items = [
-                        {"b64_json": base64.b64encode(image_data).decode("ascii")}
-                        for image_data in backend.download_image_bytes(image_urls)
-                    ]
-                    data = format_image_result(
-                        image_items,
+                    data = _format_image_bytes(
+                        backend.download_image_bytes(image_urls),
                         request.prompt,
                         request.response_format,
                         request.base_url,
-                        int(time.time()),
-                    )["data"]
+                    )
                     if data:
                         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
                         return
@@ -1565,17 +1578,12 @@ def stream_image_outputs(
             if image_urls:
                 if request.progress_callback:
                     request.progress_callback("receiving_image")
-                image_items = [
-                    {"b64_json": base64.b64encode(image_data).decode("ascii")}
-                    for image_data in backend.download_image_bytes(image_urls)
-                ]
-                data = format_image_result(
-                    image_items,
+                data = _format_image_bytes(
+                    backend.download_image_bytes(image_urls),
                     request.prompt,
                     request.response_format,
                     request.base_url,
-                    int(time.time()),
-                )["data"]
+                )
                 if data:
                     yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
                     return

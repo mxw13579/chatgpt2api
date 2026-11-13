@@ -562,7 +562,9 @@ class ImageCompatTests(unittest.TestCase):
         for response_format in ("b64_json", "url"):
             with self.subTest(response_format=response_format), mock.patch.object(
                 conversation, "save_image_bytes", return_value="https://synthetic.invalid/image.png",
-            ) as save, mock.patch.object(base64, "b64decode", wraps=base64.b64decode) as decode:
+            ) as save, mock.patch.object(base64, "b64decode", wraps=base64.b64decode) as decode, mock.patch.object(
+                base64, "b64encode", side_effect=AssertionError("upstream base64 must not be re-encoded"),
+            ):
                 data = conversation.format_image_result(
                     [{"b64_json": " " + PNG_B64 + " "}], "draw", response_format,
                 )["data"]
@@ -575,13 +577,50 @@ class ImageCompatTests(unittest.TestCase):
                 decode.assert_called_once_with(PNG_B64, validate=True)
                 save.assert_called_once_with(PNG_BYTES, None)
 
+    def test_formatted_images_keep_item_prompts_and_result_metadata(self) -> None:
+        items = [
+            {"b64_json": PNG_B64, "revised_prompt": " first "},
+            {"b64_json": PNG_B64, "revised_prompt": "second"},
+            {"b64_json": PNG_B64, "revised_prompt": " "},
+        ]
+        before = copy.deepcopy(items)
+        for response_format in ("b64_json", "url"):
+            with self.subTest(response_format=response_format), mock.patch.object(
+                conversation, "save_image_bytes", side_effect=["/first.png", "/second.png", "/third.png"],
+            ) as save:
+                result = conversation.format_image_result(
+                    items, " draw ", response_format, "https://synthetic.invalid", created=123, message="ignored",
+                )
+            values = [PNG_B64] * 3 if response_format == "b64_json" else ["/first.png", "/second.png", "/third.png"]
+            self.assertEqual(result, {"created": 123, "data": [
+                {response_format: value, "revised_prompt": prompt}
+                for value, prompt in zip(values, ("first", "second", " draw "))
+            ]})
+            self.assertEqual(save.call_args_list, [mock.call(PNG_BYTES, "https://synthetic.invalid")] * 3)
+            self.assertEqual(items, before)
+            self.assertEqual(
+                conversation.format_image_result([], "draw", response_format, created=123, message="no image"),
+                {"created": 123, "data": [], "message": "no image"},
+            )
+
     def test_invalid_upstream_base64_fails_before_storage(self) -> None:
-        for encoded in ("invalid!", "图片", "===="):
-            with self.subTest(encoded=encoded), mock.patch.object(conversation, "save_image_bytes") as save:
+        for response_format in ("b64_json", "url"):
+            for encoded in ("invalid!", "图片", "===="):
+                with self.subTest(response_format=response_format, encoded=encoded), mock.patch.object(conversation, "save_image_bytes") as save:
+                    with self.assertRaises(conversation.ImageGenerationError) as caught:
+                        conversation.format_image_result([{"b64_json": encoded}], "draw", response_format)
+                    self.assertEqual(caught.exception.code, "no_image_generated")
+                    save.assert_not_called()
+
+    def test_invalid_later_image_does_not_return_partial_success(self) -> None:
+        for response_format in ("b64_json", "url"):
+            with self.subTest(response_format=response_format), mock.patch.object(conversation, "save_image_bytes") as save:
                 with self.assertRaises(conversation.ImageGenerationError) as caught:
-                    conversation.format_image_result([{"b64_json": encoded}], "draw", "b64_json")
+                    conversation.format_image_result(
+                        [{"b64_json": PNG_B64}, {"b64_json": "invalid!"}], "draw", response_format,
+                    )
                 self.assertEqual(caught.exception.code, "no_image_generated")
-                save.assert_not_called()
+                save.assert_called_once_with(PNG_BYTES, None)
 
     def test_blank_upstream_images_cannot_become_successful_results(self) -> None:
         for encoded in ("", " "):

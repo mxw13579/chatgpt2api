@@ -604,8 +604,7 @@ class OpenAIBackendAPI:
             for idx, (data, mime) in enumerate(image_inputs, start=1):
                 ext_part = mime.split("/", 1)[1].split("+")[0] if "/" in mime else "png"
                 extension = "jpg" if ext_part == "jpeg" else (ext_part or "png")
-                b64 = base64.b64encode(data).decode("ascii")
-                uploaded.append(self._upload_image(f"data:{mime};base64,{b64}", f"image_{idx}.{extension}"))
+                uploaded.append(self._upload_image_bytes(data, f"image_{idx}.{extension}"))
             parts: list[Any] = []
             for ref in uploaded:
                 parts.append({
@@ -1047,7 +1046,7 @@ class OpenAIBackendAPI:
         return base64.b64decode(payload)
 
     def _upload_image(self, image: str, file_name: str = "image.png") -> Dict[str, Any]:
-        """上传一张 base64 图片，返回底层文件元数据。"""
+        """上传一张 base64 或本地路径图片，返回底层文件元数据。"""
         data = self._decode_image_base64(image)
         if (
                 image
@@ -1059,6 +1058,10 @@ class OpenAIBackendAPI:
             candidate_path = Path(os.path.expanduser(image))
             if candidate_path.exists() and candidate_path.is_file():
                 file_name = candidate_path.name
+        return self._upload_image_bytes(data, file_name)
+
+    def _upload_image_bytes(self, data: bytes, file_name: str = "image.png") -> Dict[str, Any]:
+        """上传图片二进制，返回底层文件元数据。"""
         image = Image.open(BytesIO(data))
         width, height = image.size
         mime_type = Image.MIME.get(image.format, "image/png")
