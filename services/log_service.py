@@ -9,10 +9,9 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from threading import Lock, RLock
+from threading import RLock
 from typing import Any, BinaryIO, Iterator
 from uuid import uuid4
-from weakref import WeakValueDictionary
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
@@ -28,11 +27,8 @@ INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
 
 
 class LogService:
-    # Locks are shared by canonical path, not by instance. Size is always read
-    # under that lock; there is no per-instance byte/record counter to go stale.
-    # This coordinates threads in one process, not independent worker processes.
-    _locks: WeakValueDictionary[str, Any] = WeakValueDictionary()
-    _locks_guard = Lock()
+    # The production singleton serializes file operations across threads.
+    # Its instance lock does not coordinate other instances or processes.
 
     def __init__(self, path: Path, *, max_bytes: int = 16 * 1024 * 1024,
                  backup_count: int = 5, block_size: int = 64 * 1024,
@@ -48,13 +44,7 @@ class LogService:
         # Reserve space for the 32-byte generated ID field when rewriting a
         # legacy line right at the limit, so deletion cannot hide that record.
         self._line_limit = max_line_bytes + 32
-        key = os.path.normcase(str(self.path))
-        with self._locks_guard:
-            lock = self._locks.get(key)
-            if lock is None:
-                lock = RLock()
-                self._locks[key] = lock
-            self._lock = lock
+        self._lock = RLock()
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
 

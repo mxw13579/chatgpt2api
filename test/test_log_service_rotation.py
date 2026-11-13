@@ -1,12 +1,10 @@
-"""Synthetic, local-files-only tests; intentionally not run by the task author.
+"""Synthetic local-file tests for the source-copy runner in test/run_isolated.py.
 
-Extract only LogService (and stdlib imports) from its AST: importing the project
-module would instantiate configuration/services against real data. Route tests
-likewise extract just the two handlers, with no application import or server.
+Run only in its temporary source tree with synthetic config/data and networking
+disabled; normal imports below initialize application services.
 """
 from __future__ import annotations
 
-import ast
 import json
 import os
 import tempfile
@@ -15,31 +13,10 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Barrier, Event
-from types import SimpleNamespace
 from unittest import mock
 
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def _load_service_namespace():
-    path = ROOT / "services" / "log_service.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    allowed = {
-        "__future__", "hashlib", "json", "itertools", "os", "tempfile", "time",
-        "dataclasses", "datetime", "pathlib", "threading", "typing", "uuid", "weakref",
-    }
-    nodes = []
-    for node in tree.body:
-        if isinstance(node, ast.Import) and all(name.name in allowed for name in node.names):
-            nodes.append(node)
-        elif isinstance(node, ast.ImportFrom) and node.module in allowed:
-            nodes.append(node)
-        elif isinstance(node, ast.ClassDef) and node.name == "LogService":
-            nodes.append(node)
-    namespace = {"__name__": "isolated_log_rotation"}
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
-    return namespace
+from api import system
+from services.log_service import LogService
 
 
 def _record(summary, *, id=None, type="call", day="2026-01-02", detail=None):
@@ -111,10 +88,6 @@ def _measure_reads(directory, *, read_limit=65536, readline_limit=1048610):
 
 
 class LogServiceRotationTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.LogService = _load_service_namespace()["LogService"]
-
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="synthetic-log-rotation-")
         self.addCleanup(temporary.cleanup)
@@ -125,7 +98,7 @@ class LogServiceRotationTests(unittest.TestCase):
         return self.path.with_name(f"{self.path.name}.{number}")
 
     def test_defaults_limit_and_missing_files(self):
-        service = self.LogService(self.path)
+        service = LogService(self.path)
         self.assertEqual(service.max_bytes, 16 * 1024 * 1024)
         self.assertEqual(service.backup_count, 5)
         self.assertEqual(service.list(), [])
@@ -141,10 +114,10 @@ class LogServiceRotationTests(unittest.TestCase):
             self.assertEqual(service.delete([]), {"removed": 0})
         for kwargs in ({"max_bytes": 0}, {"backup_count": -1}, {"block_size": 0}, {"max_line_bytes": 0}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
-                self.LogService(self.path, **kwargs)
+                LogService(self.path, **kwargs)
 
     def test_rotation_retains_five_backups_and_whole_oversized_records(self):
-        service = self.LogService(self.path, max_bytes=1)
+        service = LogService(self.path, max_bytes=1)
         ids = {}
         for n in range(9):
             service.add("call", f"entry-{n}", {"n": n, "message": "合成数据"})
@@ -159,8 +132,8 @@ class LogServiceRotationTests(unittest.TestCase):
         for path in self.directory.iterdir():
             self.assertEqual(json.loads(path.read_bytes())["detail"]["message"], "合成数据")
 
-    def test_zero_backups_and_byte_threshold_shared_between_instances(self):
-        no_backups = self.LogService(self.path, max_bytes=1, backup_count=0)
+    def test_zero_backups_and_byte_threshold_reread_between_sequential_instances(self):
+        no_backups = LogService(self.path, max_bytes=1, backup_count=0)
         no_backups.add("call", "discarded")
         no_backups.add("call", "retained")
         self.assertEqual([row["summary"] for row in no_backups.list()], ["retained"])
@@ -172,9 +145,8 @@ class LogServiceRotationTests(unittest.TestCase):
             "id": "0" * 32, "time": "2026-01-02 12:00:00", "type": "call",
             "summary": summary, "detail": {},
         }))
-        first = self.LogService(self.path, max_bytes=2 * size)
-        second = self.LogService(self.directory / "unused" / ".." / "logs.jsonl", max_bytes=2 * size)
-        self.assertIs(first._lock, second._lock)
+        first = LogService(self.path, max_bytes=2 * size)
+        second = LogService(self.directory / "unused" / ".." / "logs.jsonl", max_bytes=2 * size)
         first.add("call", summary)
         second.add("call", summary)
         self.assertEqual(self.path.stat().st_size, 2 * size)
@@ -186,11 +158,11 @@ class LogServiceRotationTests(unittest.TestCase):
         self.assertEqual(len({row["id"] for row in second.list()}), 3)
 
     def test_delete_updates_size_seen_by_another_instance(self):
-        first = self.LogService(self.path)
+        first = LogService(self.path)
         first.add("call", "same")
         size = self.path.stat().st_size
         first.max_bytes = 2 * size
-        second = self.LogService(self.path, max_bytes=2 * size)
+        second = LogService(self.path, max_bytes=2 * size)
         second.add("call", "same")
         target = first.list()[-1]["id"]
         self.assertEqual(first.delete([target]), {"removed": 1})
@@ -213,7 +185,7 @@ class LogServiceRotationTests(unittest.TestCase):
             + _line(_record("boundary-end", id="e", day="2026-02-03"), b"")
         )
         self.backup(2).write_bytes(_line(_record("old-shard-match", id="f", day="2026-02-02")))
-        service = self.LogService(self.path, block_size=17)
+        service = LogService(self.path, block_size=17)
         kwargs = {"type": "call", "start_date": "2026-02-01", "end_date": "2026-02-03"}
         self.assertEqual([row["id"] for row in service.list(**kwargs)], ["a", "e", "d", "f"])
         self.assertEqual([row["id"] for row in service.list(limit=2, **kwargs)], ["a", "e"])
@@ -228,13 +200,13 @@ class LogServiceRotationTests(unittest.TestCase):
             self.path.write_bytes(b"\r\n".join(_line(item, b"") for item in records) + ending)
             for block_size in (1, 2, 3, 7, 31):
                 with self.subTest(ending=ending, block_size=block_size):
-                    service = self.LogService(self.path, block_size=block_size)
+                    service = LogService(self.path, block_size=block_size)
                     rows = service.list()
                     self.assertEqual(
                         [{key: value for key, value in row.items() if key != "id"} for row in rows],
                         records[::-1],
                     )
-                    self.assertEqual(rows, self.LogService(self.path, block_size=13).list())
+                    self.assertEqual(rows, LogService(self.path, block_size=13).list())
 
     def test_legacy_duplicate_ids_survive_rename_rewrite_and_new_instances(self):
         duplicate = _record("identical", detail={"nested": [None, True, {"text": "合成"}]})
@@ -242,7 +214,7 @@ class LogServiceRotationTests(unittest.TestCase):
             _line(duplicate) + _line(_record("explicit", id="keep-explicit"))
             + _line(duplicate, b"")
         )
-        service = self.LogService(self.path, max_bytes=1)
+        service = LogService(self.path, max_bytes=1)
         before = service.list()
         self.assertNotEqual(before[0]["id"], before[2]["id"])
         self.assertEqual(before[1]["id"], "keep-explicit")
@@ -250,13 +222,12 @@ class LogServiceRotationTests(unittest.TestCase):
         service.add("call", "new-1")
         service.add("call", "new-2")
         self.assertEqual(service.list()[2:], before)
-        other = self.LogService(self.path, max_bytes=1)
+        other = LogService(self.path, max_bytes=1)
         self.assertEqual(other.list()[2:], before)
         self.assertEqual(other.delete([before[2]["id"], before[2]["id"]]), {"removed": 1})
         self.assertEqual(other.list()[2:], before[:2])
         # IDs are persisted in the replaced shard, not cached in the instance.
-        reloaded_class = _load_service_namespace()["LogService"]
-        reloaded = reloaded_class(self.path, max_bytes=1)
+        reloaded = LogService(self.path, max_bytes=1)
         self.assertEqual(reloaded.list()[2:], before[:2])
         self.assertEqual(reloaded.delete([before[0]["id"]]), {"removed": 1})
         self.assertEqual(reloaded.list()[2:], [before[1]])
@@ -266,7 +237,7 @@ class LogServiceRotationTests(unittest.TestCase):
         raw = _line(_record("same-bytes"))
         self.path.write_bytes(raw)
         self.backup(1).write_bytes(raw)
-        service = self.LogService(self.path)
+        service = LogService(self.path)
         rows = service.list()
         self.assertNotEqual(rows[0]["id"], rows[1]["id"])
         self.assertEqual(service.delete([rows[1]["id"]]), {"removed": 1})
@@ -275,7 +246,7 @@ class LogServiceRotationTests(unittest.TestCase):
     def test_explicit_ids_and_duplicate_explicit_rows_keep_existing_semantics(self):
         duplicate = _line(_record("explicit-duplicate", id="same-id"))
         self.path.write_bytes(duplicate + _line(_record("numeric", id=0)) + duplicate)
-        service = self.LogService(self.path)
+        service = LogService(self.path)
         self.assertEqual([row["id"] for row in service.list()], ["same-id", "0", "same-id"])
         self.assertEqual(service.delete(["same-id", "same-id"]), {"removed": 2})
         self.assertEqual(service.list()[0]["id"], "0")
@@ -284,7 +255,7 @@ class LogServiceRotationTests(unittest.TestCase):
 
     def test_append_separates_unterminated_and_torn_records(self):
         self.path.write_bytes(_line(_record("unterminated"), b""))
-        service = self.LogService(self.path)
+        service = LogService(self.path)
         old = service.list()[0]
         service.add("call", "after-valid", marker="synthetic")
         self.assertEqual(service.list()[1], old)
@@ -304,7 +275,7 @@ class LogServiceRotationTests(unittest.TestCase):
         original = keep + target + oversized + corrupt + torn
         expected = keep + oversized + corrupt + torn
         self.path.write_bytes(original)
-        service = self.LogService(self.path, block_size=23, max_line_bytes=160)
+        service = LogService(self.path, block_size=23, max_line_bytes=160)
         self.assertEqual([row["id"] for row in service.list()], ["target", "keep"])
         with _measure_reads(self.directory, read_limit=23, readline_limit=194) as readers:
             self.assertEqual(service.delete(["target"]), {"removed": 1})
@@ -317,7 +288,7 @@ class LogServiceRotationTests(unittest.TestCase):
     def test_materialization_keeps_legacy_fields_and_boundary_sized_record_visible(self):
         legacy = b' {"detail":{"number":1e999,"array":[true,null,3.1400]},"summary":"legacy"} '
         self.path.write_bytes(_line({"id": "delete"}) + legacy)
-        service = self.LogService(self.path, max_line_bytes=len(legacy), block_size=11)
+        service = LogService(self.path, max_line_bytes=len(legacy), block_size=11)
         before = service.list()[0]
         self.assertEqual(service.delete(["delete"]), {"removed": 1})
         self.assertEqual(service.list(), [before])
@@ -329,7 +300,7 @@ class LogServiceRotationTests(unittest.TestCase):
 
     def test_empty_legacy_object_and_empty_id_are_materialized(self):
         self.path.write_bytes(b'{}\n{"id":"","value":1}\n{"id":null}\n{"id":"target"}\n')
-        service = self.LogService(self.path)
+        service = LogService(self.path)
         before = service.list()
         self.assertEqual(len({row["id"] for row in before}), 4)
         self.assertEqual(service.delete(["target"]), {"removed": 1})
@@ -339,7 +310,7 @@ class LogServiceRotationTests(unittest.TestCase):
     def test_noop_delete_does_not_replace_or_materialize(self):
         original = _line(_record("legacy"), b"")
         self.path.write_bytes(original)
-        service = self.LogService(self.path)
+        service = LogService(self.path)
         before = service.list()
         identity = self.path.stat().st_ino
         with mock.patch.object(os, "replace", side_effect=AssertionError("no replacement expected")):
@@ -360,7 +331,7 @@ class LogServiceRotationTests(unittest.TestCase):
         with _measure_reads(self.directory, read_limit=4096) as readers:
             with mock.patch.object(Path, "read_text", side_effect=AssertionError("whole text read")), \
                  mock.patch.object(Path, "read_bytes", side_effect=AssertionError("whole binary read")):
-                service = self.LogService(self.path, block_size=4096)
+                service = LogService(self.path, block_size=4096)
                 rows = service.list(limit=2)
         self.assertEqual([row["summary"] for row in rows], ["tail-two", "tail-one"])
         self.assertEqual(sum(reader.bytes_read for reader in readers), 4096)
@@ -380,7 +351,7 @@ class LogServiceRotationTests(unittest.TestCase):
             + b"x" * 4096 + b'{"id":"not-a-separate-record"}\n'
             + _line({"id": "new"}) + b"y" * 4096
         )
-        service = self.LogService(self.path, block_size=7, max_line_bytes=64)
+        service = LogService(self.path, block_size=7, max_line_bytes=64)
         with mock.patch.object(service, "_parse_line", wraps=service._parse_line) as parse:
             self.assertEqual([row["id"] for row in service.list()], ["new", "old"])
         self.assertTrue(all(len(call.args[0]) <= 96 for call in parse.call_args_list))
@@ -396,7 +367,7 @@ class LogServiceRotationTests(unittest.TestCase):
             file.write(_line(_record("old-first")))
             file.seek(size - len(tail) - 1)
             file.write(b"\n" + tail)
-        service = self.LogService(self.path)
+        service = LogService(self.path)
         before = service.list(limit=1)[0]
         identity = self.path.stat().st_ino
         with _measure_reads(self.directory, read_limit=1) as readers:
@@ -411,7 +382,7 @@ class LogServiceRotationTests(unittest.TestCase):
     def test_replace_failure_keeps_original_and_cleans_temp_and_handles(self):
         original = _line(_record("remove", id="target")) + _line(_record("keep"))
         self.path.write_bytes(original)
-        service = self.LogService(self.path)
+        service = LogService(self.path)
         before = service.list()
         with _measure_reads(self.directory) as readers:
             with mock.patch.object(os, "replace", side_effect=OSError("synthetic replace failure")):
@@ -423,10 +394,9 @@ class LogServiceRotationTests(unittest.TestCase):
         self.assertEqual(list(self.directory.glob(".*.tmp")), [])
 
     def test_append_cannot_enter_between_delete_copy_and_atomic_replace(self):
-        deleter = self.LogService(self.path)
-        writer = self.LogService(self.path)
-        deleter.add("call", "remove")
-        target = deleter.list()[0]["id"]
+        service = LogService(self.path)
+        service.add("call", "remove")
+        target = service.list()[0]["id"]
         at_replace, release_replace, append_started, append_done = Event(), Event(), Event(), Event()
         original_replace = os.replace
 
@@ -439,17 +409,17 @@ class LogServiceRotationTests(unittest.TestCase):
 
         def append():
             append_started.set()
-            writer.add("call", "survives")
+            service.add("call", "survives")
             append_done.set()
 
         with mock.patch.object(os, "replace", side_effect=paused_replace):
             with ThreadPoolExecutor(max_workers=2) as pool:
-                deleting = pool.submit(deleter.delete, [target])
+                deleting = pool.submit(service.delete, [target])
                 try:
                     self.assertTrue(at_replace.wait(10))
-                    acquired = writer._lock.acquire(blocking=False)
+                    acquired = service._lock.acquire(blocking=False)
                     if acquired:
-                        writer._lock.release()
+                        service._lock.release()
                     self.assertFalse(acquired)
                     appending = pool.submit(append)
                     self.assertTrue(append_started.wait(10))
@@ -458,34 +428,32 @@ class LogServiceRotationTests(unittest.TestCase):
                     release_replace.set()
                 self.assertEqual(deleting.result(timeout=10), {"removed": 1})
                 appending.result(timeout=10)
-        self.assertEqual([row["summary"] for row in writer.list()], ["survives"])
+        self.assertEqual([row["summary"] for row in service.list()], ["survives"])
 
-    def test_multi_instance_concurrent_append_rotation_delete_counts_exactly_once(self):
-        first = self.LogService(self.path, max_bytes=512, backup_count=80)
-        second = self.LogService(self.directory / "unused" / ".." / "logs.jsonl", max_bytes=512, backup_count=80)
-        self.assertIs(first._lock, second._lock)
+    def test_same_instance_concurrent_append_rotation_delete_counts_exactly_once(self):
+        service = LogService(self.path, max_bytes=512, backup_count=80)
         for n in range(50):
-            first.add("call", f"seed-{n}")
-        initial = first.list(limit=1000)
+            service.add("call", f"seed-{n}")
+        initial = service.list(limit=1000)
         targets = [row["id"] for row in initial if int(row["summary"].split("-")[1]) < 30]
         barrier = Barrier(5)
 
-        def append(service, prefix):
+        def append(prefix):
             barrier.wait(timeout=10)
             for n in range(40):
                 service.add("call", f"{prefix}-{n}")
 
-        def delete(service):
+        def delete():
             barrier.wait(timeout=10)
             return service.delete(targets + targets)["removed"]
 
         with ThreadPoolExecutor(max_workers=5) as pool:
-            writers = [pool.submit(append, first, "a"), pool.submit(append, second, "b")]
-            deletions = [pool.submit(delete, service) for service in (first, second, first)]
+            writers = [pool.submit(append, "a"), pool.submit(append, "b")]
+            deletions = [pool.submit(delete) for _ in range(3)]
             for future in writers:
                 future.result(timeout=30)
             self.assertEqual(sum(future.result(timeout=30) for future in deletions), 30)
-        rows = second.list(limit=1000)
+        rows = service.list(limit=1000)
         expected = (
             {f"seed-{n}" for n in range(30, 50)}
             | {f"a-{n}" for n in range(40)}
@@ -494,46 +462,41 @@ class LogServiceRotationTests(unittest.TestCase):
         self.assertEqual({row["summary"] for row in rows}, expected)
         self.assertEqual(len(rows), 100)
         self.assertEqual(len({row["id"] for row in rows}), 100)
-        self.assertEqual(first.delete(targets), {"removed": 0})
+        self.assertEqual(service.delete(targets), {"removed": 0})
         self.assertEqual(list(self.directory.glob(".*.tmp")), [])
 
 
 class LogRouteThreadpoolTests(unittest.IsolatedAsyncioTestCase):
     async def test_list_and_delete_dispatch_through_threadpool(self):
-        path = ROOT / "api" / "system.py"
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        router = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "create_router")
-        handlers = [node for node in router.body if isinstance(node, ast.AsyncFunctionDef) and node.name in {"get_logs", "delete_logs"}]
-        for node in handlers:
-            node.decorator_list = []
-        calls = []
-        list_logs = mock.Mock(return_value=[{"id": "synthetic"}])
-        delete_logs = mock.Mock(return_value={"removed": 1})
-        require_admin = mock.Mock()
-
-        async def threadpool(function, *args, **kwargs):
-            calls.append((function, args, kwargs))
-            return function(*args, **kwargs)
-
-        namespace = {
-            "Header": lambda default=None: default,
-            "require_admin": require_admin,
-            "log_service": SimpleNamespace(list=list_logs, delete=delete_logs),
-            "run_in_threadpool": threadpool,
-        }
-        future_import = ast.parse("from __future__ import annotations").body
-        exec(compile(ast.Module(body=future_import + handlers, type_ignores=[]), str(path), "exec"), namespace)
-        result = await namespace["get_logs"](
-            type=" call ", start_date=" 2026-01-01 ", end_date=" 2026-01-02 ", authorization="synthetic-admin",
+        router = system.create_router("synthetic")
+        get_logs = next(
+            route.endpoint for route in router.routes
+            if route.path == "/api/logs" and "GET" in route.methods
         )
-        self.assertEqual(result, {"items": [{"id": "synthetic"}]})
-        result = await namespace["delete_logs"](SimpleNamespace(ids=["synthetic"]), authorization="synthetic-admin")
-        self.assertEqual(result, {"removed": 1})
-        self.assertEqual(calls, [
-            (list_logs, (), {"type": "call", "start_date": "2026-01-01", "end_date": "2026-01-02"}),
-            (delete_logs, (["synthetic"],), {}),
-        ])
-        self.assertEqual(require_admin.call_count, 2)
+        delete_logs = next(
+            route.endpoint for route in router.routes
+            if route.path == "/api/logs/delete" and "POST" in route.methods
+        )
+        with mock.patch.object(system, "log_service") as service, \
+             mock.patch.object(system, "require_admin") as require_admin, \
+             mock.patch.object(system, "run_in_threadpool", wraps=system.run_in_threadpool) as threadpool:
+            service.list.return_value = [{"id": "synthetic"}]
+            service.delete.return_value = {"removed": 1}
+            result = await get_logs(
+                type=" call ", start_date=" 2026-01-01 ", end_date=" 2026-01-02 ", authorization="synthetic-admin",
+            )
+            self.assertEqual(result, {"items": [{"id": "synthetic"}]})
+            result = await delete_logs(system.LogDeleteRequest(ids=["synthetic"]), authorization="synthetic-admin")
+            self.assertEqual(result, {"removed": 1})
+            self.assertEqual(threadpool.await_args_list, [
+                mock.call(service.list, type="call", start_date="2026-01-01", end_date="2026-01-02"),
+                mock.call(service.delete, ["synthetic"]),
+            ])
+            service.list.assert_called_once_with(type="call", start_date="2026-01-01", end_date="2026-01-02")
+            service.delete.assert_called_once_with(["synthetic"])
+            self.assertEqual(require_admin.call_args_list, [
+                mock.call("synthetic-admin"), mock.call("synthetic-admin"),
+            ])
 
 
 if __name__ == "__main__":
