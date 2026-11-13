@@ -371,21 +371,6 @@ class BackupService:
         settings["passphrase"] = "********" if _clean(settings.get("passphrase")) else ""
         return settings
 
-    def update_settings(self, payload: dict[str, object]) -> dict[str, object]:
-        current = config.get_backup_settings()
-        merged = dict(current)
-        merged.update(dict(payload or {}))
-        if "include" in payload and isinstance(payload.get("include"), dict):
-            include = dict(current.get("include") or {})
-            include.update(payload.get("include") or {})
-            merged["include"] = include
-        if payload.get("secret_access_key") == "********":
-            merged["secret_access_key"] = current.get("secret_access_key")
-        if payload.get("passphrase") == "********":
-            merged["passphrase"] = current.get("passphrase")
-        updated = config.update({"backup": merged})
-        return dict(updated.get("backup") or {})
-
     def test_connection(self) -> dict[str, object]:
         client = CloudflareR2Client(config.get_backup_settings())
         try:

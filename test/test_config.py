@@ -1,65 +1,61 @@
+"""Synthetic configuration fixtures; import only through the isolated runner."""
+
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-
-ROOT_DIR = Path(__file__).resolve().parents[1]
-ROOT_CONFIG_FILE = ROOT_DIR / "config.json"
+from services import config as config_module
 
 
 class ConfigLoadingTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls._created_root_config = False
-        if not ROOT_CONFIG_FILE.exists():
-            ROOT_CONFIG_FILE.write_text(json.dumps({"auth-key": "test-auth"}), encoding="utf-8")
-            cls._created_root_config = True
-
-        from services import config as config_module
-
-        cls.config_module = config_module
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        if cls._created_root_config and ROOT_CONFIG_FILE.exists():
-            ROOT_CONFIG_FILE.unlink()
-
-    def test_load_settings_ignores_directory_config_path(self) -> None:
+    def test_config_store_ignores_directory_config_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             base_dir = Path(tmp_dir)
             data_dir = base_dir / "data"
             config_dir = base_dir / "config.json"
             os_auth_key = "env-auth"
-
             config_dir.mkdir()
 
-            module = self.config_module
-            old_base_dir = module.BASE_DIR
-            old_data_dir = module.DATA_DIR
-            old_config_file = module.CONFIG_FILE
-            old_env_auth_key = module.os.environ.get("CHATGPT2API_AUTH_KEY")
-            try:
-                module.BASE_DIR = base_dir
-                module.DATA_DIR = data_dir
-                module.CONFIG_FILE = config_dir
-                module.os.environ["CHATGPT2API_AUTH_KEY"] = os_auth_key
+            with (
+                mock.patch.object(config_module, "DATA_DIR", data_dir),
+                mock.patch.dict(os.environ, {"CHATGPT2API_AUTH_KEY": os_auth_key}),
+            ):
+                store = config_module.ConfigStore(config_dir)
 
-                settings = module._load_settings()
+                self.assertEqual(store.auth_key, os_auth_key)
+                self.assertEqual(store.refresh_account_interval_minute, 5)
+                self.assertTrue(data_dir.is_dir())
 
-                self.assertEqual(settings.auth_key, os_auth_key)
-                self.assertEqual(settings.refresh_account_interval_minute, 5)
-            finally:
-                module.BASE_DIR = old_base_dir
-                module.DATA_DIR = old_data_dir
-                module.CONFIG_FILE = old_config_file
-                if old_env_auth_key is None:
-                    module.os.environ.pop("CHATGPT2API_AUTH_KEY", None)
-                else:
-                    module.os.environ["CHATGPT2API_AUTH_KEY"] = old_env_auth_key
+    def test_config_store_auth_key_precedence_and_validation(self) -> None:
+        cases = [
+            (" synthetic-env-auth ", "synthetic-file-auth", "synthetic-env-auth"),
+            ("", " synthetic-file-auth ", "synthetic-file-auth"),
+            ("", None, None),
+            ("", "   ", None),
+            ("   ", "synthetic-file-auth", None),
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            config_file = base_dir / "config.json"
+            with mock.patch.object(config_module, "DATA_DIR", base_dir / "data"):
+                for env_key, file_key, expected in cases:
+                    with (
+                        self.subTest(env_key=env_key, file_key=file_key),
+                        mock.patch.dict(os.environ, {"CHATGPT2API_AUTH_KEY": env_key}),
+                    ):
+                        config_file.write_text(json.dumps({"auth-key": file_key}), encoding="utf-8")
+                        if expected is None:
+                            with self.assertRaisesRegex(ValueError, "auth-key 未设置"):
+                                config_module.ConfigStore(config_file)
+                        else:
+                            store = config_module.ConfigStore(config_file)
+                            self.assertEqual(store.auth_key, expected)
 
     def test_image_timeout_retry_secs_is_normalized_in_public_config(self) -> None:
-        module = self.config_module
+        module = config_module
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_file = Path(tmp_dir) / "config.json"
             config_file.write_text(
@@ -72,7 +68,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(store.get()["image_timeout_retry_secs"], 1)
 
     def test_image_models_include_builtin_versions_and_normalize_custom_versions(self) -> None:
-        module = self.config_module
+        module = config_module
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_file = Path(tmp_dir) / "config.json"
             config_file.write_text(
@@ -124,7 +120,7 @@ class ConfigLoadingTests(unittest.TestCase):
             )
 
     def test_update_persists_refreshed_image_model_cache(self) -> None:
-        module = self.config_module
+        module = config_module
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_file = Path(tmp_dir) / "config.json"
             config_file.write_text(json.dumps({"auth-key": "test-auth"}), encoding="utf-8")
@@ -141,7 +137,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(saved["image_models_updated_at"], "2026-09-20T12:00:00+00:00")
 
     def test_new_builtin_models_can_be_selected_with_legacy_cache(self) -> None:
-        module = self.config_module
+        module = config_module
         for model in ("gpt-image-2.6-flare", "gpt-image-2.6-sunburst"):
             with self.subTest(model=model), tempfile.TemporaryDirectory() as tmp_dir:
                 config_file = Path(tmp_dir) / "config.json"
@@ -165,7 +161,7 @@ class ConfigLoadingTests(unittest.TestCase):
                 self.assertIn(model, reloaded.get()["image_models"])
 
     def test_default_image_model_is_saved_and_reloaded(self) -> None:
-        module = self.config_module
+        module = config_module
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_file = Path(tmp_dir) / "config.json"
             config_file.write_text(json.dumps({"auth-key": "test-auth"}), encoding="utf-8")
@@ -182,7 +178,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(reloaded.get()["default_image_model"], "gpt-image-2.5-sunburst")
 
     def test_default_image_model_falls_back_when_custom_model_is_removed(self) -> None:
-        module = self.config_module
+        module = config_module
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_file = Path(tmp_dir) / "config.json"
             config_file.write_text(

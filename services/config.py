@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
 import json
 import os
 import sys
@@ -338,12 +337,6 @@ def _validate_image_storage_settings(settings: dict[str, object]) -> None:
         raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV 密码")
 
 
-@dataclass(frozen=True)
-class LoadedSettings:
-    auth_key: str
-    refresh_account_interval_minute: int
-
-
 def _normalize_auth_key(value: object) -> str:
     return str(value or "").strip()
 
@@ -366,27 +359,6 @@ def _read_json_object(path: Path, *, name: str) -> dict[str, object]:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
-
-
-def _load_settings() -> LoadedSettings:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    raw_config = _read_json_object(CONFIG_FILE, name="config.json")
-    auth_key = _normalize_auth_key(os.getenv("CHATGPT2API_AUTH_KEY") or raw_config.get("auth-key"))
-    if _is_invalid_auth_key(auth_key):
-        raise ValueError(
-            "❌ auth-key 未设置！\n"
-            "请在环境变量 CHATGPT2API_AUTH_KEY 中设置，或者在 config.json 中填写 auth-key。"
-        )
-
-    try:
-        refresh_interval = int(raw_config.get("refresh_account_interval_minute", 5))
-    except (TypeError, ValueError):
-        refresh_interval = 5
-
-    return LoadedSettings(
-        auth_key=auth_key,
-        refresh_account_interval_minute=refresh_interval,
-    )
 
 
 class ConfigStore:
