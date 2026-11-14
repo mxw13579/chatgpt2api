@@ -85,38 +85,33 @@ test("new account drafts receive distinct canonical UUID v4 identifiers", () => 
   assert.notEqual(first.id, second.id);
 });
 
-test("dedicated settings keep all account budgets, cycle, domains and blank secrets", async () => {
+test("dedicated settings keep account fields and blank secrets", async () => {
   let body;
   const api = load("lib/image-storage.ts", { "@/lib/request": { httpRequest: async (_url, options) => { body = options.body; return {}; } } });
   const account = {
     ...api.newR2Account(), id: "fixture-account", account_id: "0".repeat(32), bucket: "fixture-images",
-    has_api_token: true, api_token: "", billing_cycle_day: 17, billing_cycle_confirmed: true,
-    domains: [{ id: "images.example.test", domain: "images.example.test", zone_id: "1".repeat(32), enabled: false }],
+    has_secret_access_key: true, secret_access_key: "", public_base_url: "https://images.example.test",
   };
   assert.equal(account.enabled, false);
-  const settings = { ...api.DEFAULT_IMAGE_STORAGE, mode: "r2", enabled: false, r2_accounts: [account], cors_origins: ["https://app.example.test"] };
+  assert.equal(account.monthly_upload_limit, 900_000);
+  const settings = { ...api.DEFAULT_IMAGE_STORAGE, mode: "r2", enabled: false, r2_accounts: [account] };
   await api.saveImageStorageSettings(settings);
   assert.equal(body.enabled, true);
   assert.deepEqual(body.r2_accounts, [account]);
-  assert.equal(body.r2_accounts[0].api_token, "");
-  assert.equal(body.r2_accounts[0].capacity_bytes, 8_000_000_000);
   await api.saveImageStorageSettings({ ...settings, mode: "local", enabled: false });
   assert.equal(body.r2_accounts.length, 1);
   assert.equal(body.enabled, false);
 });
 
-test("settings notification comparison ignores allocation-only changes but includes existing image access", () => {
+test("settings notification comparison ignores allocation-only changes but includes image access", () => {
   const api = load("lib/image-storage.ts", { "@/lib/request": { httpRequest: async () => assert.fail("No request expected") } });
   const before = { ...api.DEFAULT_IMAGE_STORAGE, mode: "r2", enabled: true, r2_accounts: [{ ...api.newR2Account(), id: "fixture-account" }] };
   const unchanged = structuredClone(before);
   assert.equal(api.imageStorageSettingsAffectImages(before, unchanged), false);
   const allocationOnly = {
-    ...unchanged, retention_minutes: 120, cleanup_interval_seconds: 120, usage_refresh_seconds: 600,
-    usage_max_age_seconds: 1200, cache_ttl_seconds: 120, cors_origins: ["https://app.example.test"],
+    ...unchanged, retention_minutes: 120, cleanup_interval_seconds: 120, cache_ttl_seconds: 120,
     r2_accounts: unchanged.r2_accounts.map((account) => ({
-      ...account, enabled: !account.enabled, name: "renamed fixture", a_budget: 400_000, b_budget: 500_000,
-      b_warn: 400_000, capacity_bytes: 2_000_000_000, billing_cycle_day: 12, billing_cycle_confirmed: true,
-      rate_limit_requests: 80, restrict_methods: false, api_token: "synthetic-rotation",
+      ...account, enabled: !account.enabled, name: "renamed fixture", monthly_upload_limit: 10, secret_access_key: "synthetic-rotation",
     })),
   };
   assert.equal(api.imageStorageSettingsAffectImages(before, allocationOnly), false);
@@ -124,48 +119,33 @@ test("settings notification comparison ignores allocation-only changes but inclu
     { mode: "local", enabled: false }, { public_base_url: "https://images.example.test" },
     { webdav_url: "https://dav.example.test" }, { webdav_root_path: "fixture/images" },
     { webdav_username: "fixture-user" }, { webdav_password: "synthetic-password" },
+    { r2_accounts: [{ ...before.r2_accounts[0], public_base_url: "https://new.example.test" }] },
+    { r2_accounts: [] },
   ]) {
     assert.equal(api.imageStorageSettingsAffectImages(before, { ...before, ...patch }), true);
   }
   assert.deepEqual(before, unchanged);
 });
 
-test("all management buttons have real frozen-contract request wrappers", async () => {
+test("storage management request wrappers", async () => {
   const calls = [];
   const api = load("lib/image-storage.ts", { "@/lib/request": { httpRequest: async (url, options = {}) => { calls.push({ url, method: options.method || "GET", body: options.body }); return {}; } } });
   const id = "fixture-account";
-  const prefix = `/api/image-storage/accounts/${id}`;
   await api.getImageStorageOverview();
   await api.testR2Account(id);
-  await api.refreshR2Usage(id);
-  await api.getR2Zones(id);
-  await api.getR2Domains(id);
-  await api.addR2Domain(id, "images.example.test", "1".repeat(32));
-  await api.updateR2Domain(id, "images.example.test", { active: true });
-  await api.updateR2Domain(id, "images.example.test", { enabled: false });
-  await api.deleteR2Domain(id, "images.example.test");
-  await api.checkR2Domains(id, "images.example.test");
-  await api.applyR2Protection(id, { rate_limit_requests: 120, restrict_methods: true, cors_origins: ["*"] });
-  await api.restoreR2Access(id);
   await api.cleanupExpiredImages();
   await api.cleanupLegacyImages();
-  await api.resolveImageReferences([{ ...reference, api_token: "synthetic-not-allowed", url: "https://old.example.test/image.png" }]);
+  await api.resolveImageReferences([{ ...reference, url: "https://old.example.test/image.png" }]);
   assert.deepEqual(calls.map(({ url, method }) => [method, url]), [
-    ["GET", "/api/image-storage"], ["POST", `${prefix}/test`], ["POST", `${prefix}/usage/refresh`],
-    ["GET", `${prefix}/zones`], ["GET", `${prefix}/domains`], ["POST", `${prefix}/domains`],
-    ["PATCH", `${prefix}/domains/images.example.test`], ["PATCH", `${prefix}/domains/images.example.test`],
-    ["DELETE", `${prefix}/domains/images.example.test`], ["POST", `${prefix}/domains/check`],
-    ["PUT", `${prefix}/protection`], ["POST", `${prefix}/access/restore`],
+    ["GET", "/api/image-storage"], ["POST", `/api/image-storage/accounts/${id}/test`],
     ["POST", "/api/image-storage/cleanup"], ["POST", "/api/image-storage/legacy/cleanup"],
     ["POST", "/api/image-storage/resolve"],
   ]);
-  assert.deepEqual(calls[6].body, { active: true });
-  assert.deepEqual(calls[7].body, { enabled: false });
-  assert.deepEqual(calls[13].body, { confirm: true });
-  assert.deepEqual(calls[14].body, { images: [{ image_id: reference.image_id, account_id: reference.account_id }] });
+  assert.deepEqual(calls[3].body, { confirm: true });
+  assert.deepEqual(calls[4].body, { images: [{ image_id: reference.image_id, account_id: reference.account_id }] });
 });
 
-test("domain switching refreshes result and reused reference URLs while retaining identity and task metadata", async () => {
+test("reference refresh updates result and reused reference URLs while retaining identity and task metadata", async () => {
   const api = load("lib/image-history.ts", { "@/lib/image-storage": { resolveImageReferences: async (images) => ({ items: images.map((image) => ({ ...image, url: "https://new.example.test/images/fixture.png", expires_at: reference.expires_at })) }) } });
   const source = conversation();
   const [result] = await api.refreshConversationReferences([source]);

@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import random
 import time
 import uuid
 from copy import deepcopy
@@ -20,6 +19,7 @@ from services.config import DATA_DIR, IMAGE_STORAGE_LOCK, config
 from services.r2_client import CloudflareR2Client, R2Error
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
+R2_USAGE_FILE = DATA_DIR / "r2_usage.json"
 IMAGE_INDEX_LOCK = IMAGE_STORAGE_LOCK
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"}
 R2_CLEANUP_BATCH_SIZE = 100
@@ -58,14 +58,6 @@ def _parse_time(value: object) -> datetime | None:
     except (TypeError, ValueError):
         return None
     return parsed.astimezone(timezone.utc) if parsed.tzinfo is not None else None
-
-
-def _cycle_start(account: dict, now: datetime) -> datetime:
-    start = now.replace(day=int(account.get("billing_cycle_day", 1)), hour=0, minute=0, second=0, microsecond=0)
-    if start > now:
-        previous_month = start.replace(day=1) - timedelta(days=1)
-        start = previous_month.replace(day=start.day)
-    return start
 
 
 def _r2_image_info(payload: bytes) -> tuple[str, str, tuple[int, int] | None]:
@@ -121,7 +113,7 @@ def _local_image_path(relative_path: str) -> Path:
 
 def _read_json_object(path: Path) -> dict[str, object]:
     if not path.exists():
-        return {"items": {}, "r2_usage": {}}
+        return {"items": {}}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, UnicodeError):
@@ -208,8 +200,9 @@ class WebDAVClient:
 
 
 class ImageStorageService:
-    def __init__(self, index_file: Path = IMAGE_INDEX_FILE):
+    def __init__(self, index_file: Path = IMAGE_INDEX_FILE, usage_file: Path = R2_USAGE_FILE):
         self.index_file = index_file
+        self.usage_file = usage_file
         self._index_lock = IMAGE_INDEX_LOCK
         # Prevent an explicit delete/cleanup racing a PUT still in flight. Restarted
         # pending records are not in this set and remain eligible for expiry cleanup.
@@ -223,12 +216,9 @@ class ImageStorageService:
 
     def _load_document(self) -> dict:
         document = _read_json_object(self.index_file)
-        if "items" not in document:
+        items = document.get("items")
+        if not isinstance(items, dict) or any(not isinstance(value, dict) for value in items.values()):
             raise ImageStorageError("image index is invalid")
-        for field in ("items", "r2_usage"):
-            mapping = document.setdefault(field, {})
-            if not isinstance(mapping, dict) or any(not isinstance(value, dict) for value in mapping.values()):
-                raise ImageStorageError("image index is invalid")
         return document
 
     def _load_index(self) -> dict[str, dict[str, object]]:
@@ -252,143 +242,59 @@ class ImageStorageService:
     def account(self, account_id: str) -> dict:
         return self._account(self.settings(), account_id)
 
-    def get_r2_usage(self, account_id: str) -> dict:
-        self.account(account_id)
-        with self._index_lock:
-            return deepcopy(self._load_document()["r2_usage"].get(account_id, {}))
+    def _load_usage(self) -> dict:
+        return _read_json_object(self.usage_file) if self.usage_file.exists() else {}
 
     @staticmethod
-    def _increment_a(state: dict, account: dict, count: int, now: datetime) -> None:
-        cycle = _cycle_start(account, now).isoformat()
-        if state.get("a_observed_cycle_start") != cycle or state.get("a_observed_cf_account_id") != account["account_id"]:
-            state["a_observed_cycle_start"] = cycle
-            state["a_observed_cf_account_id"] = account["account_id"]
-            state["a_observed_cycle_operations"] = 0
-        state["a_observed_cycle_operations"] = int(state.get("a_observed_cycle_operations", 0)) + count
-        state["a_local"] = max(int(state.get("a_local", 0)), int(state.get("cloud_a", 0))) + count
+    def _month(now: datetime) -> str:
+        return now.strftime("%Y-%m")
 
-    def update_r2_usage(self, account_id: str, updates: dict) -> dict:
-        """Merge management state. Use a_local_increment for atomic Class A debits.
+    def _monthly_uploads(self, usage: dict, account_id: str, month: str) -> int:
+        entry = usage.get(account_id) or {}
+        return int(entry.get("uploads", 0)) if entry.get("month") == month else 0
 
-        Absolute a_local values are merged with max, never used to reset a cycle.
-        Only record_usage_snapshot may reset that counter after a fresh full query.
-        """
-        account = self.account(account_id)
-        changes = deepcopy(updates)
-        increment = changes.pop("a_local_increment", 0)
-        if isinstance(increment, bool) or not isinstance(increment, int) or increment < 0:
-            raise ValueError("invalid R2 Class A increment")
-        debit = increment
+    def _count_upload(self, account_id: str, now: datetime) -> None:
+        """Count one Class A operation before the request is sent; failures are not refunded."""
         with self._index_lock:
-            document = self._load_document()
-            state = document["r2_usage"].setdefault(account_id, {})
-            absolute = changes.pop("a_local", None)
-            baseline = max(int(state.get("a_local", 0)), int(state.get("cloud_a", 0)))
-            if absolute is not None:
-                if isinstance(absolute, bool) or not isinstance(absolute, int) or absolute < 0:
-                    raise ValueError("invalid R2 Class A counter")
-                increment += max(0, absolute - baseline)
-            state.update(changes)
-            if "verified_domains" in changes:
-                # Reusing an empty account's internal ID for another CF account /
-                # bucket must not reuse the previous protection verification.
-                state.update(protection_cf_account_id=account.get("account_id"), protection_bucket=account.get("bucket"))
-            if debit and max(baseline, int(state.get("cloud_a", 0))) + increment > int(account.get("a_budget", 800000)):
-                raise ImageStorageError("R2 Class A budget exhausted")
-            if increment:
-                state["a_local"] = baseline
-                self._increment_a(state, account, increment, _utc_now())
-            elif absolute is not None:
-                state["a_local"] = max(baseline, absolute)
-            _write_json_object(self.index_file, document)
-            return deepcopy(state)
+            usage = self._load_usage()
+            month = self._month(now)
+            usage[account_id] = {"month": month, "uploads": self._monthly_uploads(usage, account_id, month) + 1}
+            _write_json_object(self.usage_file, usage)
 
-    def record_usage_snapshot(self, account_id: str, result: dict) -> dict:
-        """Atomically accept CloudflareAPI.query_usage's normalized result.
-
-        cloud_* are never added to the complete a_local counter. The two
-        a_observed_cycle_* fields retain operations issued during a rollover
-        query, including a concurrent connection test. capacity_snapshot_at is
-        the query end, not its completion time; uploads crossing it remain delta.
-        Incomplete/stale responses retain old counts/timestamps and cannot reset A.
-        """
-        settings = self.settings()
-        account = self._account(settings, account_id)
-        now = _utc_now()
-        start, end = _parse_time(result.get("period_start")), _parse_time(result.get("period_end"))
-        fields = {
-            "a_operations": "cloud_a", "b_operations": "cloud_b",
-            "bucket_a_operations": "cloud_bucket_a", "bucket_b_operations": "cloud_bucket_b",
-            "storage_bytes": "cloud_bytes", "bucket_storage_bytes": "cloud_bucket_bytes",
-            "object_count": "cloud_object_count",
-        }
-        counts_valid = all(type(result.get(key)) is int and result[key] >= 0 for key in fields)
-        fresh = end is not None and 0 <= (now - end).total_seconds() <= int(settings.get("usage_max_age_seconds", 900))
-        valid = (account.get("billing_cycle_confirmed") is True
-                 and result.get("complete") is True and not result.get("unknown_actions") and counts_valid
-                 and start == _cycle_start(account, now) and fresh and end >= start)
-        with self._index_lock:
-            document = self._load_document()
-            state = document["r2_usage"].setdefault(account_id, {})
-            if not valid:
-                state.update(complete=False, error="R2 usage snapshot incomplete or stale")
-            elif (_parse_time(state.get("period_end")) or datetime.min.replace(tzinfo=timezone.utc)) <= end:
-                new_cycle = (_parse_time(state.get("period_start")) != start
-                             or state.get("usage_cf_account_id") != account["account_id"])
-                observed = (int(state.get("a_observed_cycle_operations", 0))
-                            if _parse_time(state.get("a_observed_cycle_start")) == start
-                            and state.get("a_observed_cf_account_id") == account["account_id"] else 0)
-                local = observed if new_cycle else int(state.get("a_local", 0))
-                query_count = int(result.get("a_query_count", observed)) if _parse_time(result.get("a_query_cycle")) == start else 0
-                concurrent = max(0, observed - query_count) if "a_query_count" in result else 0
-                state.update({target: result[source] for source, target in fields.items()})
-                state.update(
-                    a_local=max(local, result["a_operations"] + concurrent), fetched_at=end.isoformat(),
-                    period_start=start.isoformat(), period_end=end.isoformat(),
-                    last_successful_usage_start=start.isoformat(),
-                    capacity_snapshot_at=result.get("bucket_storage_observed_at", end.isoformat()),
-                    usage_cf_account_id=account["account_id"], usage_bucket=account["bucket"],
-                    complete=True, error="", unknown_actions=[],
-                )
-            _write_json_object(self.index_file, document)
-            return deepcopy(state)
-
-    @staticmethod
-    def _usage_view(document: dict, account_id: str) -> dict:
-        state = deepcopy(document["r2_usage"].get(account_id, {}))
-        local_bytes = pending_bytes = image_count = pending_count = upload_delta = 0
-        snapshot_at = _parse_time(state.get("capacity_snapshot_at"))
-        for item in document["items"].values():
-            if item.get("storage") != "r2" or item.get("account_id") != account_id:
+    def _pick_account(self, settings: dict, now: datetime) -> dict | None:
+        """Enabled account with the lowest share of its monthly upload limit used."""
+        usage = self._load_usage()
+        month = self._month(now)
+        candidates = []
+        for account in settings.get("r2_accounts", []):
+            if not account["enabled"]:
                 continue
-            size = int(item["size"])
-            if item.get("pending"):
-                pending_bytes += size
-                pending_count += 1
-            else:
-                local_bytes += size
-                image_count += 1
-            uploaded_at = _parse_time(item.get("uploaded_at") or item.get("created_at"))
-            # Unknown PUT outcomes cannot be reconciled to aggregate cloud stats.
-            if item.get("pending") or snapshot_at is None or uploaded_at is None or uploaded_at > snapshot_at:
-                upload_delta += size
-        cloud_bytes = int(state.get("cloud_bytes", 0))
-        other_bucket_bytes = max(0, cloud_bytes - int(state.get("cloud_bucket_bytes", 0)))
-        state.update(
-            local_bytes=local_bytes, pending_bytes=pending_bytes, image_count=image_count,
-            pending_count=pending_count, upload_delta_bytes=upload_delta,
-            # Aggregate analytics can lag even before the query cutoff. Keep a
-            # separate lower bound for other buckets + all known image bytes,
-            # without adding the image bucket's already-counted baseline twice.
-            effective_bytes=max(cloud_bytes + upload_delta, other_bucket_bytes + local_bytes + pending_bytes),
-            effective_a=max(int(state.get("a_local", 0)), int(state.get("cloud_a", 0))),
-        )
-        return state
+            used = self._monthly_uploads(usage, account["id"], month)
+            if used < account["monthly_upload_limit"]:
+                candidates.append((used / account["monthly_upload_limit"], account))
+        return min(candidates, key=lambda item: item[0])[1] if candidates else None
 
-    def account_usage(self, account_id: str) -> dict:
-        self.account(account_id)
+    def account_summaries(self) -> list[dict]:
         with self._index_lock:
-            return self._usage_view(self._load_document(), account_id)
+            settings = self.settings()
+            items = self._load_document()["items"].values()
+            usage = self._load_usage()
+            month = self._month(_utc_now())
+            return [{
+                "id": account["id"],
+                "month": month,
+                "monthly_uploads": self._monthly_uploads(usage, account["id"], month),
+                "image_count": sum(1 for item in items if item.get("storage") == "r2" and item.get("account_id") == account["id"]),
+            } for account in settings.get("r2_accounts", [])]
+
+    def test_account(self, account_id: str) -> dict:
+        account = self.account(account_id)
+        self._count_upload(account_id, _utc_now())
+        client = CloudflareR2Client({**account, "prefix": "images"})
+        try:
+            return client.test_connection()
+        finally:
+            client.close()
 
     def validate_settings_change(self, new_settings: dict) -> None:
         old = {account["id"]: account for account in self.settings().get("r2_accounts", [])}
@@ -400,83 +306,14 @@ class ImageStorageService:
                     raise ValueError("R2 account has outstanding images and cannot be removed")
                 if any(old[account_id].get(key) != new[account_id].get(key) for key in ("account_id", "bucket")):
                     raise ValueError("R2 account identity/bucket has outstanding images and cannot be changed")
-                if any(not _clean(new[account_id].get(key)) for key in ("access_key_id", "secret_access_key", "api_token")):
+                if any(not _clean(new[account_id].get(key)) for key in ("access_key_id", "secret_access_key")):
                     raise ValueError("R2 account credentials are required while images remain")
 
-    @staticmethod
-    def _active_domain(account: dict) -> str:
-        for domain in account.get("domains", []):
-            if domain["id"] == account.get("active_domain_id") and domain.get("enabled"):
-                return str(domain["domain"])
-        return ""
-
-    def _account_status(self, account: dict, usage: dict, settings: dict, now: datetime, size: int = 0) -> str:
-        if usage.get("access_paused"):
-            return "access_paused"
-        if not account.get("enabled"):
-            return "disabled"
-        if not all(_clean(account.get(key)) for key in ("account_id", "bucket", "access_key_id", "secret_access_key", "api_token")):
-            return "unconfigured"
-        if not account.get("billing_cycle_confirmed"):
-            return "cycle_unconfirmed"
-        verified = set(usage.get("verified_domains", []))
-        enabled = {domain["domain"] for domain in account.get("domains", []) if domain.get("enabled")}
-        active = self._active_domain(account)
-        if (not active or active not in verified or not enabled.issubset(verified)
-                or usage.get("managed_disabled") is not True or usage.get("domains_checked") is not True
-                or usage.get("domains_safe") is not True
-                or usage.get("protection_cf_account_id") != account["account_id"]
-                or usage.get("protection_bucket") != account["bucket"]):
-            return "domains_unprotected"
-        fetched = _parse_time(usage.get("fetched_at"))
-        if (usage.get("complete") is not True or fetched is None
-                or usage.get("usage_cf_account_id") != account["account_id"] or usage.get("usage_bucket") != account["bucket"]
-                or not 0 <= (now - fetched).total_seconds() <= int(settings.get("usage_max_age_seconds", 900))
-                or _parse_time(usage.get("period_start")) != _cycle_start(account, now)):
-            return "usage_stale"
-        if usage["effective_bytes"] >= int(account.get("capacity_bytes", 8000000000)) or usage["effective_bytes"] + size > int(account.get("capacity_bytes", 8000000000)):
-            return "capacity_exhausted"
-        if usage["effective_a"] >= int(account.get("a_budget", 800000)):
-            return "a_exhausted"
-        if int(usage.get("cloud_b", 0)) >= int(account.get("b_budget", 8000000)):
-            return "b_exhausted"
-        return "eligible"
-
-    def account_status(self, account_id: str) -> str:
+    def require_upload_available(self) -> None:
         with self._index_lock:
             settings = self.settings()
-            account = self._account(settings, account_id)
-            usage = self._usage_view(self._load_document(), account_id)
-            return self._account_status(account, usage, settings, _utc_now())
-
-    def account_summaries(self) -> list[dict]:
-        """Derive each status from its returned usage in one settings/index snapshot."""
-        with self._index_lock:
-            settings = self.settings()
-            document = self._load_document()
-            now = _utc_now()
-            summaries = []
-            for account in settings.get("r2_accounts", []):
-                usage = self._usage_view(document, account["id"])
-                summaries.append({
-                    "id": account["id"],
-                    "status": self._account_status(account, usage, settings, now),
-                    "usage": usage,
-                    "domains": usage.get("domains", []),
-                })
-            return summaries
-
-    def _eligible_accounts(self, document: dict, settings: dict, size: int, now: datetime) -> list[dict]:
-        return [account for account in settings.get("r2_accounts", [])
-                if self._account_status(account, self._usage_view(document, account["id"]), settings, now, size) == "eligible"]
-
-    def require_upload_available(self, size: int = 0) -> None:
-        with self._index_lock:
-            settings = self.settings()
-            if settings.get("mode") != "r2":
-                return
-            if not self._eligible_accounts(self._load_document(), settings, size, _utc_now()):
-                raise ImageStorageError("R2 image storage has no eligible account or available budget")
+            if settings.get("mode") == "r2" and self._pick_account(settings, _utc_now()) is None:
+                raise ImageStorageError("R2 image storage has no enabled account with remaining monthly uploads")
 
     def metadata(self, rel: str) -> dict | None:
         safe_rel = _safe_relative_path(rel)
@@ -484,24 +321,19 @@ class ImageStorageService:
             return deepcopy(self._load_document()["items"].get(safe_rel))
 
     @staticmethod
-    def _require_readable(item: dict, usage: dict) -> None:
+    def _require_readable(item: dict) -> None:
         if item.get("pending"):
             raise HTTPException(status_code=404, detail="image not found")
         expires = _parse_time(item.get("expires_at"))
         if expires is None or expires <= _utc_now():
             raise HTTPException(status_code=410, detail="image expired")
-        if usage.get("access_paused"):
-            raise HTTPException(status_code=403, detail="R2 image access paused")
 
-    def _r2_public_url(self, item: dict, document: dict, accounts: dict[str, dict]) -> str:
-        self._require_readable(item, document["r2_usage"].get(item["account_id"], {}))
+    def _r2_public_url(self, item: dict, accounts: dict[str, dict]) -> str:
+        self._require_readable(item)
         account = accounts.get(item["account_id"])
         if account is None:
             raise HTTPException(status_code=404, detail="image account unavailable")
-        domain = self._active_domain(account)
-        if not domain:
-            raise HTTPException(status_code=403, detail="R2 public domain unavailable")
-        return f"https://{domain}/{quote(item['object_key'], safe='/')}"
+        return f"{account['public_base_url']}/{quote(item['object_key'], safe='/')}"
 
     def public_url(self, rel: str, base_url: str | None = None) -> str:
         safe_rel = _safe_relative_path(rel)
@@ -511,7 +343,7 @@ class ImageStorageService:
             item = document["items"].get(safe_rel)
             if item and item.get("storage") == "r2":
                 accounts = {account["id"]: account for account in settings.get("r2_accounts", [])}
-                return self._r2_public_url(item, document, accounts)
+                return self._r2_public_url(item, accounts)
             if not _is_image_rel(safe_rel) or not ((item and item.get("webdav")) or _local_image_path(safe_rel).is_file()):
                 raise HTTPException(status_code=404, detail="image not found")
         return self._public_url(safe_rel, settings, base_url)
@@ -528,7 +360,7 @@ class ImageStorageService:
                     return {**result, "expired": True}
                 result.update({key: item[key] for key in ("image_id", "account_id", "expires_at")})
                 accounts = {account["id"]: account for account in self.settings().get("r2_accounts", [])}
-                result["url"] = self._r2_public_url(item, document, accounts)
+                result["url"] = self._r2_public_url(item, accounts)
                 return result
         except HTTPException as exc:
             result["expired" if exc.status_code in {404, 410} else "unavailable"] = True
@@ -544,10 +376,9 @@ class ImageStorageService:
                 extension, mime, dimensions = _r2_image_info(image_data)
                 now = _utc_now()
                 document = self._load_document()
-                candidates = self._eligible_accounts(document, settings, len(image_data), now)
-                if not candidates:
-                    raise ImageStorageError("R2 image storage has no eligible account or available budget")
-                account = random.choice(candidates)
+                account = self._pick_account(settings, now)
+                if account is None:
+                    raise ImageStorageError("R2 image storage has no enabled account with remaining monthly uploads")
                 rel = f"images/{now:%Y/%m/%d}/{uuid.uuid4().hex}{extension}"
                 expires = now + timedelta(minutes=int(settings.get("retention_minutes", 60)))
                 item = {
@@ -559,8 +390,8 @@ class ImageStorageService:
                 if dimensions:
                     item["width"], item["height"] = dimensions
                 document["items"][rel] = item
-                self._increment_a(document["r2_usage"].setdefault(account["id"], {}), account, 1, now)
                 _write_json_object(self.index_file, document)
+                self._count_upload(account["id"], now)
                 self._uploading.add(rel)
         if settings.get("mode") != "r2":
             return self._save_legacy(image_data, settings, base_url)
@@ -582,7 +413,7 @@ class ImageStorageService:
                 item.update(pending=False, uploaded_at=_now_iso())
                 _write_json_object(self.index_file, document)
                 accounts = {account["id"]: account for account in self.settings().get("r2_accounts", [])}
-                url = self._r2_public_url(item, document, accounts)
+                url = self._r2_public_url(item, accounts)
             return StoredImage(rel=rel, url=url, storage="r2", size=len(image_data),
                                image_id=rel, account_id=account["id"], expires_at=expires.isoformat())
         finally:
@@ -649,7 +480,7 @@ class ImageStorageService:
             document = self._load_document()
             item = document["items"].get(safe_rel, {})
             if item.get("storage") == "r2":
-                self._require_readable(item, document["r2_usage"].get(item["account_id"], {}))
+                self._require_readable(item)
         if item.get("storage") == "r2":
             client = self._r2_client(item["account_id"])
             try:
@@ -724,7 +555,7 @@ class ImageStorageService:
                         continue
                     visible = {**item, "rel": rel, "path": rel, "url": ""}
                     try:
-                        visible["url"] = self._r2_public_url(item, document, accounts)
+                        visible["url"] = self._r2_public_url(item, accounts)
                     except HTTPException as exc:
                         visible["expired" if exc.status_code == 410 else "unavailable"] = True
                     items.append(visible)

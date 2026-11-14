@@ -105,7 +105,7 @@ docker compose logs --tail=100 app
 
 ### 1.9.7 升级注意
 
-保留现有存储配置，不会自动启用 R2、迁移或删除旧图片。Images 默认及 `b64_json`、Chat/Responses 图片不再保存；需要持久化链接时显式使用 `response_format=url`，网页图片任务继续保存。R2 需要在「设置 → 图片存储」中配置，先完成测试桶权限、统计、域名、防护及缓存验收，再启用分配，详见 [R2 图片存储](r2-image-storage.md)。升级前备份配置、数据库、图片索引及任务记录；应用更新无需重建 PostgreSQL。
+保留现有存储配置，不会自动启用 R2、迁移或删除旧图片。Images 默认及 `b64_json`、Chat/Responses 图片不再保存；需要持久化链接时显式使用 `response_format=url`，网页图片任务继续保存。R2 需要在「设置 → 图片存储」中配置账号、公开访问地址并测试连接，详见 [R2 图片存储](r2-image-storage.md)。升级前备份配置、数据库、图片索引及任务记录；应用更新无需重建 PostgreSQL。
 
 ### 1.9.6 升级注意
 

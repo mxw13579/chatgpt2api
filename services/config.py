@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import ipaddress
 import json
 import os
 import re
@@ -42,14 +41,11 @@ DEFAULT_IMAGE_STORAGE = {
     "public_base_url": "",
     "retention_minutes": 60,
     "cleanup_interval_seconds": 60,
-    "usage_refresh_seconds": 300,
-    "usage_max_age_seconds": 900,
     "cache_ttl_seconds": 60,
-    "cors_origins": ["*"],
     "r2_accounts": [],
 }
 
-R2_SECRET_FIELDS = ("access_key_id", "secret_access_key", "api_token")
+R2_SECRET_FIELDS = ("access_key_id", "secret_access_key")
 
 DEFAULT_CHAT_COMPLETION_CACHE = {
     "enabled": True,
@@ -233,20 +229,6 @@ def _r2_bool(source: dict, field: str, default: bool) -> bool:
 def _normalize_r2_account(source: object) -> dict[str, object]:
     if not isinstance(source, dict):
         raise ValueError("R2 账号必须是对象")
-    domains = source.get("domains", [])
-    if not isinstance(domains, list):
-        raise ValueError("R2 domains 必须是列表")
-    normalized_domains = []
-    for domain in domains:
-        if not isinstance(domain, dict):
-            raise ValueError("R2 域名必须是对象")
-        hostname = _r2_text(domain, "domain").lower()
-        normalized_domains.append({
-            "id": _r2_text(domain, "id", hostname).lower(),
-            "domain": hostname,
-            "zone_id": _r2_text(domain, "zone_id").lower(),
-            "enabled": _r2_bool(domain, "enabled", False),
-        })
     return {
         "id": _r2_text(source, "id").lower(),
         "name": _r2_text(source, "name"),
@@ -254,45 +236,9 @@ def _normalize_r2_account(source: object) -> dict[str, object]:
         "account_id": _r2_text(source, "account_id").lower(),
         "bucket": _r2_text(source, "bucket"),
         **{field: _r2_text(source, field) for field in R2_SECRET_FIELDS},
-        "capacity_bytes": _image_storage_int(source, "capacity_bytes", 8_000_000_000),
-        "a_budget": _image_storage_int(source, "a_budget", 800_000),
-        "b_warn": _image_storage_int(source, "b_warn", 7_000_000, minimum=0),
-        "b_budget": _image_storage_int(source, "b_budget", 8_000_000),
-        "billing_cycle_day": _image_storage_int(source, "billing_cycle_day", 1, maximum=28),
-        "billing_cycle_confirmed": _r2_bool(source, "billing_cycle_confirmed", False),
-        "active_domain_id": _r2_text(source, "active_domain_id").lower(),
-        "domains": normalized_domains,
-        "rate_limit_requests": _image_storage_int(source, "rate_limit_requests", 120),
-        "restrict_methods": _r2_bool(source, "restrict_methods", True),
+        "public_base_url": _r2_text(source, "public_base_url").rstrip("/"),
+        "monthly_upload_limit": _image_storage_int(source, "monthly_upload_limit", 900_000),
     }
-
-
-def _normalize_image_cors_origins(value: object) -> list[str]:
-    if not isinstance(value, list):
-        raise ValueError("图片存储 cors_origins 必须是列表")
-    origins = []
-    for item in value:
-        if not isinstance(item, str):
-            raise ValueError("图片存储 CORS 必须是 HTTP/HTTPS Origin 或 *")
-        origin = item.strip()
-        if origin != "*":
-            try:
-                parsed = urlsplit(origin)
-                valid = (
-                    parsed.scheme in {"http", "https"} and parsed.hostname
-                    and parsed.username is None and parsed.password is None
-                    and parsed.path in {"", "/"} and not parsed.query and not parsed.fragment
-                    and (parsed.port is None or 1 <= parsed.port <= 65535)
-                    and "\\" not in origin and not any(char.isspace() for char in origin)
-                )
-            except ValueError:
-                valid = False
-            if not valid:
-                raise ValueError("图片存储 CORS 必须是 HTTP/HTTPS Origin 或 *") from None
-            origin = f"{parsed.scheme}://{parsed.netloc.lower()}"
-        if origin not in origins:
-            origins.append(origin)
-    return origins
 
 
 def _normalize_image_storage_settings(value: object) -> dict[str, object]:
@@ -318,10 +264,9 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         "public_base_url": str(source.get("public_base_url") or "").strip().rstrip("/"),
         **{
             field: _image_storage_int(source, field, DEFAULT_IMAGE_STORAGE[field])
-            for field in ("retention_minutes", "cleanup_interval_seconds", "usage_refresh_seconds", "usage_max_age_seconds")
+            for field in ("retention_minutes", "cleanup_interval_seconds")
         },
         "cache_ttl_seconds": _image_storage_int(source, "cache_ttl_seconds", 60, minimum=0),
-        "cors_origins": _normalize_image_cors_origins(source.get("cors_origins", ["*"])),
         "r2_accounts": [_normalize_r2_account(account) for account in accounts],
     }
 
@@ -474,23 +419,6 @@ def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
     }
 
 
-def _validate_r2_hostname(hostname: str) -> None:
-    labels = hostname.split(".")
-    valid = (
-        len(hostname) <= 253 and len(labels) >= 2
-        and not labels[-1].isdigit()
-        and all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels)
-    )
-    try:
-        ipaddress.ip_address(hostname)
-    except ValueError:
-        pass
-    else:
-        valid = False
-    if not valid:
-        raise ValueError("R2 domain 必须是 HTTPS 主机名，不能包含协议、路径、端口或 IP 地址")
-
-
 def _validate_image_storage_settings(settings: dict[str, object]) -> None:
     if settings["mode"] == "r2" and not settings["enabled"]:
         raise ValueError("R2 图片存储必须设置 enabled=true")
@@ -502,7 +430,6 @@ def _validate_image_storage_settings(settings: dict[str, object]) -> None:
 
     internal_ids: set[str] = set()
     cf_ids: set[str] = set()
-    all_domains: set[str] = set()
     for account in settings["r2_accounts"]:
         internal_id = account["id"]
         try:
@@ -526,28 +453,15 @@ def _validate_image_storage_settings(settings: dict[str, object]) -> None:
         for field in R2_SECRET_FIELDS:
             if account[field] and not account[field].strip("*"):
                 raise ValueError(f"R2 {field} 不能使用密钥掩码；留空以保留已有凭据")
+        base_url = account["public_base_url"]
+        if base_url:
+            parsed = urlsplit(base_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.query or parsed.fragment:
+                raise ValueError("R2 public_base_url 必须是 http(s):// 开头的访问地址")
         if account["enabled"]:
-            for field in ("account_id", "bucket", *R2_SECRET_FIELDS):
+            for field in ("account_id", "bucket", *R2_SECRET_FIELDS, "public_base_url"):
                 if not account[field]:
-                    raise ValueError(f"启用 R2 账号前必须填写 {field}；未配置完成可保存为禁用草稿")
-        if account["b_warn"] > account["b_budget"]:
-            raise ValueError("R2 b_warn 不能超过 b_budget")
-        if len(account["domains"]) > 100:
-            raise ValueError("每个 R2 桶最多配置 100 个自定义域名")
-        domain_ids: set[str] = set()
-        for domain in account["domains"]:
-            hostname = domain["domain"]
-            _validate_r2_hostname(hostname)
-            if domain["id"] != hostname:
-                raise ValueError("R2 domain id 必须与域名相同")
-            if not re.fullmatch(r"[a-f0-9]{32}", domain["zone_id"]):
-                raise ValueError("R2 zone_id 必须是 32 位十六进制 Zone ID")
-            if hostname in all_domains:
-                raise ValueError("R2 domain 不得重复")
-            all_domains.add(hostname)
-            domain_ids.add(hostname)
-        if account["active_domain_id"] and account["active_domain_id"] not in domain_ids:
-            raise ValueError("R2 active_domain_id 必须引用已配置的域名")
+                    raise ValueError(f"启用 R2 账号前必须填写 {field}")
 
 
 def _normalize_auth_key(value: object) -> str:

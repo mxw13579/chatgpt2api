@@ -17,7 +17,6 @@ from fastapi import HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
 
 from services import image_service, image_task_service as task_module
-from services import r2_management_service as management_module
 from services.image_storage_service import ImageStorageError, StoredImage
 from services.protocol import conversation
 
@@ -50,7 +49,7 @@ def service_env(monkeypatch, tmp_path):
         def image_thumbnails_dir(self):
             raise AssertionError("directory-creating config property used")
 
-    storage = Mock(spec=["metadata", "_load_index", "public_url", "get_bytes", "has_local", "delete", "list_items"])
+    storage = Mock(spec=["metadata", "_load_index", "public_url", "get_bytes", "has_local", "delete", "list_items", "cleanup_expired"])
     storage.metadata.return_value = None
     storage.has_local.return_value = False
     storage.public_url.return_value = URL
@@ -298,8 +297,7 @@ def test_explicit_legacy_cleanup_keeps_remote_objects_and_r2_metadata(service_en
 def test_maintenance_uses_one_loop_and_dynamic_r2_interval(service_env, monkeypatch):
     env = service_env
     env.settings["cleanup_interval_seconds"] = 15
-    manager = SimpleNamespace(maintenance_tick=Mock())
-    monkeypatch.setattr(management_module, "r2_management_service", manager)
+    env.storage.cleanup_expired = Mock()
     clock = [0.0]
     waits = []
 
@@ -311,11 +309,11 @@ def test_maintenance_uses_one_loop_and_dynamic_r2_interval(service_env, monkeypa
     def tick():
         env.settings["cleanup_interval_seconds"] = 30
 
-    manager.maintenance_tick.side_effect = tick
+    env.storage.cleanup_expired.side_effect = tick
     monkeypatch.setattr(image_service.time, "monotonic", lambda: clock[0])
     image_service._auto_cleanup_worker(SimpleNamespace(wait=wait))
     assert waits == [15, 30, 30]
-    assert manager.maintenance_tick.call_count == 2
+    assert env.storage.cleanup_expired.call_count == 2
     env.config.cleanup_old_images.assert_not_called()
     assert list(env.root.iterdir()) == []
 
@@ -324,8 +322,7 @@ def test_maintenance_uses_one_loop_and_dynamic_r2_interval(service_env, monkeypa
 def test_maintenance_failure_is_sanitized_without_blocking_local_cadence(service_env, monkeypatch, mode):
     env = service_env
     env.settings["mode"] = mode
-    manager = SimpleNamespace(maintenance_tick=Mock(side_effect=RuntimeError("synthetic-private-error")))
-    monkeypatch.setattr(management_module, "r2_management_service", manager)
+    env.storage.cleanup_expired = Mock(side_effect=RuntimeError("synthetic-private-error"))
     clock = [0.0]
     waits = []
     local_runs = []
@@ -342,7 +339,7 @@ def test_maintenance_failure_is_sanitized_without_blocking_local_cadence(service
     monkeypatch.setattr(image_service, "cleanup_image_thumbnails", thumbnails)
     image_service._auto_cleanup_worker(SimpleNamespace(wait=wait))
     assert waits == [60] * 31
-    assert manager.maintenance_tick.call_count == 30
+    assert env.storage.cleanup_expired.call_count == 30
     assert image_service.logger.warning.call_count == 30
     assert "synthetic-private-error" not in str(image_service.logger.mock_calls)
     assert local_runs == ([] if mode == "r2" else [1800])
@@ -358,8 +355,7 @@ def test_maintenance_after_mode_switch_keeps_r2_and_local_deadlines_independent(
     ticks = []
     local_runs = []
     env.config.cleanup_old_images.side_effect = lambda: local_runs.append(clock[0])
-    manager = SimpleNamespace(maintenance_tick=Mock(side_effect=lambda: ticks.append((clock[0], env.settings["mode"]))))
-    monkeypatch.setattr(management_module, "r2_management_service", manager)
+    env.storage.cleanup_expired = Mock(side_effect=lambda: ticks.append((clock[0], env.settings["mode"])))
 
     def wait(seconds):
         waits.append(seconds)
@@ -384,8 +380,7 @@ def test_maintenance_after_mode_switch_keeps_r2_and_local_deadlines_independent(
 def test_maintenance_without_r2_accounts_keeps_legacy_thirty_minute_cadence(service_env, monkeypatch, mode):
     env = service_env
     env.settings.update(mode=mode, r2_accounts=[])
-    manager = SimpleNamespace(maintenance_tick=Mock())
-    monkeypatch.setattr(management_module, "r2_management_service", manager)
+    env.storage.cleanup_expired = Mock()
     clock = [0.0]
     waits = []
     local_runs = []
@@ -404,7 +399,7 @@ def test_maintenance_without_r2_accounts_keeps_legacy_thirty_minute_cadence(serv
     assert waits == [60] * 61
     assert local_runs == ([] if mode == "r2" else [1800, 3600])
     assert thumbnails.call_count == len(local_runs)
-    manager.maintenance_tick.assert_not_called()
+    env.storage.cleanup_expired.assert_not_called()
 
 
 def test_scheduler_starts_one_loop_with_lifespan_stop_event(service_env, monkeypatch):

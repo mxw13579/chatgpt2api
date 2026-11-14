@@ -416,7 +416,7 @@ def download_images_zip(paths: list[str]) -> io.BytesIO:
 
 
 def _auto_cleanup_worker(stop_event: threading.Event) -> None:
-    """One loop, independent R2 maintenance and 30-minute local cleanup deadlines."""
+    """One loop, independent R2 expiry cleanup and 30-minute local cleanup deadlines."""
     last_r2 = last_legacy = time.monotonic()
     while True:
         settings = config.get_image_storage_settings()
@@ -434,8 +434,7 @@ def _auto_cleanup_worker(stop_event: threading.Event) -> None:
         if settings.get("r2_accounts") and now - last_r2 >= int(settings.get("cleanup_interval_seconds", 60)):
             last_r2 = now
             try:
-                from services.r2_management_service import r2_management_service
-                r2_management_service.maintenance_tick()
+                image_storage_service.cleanup_expired()
             except Exception:
                 # No raw transport exceptions/URLs in the maintenance log.
                 logger.warning({"event": "image_maintenance_failed", "mode": settings.get("mode")})

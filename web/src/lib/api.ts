@@ -15,13 +15,6 @@ export type ImageReference = {
   storage?: string;
 };
 
-export type R2Domain = {
-  id: string;
-  domain: string;
-  zone_id: string;
-  enabled: boolean;
-};
-
 export type R2Account = {
   id: string;
   name: string;
@@ -30,20 +23,10 @@ export type R2Account = {
   bucket: string;
   access_key_id: string;
   secret_access_key: string;
-  api_token: string;
   has_access_key_id?: boolean;
   has_secret_access_key?: boolean;
-  has_api_token?: boolean;
-  capacity_bytes: number;
-  a_budget: number;
-  b_warn: number;
-  b_budget: number;
-  billing_cycle_day: number;
-  billing_cycle_confirmed: boolean;
-  active_domain_id: string;
-  domains: R2Domain[];
-  rate_limit_requests: number;
-  restrict_methods: boolean;
+  public_base_url: string;
+  monthly_upload_limit: number;
 };
 
 export type ImageStorageSettings = {
@@ -56,10 +39,7 @@ export type ImageStorageSettings = {
   public_base_url: string;
   retention_minutes: number;
   cleanup_interval_seconds: number;
-  usage_refresh_seconds: number;
-  usage_max_age_seconds: number;
   cache_ttl_seconds: number;
-  cors_origins: string[];
   r2_accounts: R2Account[];
 };
 
