@@ -131,7 +131,7 @@ function ImageManagerContent() {
   const currentPageSelected = currentRows.length > 0 && currentRows.every((item) => selectedSet.has(imageKey(item)));
   const allSelected = filteredItems.length > 0 && filteredItems.every((item) => selectedSet.has(imageKey(item)));
 
-  const loadImages = useCallback(async () => {
+  const loadImages = useCallback(async (resetPage = true) => {
     setIsLoading(true);
     try {
       const [data, tagsData] = await Promise.all([
@@ -141,7 +141,7 @@ function ImageManagerContent() {
       setItems(data.items);
       setAllTags(tagsData.tags);
       setSelectedPaths((current) => current.filter((path) => data.items.some((item) => imageKey(item) === path)));
-      setPage(1);
+      if (resetPage) setPage(1);
     } catch (error) {
       setItems((current) => current.map((image) => isR2Image(image) ? { ...image, url: "", unavailable: true } : image));
       toast.error(error instanceof Error ? error.message : "加载图片失败");
@@ -313,7 +313,7 @@ function ImageManagerContent() {
 
   useEffect(() => { void loadImages(); }, [loadImages]);
   useEffect(() => {
-    const refresh = () => { void loadImages(); void loadStorage(); };
+    const refresh = () => { void loadImages(false); void loadStorage(); };
     const changed = (event: StorageEvent) => { if (event.key === IMAGE_STORAGE_CHANGED) refresh(); };
     window.addEventListener("focus", refresh);
     window.addEventListener(IMAGE_STORAGE_CHANGED, refresh);
@@ -512,7 +512,7 @@ function ImageManagerContent() {
               {selectedPaths.length > 0 ? <span>已选 {selectedPaths.length} 张</span> : null}
             </div>
             <div className="flex items-center gap-2">
-              <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-500" onClick={() => void loadImages()} disabled={isLoading}>
+              <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-500" onClick={() => void loadImages(false)} disabled={isLoading}>
                 <RefreshCw className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
                 刷新
               </Button>

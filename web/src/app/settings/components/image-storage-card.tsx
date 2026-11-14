@@ -12,7 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { syncImageStorage, testImageStorageConnection, type ImageStorageMode, type ImageStorageSettings, type R2Account } from "@/lib/api";
 import {
   DEFAULT_IMAGE_STORAGE, addR2Domain, applyR2Protection, checkR2Domains, cleanupExpiredImages,
-  cleanupLegacyImages, deleteR2Domain, getImageStorageOverview, getR2Domains, getR2Zones,
+  cleanupLegacyImages, deleteR2Domain, getImageStorageOverview, getR2Domains, getR2Zones, imageStorageSettingsAffectImages,
   newR2Account, notifyImageStorageChanged, refreshR2Usage, restoreR2Access,
   saveImageStorageSettings, testR2Account, updateR2Domain,
   type CleanupResult, type DomainCheck, type ImageStorageOverview, type R2AccountRuntime,
@@ -47,7 +47,7 @@ function NumberField({ label, value, onChange, min = 1, max, step = 1, hint }: {
   return <Field label={label} hint={hint}><Input required type="number" min={min} max={max} step={step} value={Number.isNaN(value) ? "" : value} onChange={(event) => onChange(event.target.valueAsNumber)} className={inputClass} /></Field>;
 }
 
-type RunAction = (label: string, action: () => Promise<string | void>) => Promise<void>;
+type RunAction = (label: string, action: () => Promise<string | void>, changesImages?: boolean) => Promise<void>;
 
 export function ImageStorageCard() {
   const [overview, setOverview] = useState<ImageStorageOverview | null>(null);
@@ -78,7 +78,7 @@ export function ImageStorageCard() {
     return () => window.removeEventListener("beforeunload", warn);
   }, [dirty]);
 
-  const run: RunAction = async (label, action) => {
+  const run: RunAction = async (label, action, changesImages = false) => {
     setBusy(label); setError(""); setResult("");
     try {
       const message = await action();
@@ -88,9 +88,10 @@ export function ImageStorageCard() {
       const message = cause instanceof Error ? cause.message : `${label}失败`;
       setError(message); toast.error(message);
     } finally {
-      // 失败也读取最新状态，展示已完成的部分操作，绝不伪装全部成功。
-      try { await reload(); notifyImageStorageChanged(); }
+      // 失败也读取最新状态；变更可能部分生效，即使读取失败仍通知图片视图。
+      try { await reload(); }
       catch { setError((previous) => `${previous ? `${previous}；` : ""}状态刷新失败，请重新读取后再操作`); }
+      if (changesImages) notifyImageStorageChanged();
       setBusy("");
     }
   };
@@ -103,6 +104,7 @@ export function ImageStorageCard() {
   const save = async () => {
     if (!settings || !formRef.current?.reportValidity()) return;
     setBusy("保存"); setError(""); setResult("");
+    let changesImages = false;
     try {
       const latest = await getImageStorageOverview();
       // 域名只通过专用动作修改；预算/凭据表单不回写旧的域名切换快照。
@@ -110,11 +112,17 @@ export function ImageStorageCard() {
         const current = latest.settings.r2_accounts.find((item) => item.id === account.id);
         return current ? { ...account, domains: current.domains, active_domain_id: current.active_domain_id } : account;
       });
-      accept(await saveImageStorageSettings({ ...settings, r2_accounts, cors_origins: origins(settings) }));
-      notifyImageStorageChanged(); setResult("图片存储配置已保存"); toast.success("图片存储配置已保存");
+      const next = { ...settings, r2_accounts, cors_origins: origins(settings) };
+      changesImages = imageStorageSettingsAffectImages(latest.settings, next);
+      accept(await saveImageStorageSettings(next));
+      setResult("图片存储配置已保存"); toast.success("图片存储配置已保存");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "保存失败");
-    } finally { setBusy(""); }
+    } finally {
+      // 请求失败不代表配置未提交；只通知可能影响现有图片的保存尝试。
+      if (changesImages) notifyImageStorageChanged();
+      setBusy("");
+    }
   };
   const refreshPage = async () => {
     if (dirty && !window.confirm("放弃未保存的图片存储修改并重新读取？密钥输入不会保留。")) return;
@@ -160,7 +168,7 @@ export function ImageStorageCard() {
               {([ ["webdav_url", "WebDAV URL"], ["webdav_username", "用户名"], ["webdav_password", "密码"], ["webdav_root_path", "远端目录"], ["public_base_url", "公开访问前缀（可留空）"] ] as const).map(([key, label]) => <Field key={key} label={label}><Input className={inputClass} type={key === "webdav_password" ? "password" : "text"} value={settings[key]} onChange={(event) => patch({ [key]: event.target.value })} autoComplete="off" /></Field>)}
             </div><p className="text-xs text-stone-500">先保存，再测试或将现有本地图补传至 WebDAV；公开前缀留空使用应用访问地址。</p>
             <div className="flex flex-wrap gap-2"><Button type="button" variant="outline" disabled={locked} onClick={() => void run("测试 WebDAV", async () => { const { result } = await testImageStorageConnection(); requireOK(result); })}>测试 WebDAV</Button>
-              <Button type="button" variant="outline" disabled={locked} onClick={() => { if (window.confirm("将现有本地图全量同步到 WebDAV？")) void run("同步 WebDAV", async () => { const { result } = await syncImageStorage(); return `上传 ${result.uploaded}，跳过 ${result.skipped}，失败 ${result.failed}`; }); }}>全量同步</Button></div>
+              <Button type="button" variant="outline" disabled={locked} onClick={() => { if (window.confirm("将现有本地图全量同步到 WebDAV？")) void run("同步 WebDAV", async () => { const { result } = await syncImageStorage(); return `上传 ${result.uploaded}，跳过 ${result.skipped}，失败 ${result.failed}`; }, true); }}>全量同步</Button></div>
           </div> : null}
           <Field label="R2 CORS 允许的 Origin（每行一项）" hint="填完整 Origin（如 https://app.example.com），或 *。允许 GET/HEAD 和 Range，不带凭据；CORS 不是防刷。保存后须对相关账号点击「应用防护与 CORS」。"><Textarea className="rounded-xl border-stone-200 bg-white" value={settings.cors_origins.join("\n")} onChange={(event) => patch({ cors_origins: event.target.value.split("\n") })} /></Field>
           <div className="flex flex-wrap items-center justify-between gap-3"><h3 className="font-medium">R2 账号 · {settings.r2_accounts.length} 个 / 可分配 {overview?.accounts.filter((account) => account.status === "eligible").length || 0} 个</h3>
@@ -192,9 +200,9 @@ export function ImageStorageCard() {
                 <p className="text-xs text-stone-500">账号停用只停止新上传，仍保留旧图清理。存在对象时仅允许凭据轮换，不可移除账号/改桶。启用分配不等于恢复公开访问。</p>
                 <div className="flex flex-wrap gap-2">
                   <Button type="button" variant="outline" disabled={locked || !runtime} onClick={() => void run("测试账号", async () => { const { result } = await testR2Account(account.id); requireOK(result); return "对象连接/权限测试完成（实际操作消耗 A 类额度）"; })}>连接/权限测试</Button>
-                  <Button type="button" variant="outline" disabled={locked || !runtime} onClick={() => void run("刷新用量", async () => { const { result } = await refreshR2Usage(account.id); if (!result.complete || result.error) throw new Error(result.error || "统计不完整，不能视为可用预算"); })}>刷新用量</Button>
-                  <Button type="button" variant="outline" disabled={locked || !runtime} onClick={() => { if (window.confirm("应用本项目免费规则与 CORS，关闭 r2.dev 和所有未纳管的公开绑定？若防护应用失败，可能停用该桶全部公开入口。不会覆盖其他规则或升级付费；同 Zone /images/ 路径共用限速规则。")) void run("应用防护与 CORS", async () => { const { result } = await applyR2Protection(account.id, { rate_limit_requests: account.rate_limit_requests, restrict_methods: account.restrict_methods, cors_origins: origins(settings) }); requireOK(result); }); }}>应用防护与 CORS</Button>
-                  <Button type="button" variant="outline" disabled={locked || !runtime} onClick={() => { if (window.confirm(`重新检查预算及防护，并恢复公开访问？拟启用配置域名：${account.domains.filter((domain) => domain.enabled).map((domain) => domain.domain).join("、") || "无（请检查域名配置）"}。切换域名不能绕过 B 类停读。`)) void run("恢复公开访问", async () => { const { result } = await restoreR2Access(account.id); requireOK(result); }); }}>恢复公开访问</Button>
+                  <Button type="button" variant="outline" disabled={locked || !runtime} onClick={() => void run("刷新用量", async () => { const { result } = await refreshR2Usage(account.id); if (!result.complete || result.error) throw new Error(result.error || "统计不完整，不能视为可用预算"); }, true)}>刷新用量</Button>
+                  <Button type="button" variant="outline" disabled={locked || !runtime} onClick={() => { if (window.confirm("应用本项目免费规则与 CORS，关闭 r2.dev 和所有未纳管的公开绑定？若防护应用失败，可能停用该桶全部公开入口。不会覆盖其他规则或升级付费；同 Zone /images/ 路径共用限速规则。")) void run("应用防护与 CORS", async () => { const { result } = await applyR2Protection(account.id, { rate_limit_requests: account.rate_limit_requests, restrict_methods: account.restrict_methods, cors_origins: origins(settings) }); requireOK(result); }, true); }}>应用防护与 CORS</Button>
+                  <Button type="button" variant="outline" disabled={locked || !runtime} onClick={() => { if (window.confirm(`重新检查预算及防护，并恢复公开访问？拟启用配置域名：${account.domains.filter((domain) => domain.enabled).map((domain) => domain.domain).join("、") || "无（请检查域名配置）"}。切换域名不能绕过 B 类停读。`)) void run("恢复公开访问", async () => { const { result } = await restoreR2Access(account.id); requireOK(result); }, true); }}>恢复公开访问</Button>
                   <Button type="button" variant="outline" disabled={hasObjects} className="text-rose-600" onClick={() => { if (window.confirm("从配置中移除此账号？存在对象时后端将拒绝；需保存生效。")) patch({ r2_accounts: settings.r2_accounts.filter((item) => item.id !== account.id) }); }}><Trash2 className="size-4" />移除账号</Button>
                 </div>
                 {runtime ? <DomainManager account={account} runtime={runtime} locked={locked} run={run} /> : <p className="text-xs text-stone-500">保存草稿后可读取 Zone、绑定域名；未完整配置的账号保持停用。</p>}
@@ -208,9 +216,9 @@ export function ImageStorageCard() {
         <p className="text-xs leading-6 text-stone-500">切换域名仅改应用重新解析出的历史链接，不改外部已复制 URL，不复制图片。服务器检查不代表当前浏览器可达；不会自动故障切换。R2 到期后应用停止加载，清理及 CDN 收敛不是精确到秒。</p>
         {overview?.legacy ? <p className="text-xs text-stone-500">旧数据统计：{Object.entries(overview.legacy).filter(([, value]) => typeof value === "number").map(([key, value]) => `${key}: ${value}`).join(" · ") || "请按需执行显式清理"}</p> : null}
         <div className="flex flex-wrap gap-2">
-          <Button type="button" variant="outline" disabled={locked} onClick={() => void run("刷新全部账号用量", refreshAllUsage)}>刷新全部用量</Button>
-          <Button type="button" variant="outline" disabled={locked} onClick={() => void run("清理到期图片", async () => cleanupSummary((await cleanupExpiredImages()).result))}>立即清理到期 / 预占对象</Button>
-          <Button type="button" variant="outline" disabled={locked} className="border-rose-200 text-rose-600" onClick={() => { if (window.confirm("不可恢复：清除旧本地原图、缩略图和旧任务内嵌 Base64。不会迁移、不会删除 R2 对象或远端 WebDAV 图片，也不会清除用户已下载的副本。确认继续？")) void run("清理旧本地图", async () => cleanupSummary((await cleanupLegacyImages()).result)); }}>显式清理旧本地图 / 任务图片内容</Button>
+          <Button type="button" variant="outline" disabled={locked} onClick={() => void run("刷新全部账号用量", refreshAllUsage, settings.r2_accounts.length > 0)}>刷新全部用量</Button>
+          <Button type="button" variant="outline" disabled={locked} onClick={() => void run("清理到期图片", async () => cleanupSummary((await cleanupExpiredImages()).result), true)}>立即清理到期 / 预占对象</Button>
+          <Button type="button" variant="outline" disabled={locked} className="border-rose-200 text-rose-600" onClick={() => { if (window.confirm("不可恢复：清除旧本地原图、缩略图和旧任务内嵌 Base64。不会迁移、不会删除 R2 对象或远端 WebDAV 图片，也不会清除用户已下载的副本。确认继续？")) void run("清理旧本地图", async () => cleanupSummary((await cleanupLegacyImages()).result), true); }}>显式清理旧本地图 / 任务图片内容</Button>
         </div>
       </div>
     </> : null}
@@ -256,11 +264,11 @@ function DomainManager({ account, runtime, locked, run }: { account: R2Account; 
     const data = await getR2Domains(account.id);
     setDomains(data.items); setManagedEnabled(data.managed_enabled);
   };
-  const domainAction: RunAction = (label, action) => run(label, async () => {
+  const domainAction: RunAction = (label, action, changesImages) => run(label, async () => {
     const message = await action();
     await readDomains();
     return message;
-  });
+  }, changesImages);
   const browserCheck = async (item: RuntimeDomain, sample?: string) => {
     if (!sample) return;
     const checkedAt = () => new Date().toLocaleString("zh-CN");
@@ -303,11 +311,11 @@ function DomainManager({ account, runtime, locked, run }: { account: R2Account; 
         <p className="text-stone-500">服务器检查：{check ? `${check.ok ? "成功" : check.error || "失败/无有效图片样本"} · ${time(check.checked_at)}` : "未检查"}</p>
         <p className="text-stone-500">{browserChecks[item.id] || "当前浏览器：未检查"}</p>
         <div className="flex flex-wrap gap-2">
-          <Button type="button" size="sm" variant="outline" disabled={disabled || active || !item.enabled || !protectedDomain || Boolean(runtime.usage.access_paused)} onClick={() => { if (window.confirm(`手动切换当前返回域名为 ${item.domain}？外部旧链接不会改写，也不会复制图片。`)) void domainAction("切换当前域名", async () => { await updateR2Domain(account.id, item.id, { active: true }); }); }}>设为当前</Button>
-          <Button type="button" size="sm" variant="outline" disabled={disabled || (!item.enabled && (!protectedDomain || Boolean(runtime.usage.access_paused)))} onClick={() => void domainAction(item.enabled ? "停用域名" : "启用域名", async () => { await updateR2Domain(account.id, item.id, { enabled: !item.enabled }); })}>{item.enabled ? "停用" : "启用"}</Button>
+          <Button type="button" size="sm" variant="outline" disabled={disabled || active || !item.enabled || !protectedDomain || Boolean(runtime.usage.access_paused)} onClick={() => { if (window.confirm(`手动切换当前返回域名为 ${item.domain}？外部旧链接不会改写，也不会复制图片。`)) void domainAction("切换当前域名", async () => { await updateR2Domain(account.id, item.id, { active: true }); }, true); }}>设为当前</Button>
+          <Button type="button" size="sm" variant="outline" disabled={disabled || (!item.enabled && (!protectedDomain || Boolean(runtime.usage.access_paused)))} onClick={() => void domainAction(item.enabled ? "停用域名" : "启用域名", async () => { await updateR2Domain(account.id, item.id, { enabled: !item.enabled }); }, true)}>{item.enabled ? "停用" : "启用"}</Button>
           <Button type="button" size="sm" variant="outline" disabled={disabled} onClick={() => void run("服务器检查域名", async () => { const data = await checkR2Domains(account.id, item.id); setChecks((current) => [...current.filter((entry) => entry.domain_id !== item.id), ...data.items]); return "检查已返回，请查看来源、时间及错误阶段"; })}>服务器检查</Button>
           <Button type="button" size="sm" variant="outline" disabled={disabled || !sample || !item.enabled || Boolean(runtime.usage.access_paused)} onClick={() => void browserCheck(item, sample)}>{browserBusy === item.id ? "浏览器读取中…" : "当前浏览器检查"}</Button>
-          <Button type="button" size="sm" variant="outline" className="text-rose-600" disabled={disabled || (active && account.enabled)} onClick={() => { if (window.confirm(`解绑 ${item.domain}？其旧链接将不可用，当前域名须先切换或停用账号。`)) void domainAction("解绑域名", async () => { await deleteR2Domain(account.id, item.id); }); }}>解绑</Button>
+          <Button type="button" size="sm" variant="outline" className="text-rose-600" disabled={disabled || (active && account.enabled)} onClick={() => { if (window.confirm(`解绑 ${item.domain}？其旧链接将不可用，当前域名须先切换或停用账号。`)) void domainAction("解绑域名", async () => { await deleteR2Domain(account.id, item.id); }, true); }}>解绑</Button>
         </div>
         {!sample ? <p className="text-stone-500">无浏览器检查样本；先运行服务器检查。有未过期图片时才可探测，不会专门上传探针。</p> : null}
       </div>;

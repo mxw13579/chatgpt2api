@@ -8,6 +8,13 @@ export const DEFAULT_IMAGE_STORAGE: ImageStorageSettings = {
   usage_max_age_seconds: 900, cache_ttl_seconds: 60, cors_origins: ["*"], r2_accounts: [],
 };
 
+// 预算、保留期和 R2 分配/防护参数保存不改变现有图片 URL 或停读状态；
+// 域名与公开访问变更由各自的显式动作通知。旧 WebDAV 图片仍依赖连接配置。
+export function imageStorageSettingsAffectImages(previous: ImageStorageSettings, next: ImageStorageSettings): boolean {
+  return (["mode", "enabled", "public_base_url", "webdav_url", "webdav_username", "webdav_password", "webdav_root_path"] as const)
+    .some((key) => previous[key] !== next[key]);
+}
+
 export function newR2Account(): R2Account {
   return {
     id: crypto.randomUUID(), name: "新 R2 账号", enabled: false, account_id: "", bucket: "",

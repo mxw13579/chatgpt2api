@@ -84,7 +84,7 @@ function LogsContent() {
   const currentPageSelected = currentRows.length > 0 && currentRows.every((item) => selectedSet.has(item.id));
   const allSelected = items.length > 0 && items.every((item) => selectedSet.has(item.id));
 
-  const loadLogs = useCallback(async () => {
+  const loadLogs = useCallback(async (resetPage = true) => {
     setIsLoading(true);
     try {
       const data = await fetchSystemLogs({ type, start_date: startDate, end_date: endDate });
@@ -100,7 +100,7 @@ function LogsContent() {
       setR2Images(resolved);
       setItems(data.items);
       setSelectedIds((current) => current.filter((id) => data.items.some((item) => item.id === id)));
-      setPage(1);
+      if (resetPage) setPage(1);
     } catch (error) {
       setR2Images({});
       toast.error(error instanceof Error ? error.message : "加载日志失败");
@@ -152,7 +152,7 @@ function LogsContent() {
 
   useEffect(() => { void loadLogs(); }, [loadLogs]);
   useEffect(() => {
-    const refresh = () => { void loadLogs(); };
+    const refresh = () => { void loadLogs(false); };
     const changed = (event: StorageEvent) => { if (event.key === IMAGE_STORAGE_CHANGED) refresh(); };
     window.addEventListener("focus", refresh);
     window.addEventListener(IMAGE_STORAGE_CHANGED, refresh);
@@ -202,7 +202,7 @@ function LogsContent() {
               {selectedIds.length > 0 ? <span>已选 {selectedIds.length} 条</span> : null}
             </div>
             <div className="flex items-center gap-2">
-              <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-500" onClick={() => void loadLogs()} disabled={isLoading}>
+              <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-500" onClick={() => void loadLogs(false)} disabled={isLoading}>
                 <RefreshCw className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
                 刷新
               </Button>

@@ -70,6 +70,31 @@ test("dedicated settings keep all account budgets, cycle, domains and blank secr
   assert.equal(body.enabled, false);
 });
 
+test("settings notification comparison ignores allocation-only changes but includes existing image access", () => {
+  const api = load("lib/image-storage.ts", { "@/lib/request": { httpRequest: async () => assert.fail("No request expected") } });
+  const before = { ...api.DEFAULT_IMAGE_STORAGE, mode: "r2", enabled: true, r2_accounts: [{ ...api.newR2Account(), id: "fixture-account" }] };
+  const unchanged = structuredClone(before);
+  assert.equal(api.imageStorageSettingsAffectImages(before, unchanged), false);
+  const allocationOnly = {
+    ...unchanged, retention_minutes: 120, cleanup_interval_seconds: 120, usage_refresh_seconds: 600,
+    usage_max_age_seconds: 1200, cache_ttl_seconds: 120, cors_origins: ["https://app.example.test"],
+    r2_accounts: unchanged.r2_accounts.map((account) => ({
+      ...account, enabled: !account.enabled, name: "renamed fixture", a_budget: 400_000, b_budget: 500_000,
+      b_warn: 400_000, capacity_bytes: 2_000_000_000, billing_cycle_day: 12, billing_cycle_confirmed: true,
+      rate_limit_requests: 80, restrict_methods: false, api_token: "synthetic-rotation",
+    })),
+  };
+  assert.equal(api.imageStorageSettingsAffectImages(before, allocationOnly), false);
+  for (const patch of [
+    { mode: "local", enabled: false }, { public_base_url: "https://images.example.test" },
+    { webdav_url: "https://dav.example.test" }, { webdav_root_path: "fixture/images" },
+    { webdav_username: "fixture-user" }, { webdav_password: "synthetic-password" },
+  ]) {
+    assert.equal(api.imageStorageSettingsAffectImages(before, { ...before, ...patch }), true);
+  }
+  assert.deepEqual(before, unchanged);
+});
+
 test("all management buttons have real frozen-contract request wrappers", async () => {
   const calls = [];
   const api = load("lib/image-storage.ts", { "@/lib/request": { httpRequest: async (url, options = {}) => { calls.push({ url, method: options.method || "GET", body: options.body }); return {}; } } });
