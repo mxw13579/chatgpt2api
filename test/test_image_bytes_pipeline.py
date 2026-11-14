@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from services import openai_backend_api as backend_module
+from services.image_storage_service import StoredImage
 from services.protocol import conversation
 from utils import image_tokens
 
@@ -16,6 +17,10 @@ IMAGE_BYTES = [b"synthetic-first-image", b"synthetic-second-image"]
 IMAGE_B64 = [base64.b64encode(data).decode("ascii") for data in IMAGE_BYTES]
 BASE_URL = "https://synthetic.invalid"
 IMAGE_URLS = [BASE_URL + "/first.png", BASE_URL + "/second.png"]
+STORED_IMAGES = [
+    StoredImage(rel=url.rsplit("/", 1)[-1], url=url, storage="local", size=len(data))
+    for url, data in zip(IMAGE_URLS, IMAGE_BYTES)
+]
 
 
 class ImageBytesOutputTests(unittest.TestCase):
@@ -31,10 +36,10 @@ class ImageBytesOutputTests(unittest.TestCase):
             "type": "conversation.completed", "conversation_id": "synthetic-conversation",
             "file_ids": ["file-synthetic"], "text": "", "turn_use_case": "image gen",
         }
-        self.save = mock.Mock(side_effect=IMAGE_URLS)
+        self.save = mock.Mock(side_effect=STORED_IMAGES)
         for name, value in (
             ("conversation_events", mock.Mock(return_value=[self.event])),
-            ("save_image_bytes", self.save),
+            ("image_storage_service", SimpleNamespace(save=self.save)),
             ("_image_remaining_timeout_secs", mock.Mock(return_value=30.0)),
             ("_sleep_image_retry", mock.Mock()),
             ("config", SimpleNamespace(image_poll_initial_wait_secs=0)),
@@ -56,7 +61,7 @@ class ImageBytesOutputTests(unittest.TestCase):
                     self.backend.download_image_bytes.reset_mock()
                     self.backend._poll_image_results.reset_mock()
                     self.save.reset_mock()
-                    self.save.side_effect = IMAGE_URLS
+                    self.save.side_effect = STORED_IMAGES
                     request = conversation.ConversationRequest(
                         model="gpt-image-2", prompt=" draw ", base_url=BASE_URL, progress_callback=mock.Mock(),
                     )
@@ -102,7 +107,7 @@ class ImageBytesOutputTests(unittest.TestCase):
                     failure = RuntimeError("synthetic image failure")
                     self.backend.download_image_bytes.side_effect = failure if stage == "download" else None
                     self.save.reset_mock()
-                    self.save.side_effect = [IMAGE_URLS[0], failure]
+                    self.save.side_effect = [STORED_IMAGES[0], failure]
                     request = conversation.ConversationRequest(prompt="draw", response_format=response_format)
                     outputs = conversation.stream_image_outputs(self.backend, request)
                     if stage == "storage" and response_format == "b64_json":
@@ -125,7 +130,7 @@ class ImageBytesOutputTests(unittest.TestCase):
                     ]},
                 }]
                 self.save.reset_mock()
-                self.save.side_effect = [IMAGE_URLS[0]]
+                self.save.side_effect = [STORED_IMAGES[0]]
                 request = conversation.ConversationRequest(model="codex-gpt-image-2", prompt="draw", base_url=BASE_URL)
                 if response_format is not None:
                     request.response_format = response_format

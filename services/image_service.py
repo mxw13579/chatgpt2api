@@ -84,9 +84,8 @@ def _thumbnail_path(relative_path: str) -> Path:
 
 
 def thumbnail_url(base_url: str, relative_path: str) -> str:
+    """Build a legacy thumbnail URL; the listing already handles R2 separately."""
     rel = _safe_relative_path(relative_path)
-    if _r2_image(rel) or _r2_mode():
-        return image_storage_service.public_url(rel, base_url)
     return f"{base_url.rstrip('/')}/image-thumbnails/{rel}"
 
 
@@ -359,18 +358,18 @@ def cleanup_legacy_images() -> dict[str, int]:
     root = DATA_DIR / "images"
     thumbnails_root = DATA_DIR / "image_thumbnails"
     removed = thumbnails = 0
+    indexed = image_storage_service._load_index()
     for path in root.rglob("*"):
         if not path.is_file():
             continue
         rel = path.relative_to(root).as_posix()
-        metadata = image_storage_service.metadata(rel) or {}
+        metadata = indexed.get(rel, {})
         if metadata.get("storage") == "r2":
             continue
-        if metadata.get("webdav") or metadata.get("storage") in {"webdav", "both"}:
-            # delete() also deletes remote WebDAV copies, so unlink only this local copy.
-            path.unlink()
-        else:
-            image_storage_service.delete(rel)
+        # The snapshot selects local files only; never invoke a remote delete or
+        # rewrite the index per file. Reconcile once after filesystem changes.
+        path.unlink()
+        if not metadata.get("webdav") and metadata.get("storage") not in {"webdav", "both"}:
             remove_tags(rel)
         removed += 1
     for path in thumbnails_root.rglob("*"):

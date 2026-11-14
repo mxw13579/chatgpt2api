@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 
 from services import image_service, image_task_service as task_module
 from services import r2_management_service as management_module
-from services.image_storage_service import ImageStorageError
+from services.image_storage_service import ImageStorageError, StoredImage
 from services.protocol import conversation
 
 IMAGE = b"synthetic-image-bytes"
@@ -50,7 +50,7 @@ def service_env(monkeypatch, tmp_path):
         def image_thumbnails_dir(self):
             raise AssertionError("directory-creating config property used")
 
-    storage = Mock(spec=["metadata", "public_url", "get_bytes", "has_local", "delete", "list_items"])
+    storage = Mock(spec=["metadata", "_load_index", "public_url", "get_bytes", "has_local", "delete", "list_items"])
     storage.metadata.return_value = None
     storage.has_local.return_value = False
     storage.public_url.return_value = URL
@@ -282,14 +282,14 @@ def test_explicit_legacy_cleanup_keeps_remote_objects_and_r2_metadata(service_en
         "both.png": {"storage": "both", "local": True, "webdav": True},
         "r2.png": {"storage": "r2", **REFERENCE},
     }
-    env.storage.metadata.side_effect = metadata.get
-    env.storage.delete.side_effect = lambda rel: (originals / rel).unlink() or True
+    env.storage._load_index.return_value = metadata
     clear = Mock(return_value={"tasks": 1, "payloads": 2})
     monkeypatch.setattr(task_module.image_task_service, "clear_legacy_image_payloads", clear)
     assert image_service.cleanup_legacy_images() == {"removed": 2, "thumbnails": 1, "tasks": 1, "payloads": 2}
-    env.storage.delete.assert_called_once_with("local.png")
+    env.storage.delete.assert_not_called()
     env.storage.list_items.assert_called_once_with("")
     clear.assert_called_once_with()
+    assert not (originals / "local.png").exists()
     assert not (originals / "both.png").exists()
     assert (originals / "r2.png").read_bytes() == IMAGE
     assert not list(thumbnails.rglob("*"))
@@ -421,10 +421,9 @@ def test_scheduler_starts_one_loop_with_lifespan_stop_event(service_env, monkeyp
 
 @pytest.fixture
 def task_env(monkeypatch, tmp_path):
-    storage = Mock(spec=["reference_for_url", "resolve_reference", "save"])
-    storage.reference_for_url.return_value = dict(REFERENCE)
+    storage = Mock(spec=["resolve_reference", "save"])
     storage.resolve_reference.side_effect = lambda ref: {**ref, "url": URL}
-    storage.save.return_value = SimpleNamespace(url=URL, **REFERENCE)
+    storage.save.return_value = StoredImage(rel=REL, url=URL, storage="r2", size=len(IMAGE), **REFERENCE)
     monkeypatch.setattr(task_module, "image_storage_service", storage)
     monkeypatch.setattr(conversation, "image_storage_service", storage)
     monkeypatch.setattr(task_module.log_service, "add", Mock())
@@ -435,7 +434,13 @@ def task_env(monkeypatch, tmp_path):
 @pytest.mark.parametrize("mode", ["generate", "edit"])
 def test_new_task_persists_only_reference_and_resolves_current_domain(task_env, monkeypatch, mode):
     env = task_env
-    handler = Mock(return_value={"data": [{"url": URL, "revised_prompt": "synthetic prompt"}]})
+
+    def handle(payload, *, include_storage_reference=False):
+        assert payload["response_format"] == "url"
+        assert include_storage_reference is True
+        return {"data": [{"url": URL, "_storage_reference": dict(REFERENCE), "revised_prompt": "synthetic prompt"}]}
+
+    handler = Mock(side_effect=handle)
     env.service.generation_handler = env.service.edit_handler = handler
     thread = Mock()
     monkeypatch.setattr(task_module.threading, "Thread", thread)
@@ -445,6 +450,7 @@ def test_new_task_persists_only_reference_and_resolves_current_domain(task_env, 
     kwargs = thread.call_args.kwargs
     kwargs["target"](*kwargs["args"])
     assert handler.call_args.args[0]["response_format"] == "url"
+    assert handler.call_args.kwargs == {"include_storage_reference": True}
     persisted = env.service.path.read_text(encoding="utf-8")
     data = json.loads(persisted)["tasks"][0]["data"]
     assert data == [{**REFERENCE, "revised_prompt": "synthetic prompt"}]
@@ -466,6 +472,8 @@ def test_new_task_persists_only_reference_and_resolves_current_domain(task_env, 
     {"b64_json": "c3ludGhldGlj"},
     {"b64_json": "c3ludGhldGlj", "url": URL},
     {"url": "data:image/png;base64,c3ludGhldGlj"},
+    {"b64_json": "c3ludGhldGlj", "_storage_reference": dict(REFERENCE)},
+    {"url": " DaTa:image/png;base64,c3ludGhldGlj ", "_storage_reference": dict(REFERENCE)},
 ])
 def test_new_base64_result_is_rejected_before_any_task_write(task_env, bad_image):
     env = task_env
@@ -476,7 +484,12 @@ def test_new_base64_result_is_rejected_before_any_task_write(task_env, bad_image
         env.service._update_task("synthetic-owner:task", status="success", data=[bad_image])
     assert env.service.path.read_text(encoding="utf-8") == before
     assert "data" not in env.service._tasks["synthetic-owner:task"]
-    env.service.generation_handler = lambda payload: {"data": [bad_image]}
+
+    def handle(payload, *, include_storage_reference=False):
+        assert include_storage_reference is True
+        return {"data": [bad_image]}
+
+    env.service.generation_handler = handle
     env.service._run_task("synthetic-owner:task", "generate", {"response_format": "url"}, OWNER, "gpt-image-2")
     persisted = env.service.path.read_text(encoding="utf-8")
     assert "c3ludGhldGlj" not in persisted and "b64_json" not in persisted
@@ -525,13 +538,16 @@ def test_legacy_urls_remain_and_payloads_only_clear_on_explicit_request(task_env
     assert "c3ludGhldGlj" not in saved and "b64_json" not in saved
     assert json.loads(saved)["tasks"][0]["data"][2:] == legacy["data"][2:]
     assert service.clear_legacy_image_payloads() == {"tasks": 0, "payloads": 0}
-    env.storage.reference_for_url.return_value = None
     assert task_module._stored_image_data([legacy["data"][2]]) == [legacy["data"][2]]
 
 
-def test_public_openai_result_never_exposes_r2_identifiers(task_env):
+def test_internal_result_retains_reference_but_public_output_never_exposes_it(task_env):
     result = conversation._format_image_bytes([IMAGE], "draw", "url")
-    assert result == [{"url": URL, "revised_prompt": "draw"}]
+    assert result == [{"url": URL, "_storage_reference": REFERENCE, "revised_prompt": "draw"}]
+    output = conversation.ImageOutput(kind="result", model="gpt-image-2", index=1, total=1, data=result)
+    public_data = [{"url": URL, "revised_prompt": "draw"}]
+    assert output.to_chunk()["data"] == conversation.collect_image_outputs([output])["data"] == public_data
+    assert conversation.collect_image_outputs([output], include_storage_reference=True)["data"] == result
     task_env.storage.save.assert_called_once_with(IMAGE, None)
     task_env.storage.save.reset_mock()
     data = conversation._format_image_bytes([IMAGE], "draw", "b64_json")

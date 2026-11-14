@@ -27,10 +27,18 @@ def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_i
 
 class ImageTaskServiceTests(unittest.TestCase):
     def make_service(self, path: Path, handler=None) -> ImageTaskService:
+        def generate(_payload, *, include_storage_reference=False):
+            self.assertTrue(include_storage_reference)
+            return {"data": [{"url": "http://example.test/image.png"}]}
+
+        def edit(_payload, *, include_storage_reference=False):
+            self.assertTrue(include_storage_reference)
+            return {"data": [{"url": "http://example.test/edit.png"}]}
+
         return ImageTaskService(
             path,
-            generation_handler=handler or (lambda _payload: {"data": [{"url": "http://example.test/image.png"}]}),
-            edit_handler=handler or (lambda _payload: {"data": [{"url": "http://example.test/edit.png"}]}),
+            generation_handler=handler or generate,
+            edit_handler=handler or edit,
             retention_days_getter=lambda: 30,
         )
 
@@ -38,8 +46,9 @@ class ImageTaskServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             calls = 0
 
-            def handler(_payload):
+            def handler(_payload, *, include_storage_reference=False):
                 nonlocal calls
+                self.assertTrue(include_storage_reference)
                 calls += 1
                 time.sleep(0.05)
                 return {"data": [{"url": "http://example.test/image.png"}]}

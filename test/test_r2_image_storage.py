@@ -144,7 +144,7 @@ class R2ImageStorageTests(unittest.TestCase):
             self.assertFalse(self.service.exists(key))
             self.assert_http(404, self.service.public_url, key)
             self.assert_http(404, self.service.get_bytes, key)
-            self.assertIsNone(self.service.reference_for_url(f"https://images.example.test/{key}"))
+            self.assertTrue(self.service.resolve_reference({"image_id": key})["expired"])
             return original(key, payload, **kwargs)
 
         self.client.upload_bytes.side_effect = inspect_put
@@ -423,6 +423,21 @@ class R2ImageStorageTests(unittest.TestCase):
         state = self.service.record_usage_snapshot(self.account_id, self.snapshot(period_start="2026-06-15T00:00:00Z"))
         self.assertTrue(state["complete"])
 
+    def test_snapshot_acceptance_does_not_extend_its_freshness_window(self):
+        snapshot = self.snapshot()
+        self.now += timedelta(seconds=800)
+        state = self.service.record_usage_snapshot(self.account_id, snapshot)
+        self.assertEqual(state["fetched_at"], snapshot["period_end"])
+        self.assertEqual(self.service.account_status(self.account_id), "eligible")
+
+        self.now += timedelta(seconds=100)
+        self.assertEqual(self.service.account_status(self.account_id), "eligible")
+        self.now += timedelta(seconds=1)
+        self.assertEqual(self.service.account_status(self.account_id), "usage_stale")
+        with self.assertRaises(ImageStorageError):
+            self.service.require_upload_available()
+        self.client.upload_bytes.assert_not_called()
+
     def test_incomplete_unknown_or_stale_snapshots_do_not_zero_previous_counts(self):
         self.service.record_usage_snapshot(self.account_id, self.snapshot(a_operations=20, storage_bytes=500))
         original = self.service.get_r2_usage(self.account_id)
@@ -496,22 +511,19 @@ class R2ImageStorageTests(unittest.TestCase):
         self.service.save(self.payload)
         self.assertEqual(self.service.account_usage(self.account_id)["upload_delta_bytes"], len(self.payload))
 
-    def test_dynamic_url_and_reference_use_key_and_known_host(self):
+    def test_dynamic_url_and_reference_follow_active_domain(self):
         saved = self.service.save(self.payload)
-        reference = self.service.reference_for_url(saved.url)
-        self.assertEqual(reference, {"image_id": saved.rel, "account_id": self.account_id, "expires_at": saved.expires_at})
-        for url in (saved.url.replace("images.example.test", "evil.example.test"),
-                    saved.url.replace("https:", "http:"),
-                    saved.url.replace("https://", "https://user@"),
-                    saved.url.replace("images.example.test", "images.example.test:444")):
-            self.assertIsNone(self.service.reference_for_url(url))
+        reference = {"image_id": saved.image_id, "account_id": saved.account_id, "expires_at": saved.expires_at}
         self.account["active_domain_id"] = "backup.example.test"
+        self.account["domains"] = [domain for domain in self.account["domains"] if domain["id"] == "backup.example.test"]
         self.assertEqual(self.service.public_url(saved.rel), f"https://backup.example.test/{saved.rel}")
-        self.assertEqual(self.service.resolve_reference(reference)["url"], f"https://backup.example.test/{saved.rel}")
-        self.assertEqual(self.service.reference_for_url(saved.url), reference)
+        self.assertEqual(self.service.resolve_reference(reference),
+                         {**reference, "url": f"https://backup.example.test/{saved.rel}"})
         self.assertEqual(self.client.upload_bytes.call_count, 1)
         self.assertEqual(self.service.resolve_reference({"image_id": "images/missing.png"}),
                          {"image_id": "images/missing.png", "url": "", "expired": True})
+        mismatched = {**reference, "account_id": "missing"}
+        self.assertEqual(self.service.resolve_reference(mismatched), {**mismatched, "url": "", "expired": True})
 
     def test_expiry_metadata_and_paused_read_gate_survive_mode_or_domain_switch(self):
         saved = self.service.save(self.payload)

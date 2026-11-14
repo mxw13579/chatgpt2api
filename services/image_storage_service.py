@@ -10,7 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, urlparse
 
 from curl_cffi import requests
 from fastapi import HTTPException
@@ -232,24 +232,25 @@ class ImageStorageService:
         return document
 
     def _load_index(self) -> dict[str, dict[str, object]]:
+        """Metadata selection snapshot; reconcile separately after local file I/O."""
         with self._index_lock:
             return self._load_document()["items"]
 
-    def _load_clean_index(self) -> dict[str, dict[str, object]]:
-        return {rel: item for rel, item in self._load_index().items() if item.get("storage") == "r2" or _is_image_rel(rel)}
+    @staticmethod
+    def _clean_index(document: dict) -> dict[str, dict[str, object]]:
+        document["items"] = {rel: item for rel, item in document["items"].items()
+                             if item.get("storage") == "r2" or _is_image_rel(rel)}
+        return document["items"]
 
-    def _save_index(self, items: dict[str, dict[str, object]]) -> None:
-        # Legacy callers must preserve the concurrently maintained R2 state.
-        with self._index_lock:
-            document = self._load_document()
-            document["items"] = items
-            _write_json_object(self.index_file, document)
+    @staticmethod
+    def _account(settings: dict, account_id: str) -> dict:
+        for account in settings.get("r2_accounts", []):
+            if account["id"] == account_id:
+                return account
+        raise ValueError("R2 account not found")
 
     def account(self, account_id: str) -> dict:
-        for account in self.settings().get("r2_accounts", []):
-            if account["id"] == account_id:
-                return deepcopy(account)
-        raise ValueError("R2 account not found")
+        return self._account(self.settings(), account_id)
 
     def get_r2_usage(self, account_id: str) -> dict:
         self.account(account_id)
@@ -311,7 +312,8 @@ class ImageStorageService:
         the query end, not its completion time; uploads crossing it remain delta.
         Incomplete/stale responses retain old counts/timestamps and cannot reset A.
         """
-        account = self.account(account_id)
+        settings = self.settings()
+        account = self._account(settings, account_id)
         now = _utc_now()
         start, end = _parse_time(result.get("period_start")), _parse_time(result.get("period_end"))
         fields = {
@@ -321,7 +323,7 @@ class ImageStorageService:
             "object_count": "cloud_object_count",
         }
         counts_valid = all(type(result.get(key)) is int and result[key] >= 0 for key in fields)
-        fresh = end is not None and 0 <= (now - end).total_seconds() <= int(self.settings().get("usage_max_age_seconds", 900))
+        fresh = end is not None and 0 <= (now - end).total_seconds() <= int(settings.get("usage_max_age_seconds", 900))
         valid = (account.get("billing_cycle_confirmed") is True
                  and result.get("complete") is True and not result.get("unknown_actions") and counts_valid
                  and start == _cycle_start(account, now) and fresh and end >= start)
@@ -341,7 +343,7 @@ class ImageStorageService:
                 concurrent = max(0, observed - query_count) if "a_query_count" in result else 0
                 state.update({target: result[source] for source, target in fields.items()})
                 state.update(
-                    a_local=max(local, result["a_operations"] + concurrent), fetched_at=now.isoformat(),
+                    a_local=max(local, result["a_operations"] + concurrent), fetched_at=end.isoformat(),
                     period_start=start.isoformat(), period_end=end.isoformat(),
                     last_successful_usage_start=start.isoformat(),
                     capacity_snapshot_at=result.get("bucket_storage_observed_at", end.isoformat()),
@@ -442,7 +444,27 @@ class ImageStorageService:
 
     def account_status(self, account_id: str) -> str:
         with self._index_lock:
-            return self._account_status(self.account(account_id), self.account_usage(account_id), self.settings(), _utc_now())
+            settings = self.settings()
+            account = self._account(settings, account_id)
+            usage = self._usage_view(self._load_document(), account_id)
+            return self._account_status(account, usage, settings, _utc_now())
+
+    def account_summaries(self) -> list[dict]:
+        """Derive each status from its returned usage in one settings/index snapshot."""
+        with self._index_lock:
+            settings = self.settings()
+            document = self._load_document()
+            now = _utc_now()
+            summaries = []
+            for account in settings.get("r2_accounts", []):
+                usage = self._usage_view(document, account["id"])
+                summaries.append({
+                    "id": account["id"],
+                    "status": self._account_status(account, usage, settings, now),
+                    "usage": usage,
+                    "domains": usage.get("domains", []),
+                })
+            return summaries
 
     def _eligible_accounts(self, document: dict, settings: dict, size: int, now: datetime) -> list[dict]:
         return [account for account in settings.get("r2_accounts", [])
@@ -471,12 +493,12 @@ class ImageStorageService:
         if usage.get("access_paused"):
             raise HTTPException(status_code=403, detail="R2 image access paused")
 
-    def _r2_public_url(self, item: dict, document: dict) -> str:
+    def _r2_public_url(self, item: dict, document: dict, accounts: dict[str, dict]) -> str:
         self._require_readable(item, document["r2_usage"].get(item["account_id"], {}))
-        try:
-            domain = self._active_domain(self.account(item["account_id"]))
-        except ValueError:
-            raise HTTPException(status_code=404, detail="image account unavailable") from None
+        account = accounts.get(item["account_id"])
+        if account is None:
+            raise HTTPException(status_code=404, detail="image account unavailable")
+        domain = self._active_domain(account)
         if not domain:
             raise HTTPException(status_code=403, detail="R2 public domain unavailable")
         return f"https://{domain}/{quote(item['object_key'], safe='/')}"
@@ -485,33 +507,14 @@ class ImageStorageService:
         safe_rel = _safe_relative_path(rel)
         with self._index_lock:
             document = self._load_document()
+            settings = self.settings()
             item = document["items"].get(safe_rel)
             if item and item.get("storage") == "r2":
-                return self._r2_public_url(item, document)
+                accounts = {account["id"]: account for account in settings.get("r2_accounts", [])}
+                return self._r2_public_url(item, document, accounts)
             if not _is_image_rel(safe_rel) or not ((item and item.get("webdav")) or _local_image_path(safe_rel).is_file()):
                 raise HTTPException(status_code=404, detail="image not found")
-        return self._public_url(safe_rel, base_url)
-
-    def reference_for_url(self, url: str) -> dict | None:
-        try:
-            parsed = urlparse(url)
-            if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in (None, 443):
-                return None
-            key = _safe_relative_path(unquote(parsed.path))
-        except (ValueError, HTTPException):
-            return None
-        if not key.startswith("images/"):
-            return None
-        item = self.metadata(key)
-        if not item or item.get("storage") != "r2" or item.get("pending") or item.get("object_key") != key:
-            return None
-        try:
-            hosts = {domain["domain"].lower() for domain in self.account(item["account_id"]).get("domains", [])}
-        except ValueError:
-            return None
-        if parsed.hostname not in hosts:
-            return None
-        return {key: item[key] for key in ("image_id", "account_id", "expires_at")}
+        return self._public_url(safe_rel, settings, base_url)
 
     def resolve_reference(self, ref: dict) -> dict:
         result = {key: ref[key] for key in ("image_id", "account_id", "expires_at") if key in ref}
@@ -524,7 +527,8 @@ class ImageStorageService:
                         or (ref.get("account_id") and ref["account_id"] != item["account_id"])):
                     return {**result, "expired": True}
                 result.update({key: item[key] for key in ("image_id", "account_id", "expires_at")})
-                result["url"] = self._r2_public_url(item, document)
+                accounts = {account["id"]: account for account in self.settings().get("r2_accounts", [])}
+                result["url"] = self._r2_public_url(item, document, accounts)
                 return result
         except HTTPException as exc:
             result["expired" if exc.status_code in {404, 410} else "unavailable"] = True
@@ -533,29 +537,33 @@ class ImageStorageService:
     def _r2_client(self, account_id: str) -> CloudflareR2Client:
         return CloudflareR2Client({**self.account(account_id), "prefix": "images"})
 
-    def _save_r2(self, image_data: bytes) -> StoredImage:
-        extension, mime, dimensions = _r2_image_info(image_data)
+    def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
         with self._index_lock:
-            settings, now = self.settings(), _utc_now()
-            document = self._load_document()
-            candidates = self._eligible_accounts(document, settings, len(image_data), now)
-            if not candidates:
-                raise ImageStorageError("R2 image storage has no eligible account or available budget")
-            account = random.choice(candidates)
-            rel = f"images/{now:%Y/%m/%d}/{uuid.uuid4().hex}{extension}"
-            expires = now + timedelta(minutes=int(settings.get("retention_minutes", 60)))
-            item = {
-                "rel": rel, "path": rel, "name": Path(rel).name, "date": now.strftime("%Y-%m-%d"),
-                "storage": "r2", "account_id": account["id"], "object_key": rel, "image_id": rel,
-                "size": len(image_data), "mime": mime, "created_at": now.isoformat(),
-                "expires_at": expires.isoformat(), "pending": True, "local": False, "webdav": False,
-            }
-            if dimensions:
-                item["width"], item["height"] = dimensions
-            document["items"][rel] = item
-            self._increment_a(document["r2_usage"].setdefault(account["id"], {}), account, 1, now)
-            _write_json_object(self.index_file, document)
-            self._uploading.add(rel)
+            settings = self.settings()
+            if settings.get("mode") == "r2":
+                extension, mime, dimensions = _r2_image_info(image_data)
+                now = _utc_now()
+                document = self._load_document()
+                candidates = self._eligible_accounts(document, settings, len(image_data), now)
+                if not candidates:
+                    raise ImageStorageError("R2 image storage has no eligible account or available budget")
+                account = random.choice(candidates)
+                rel = f"images/{now:%Y/%m/%d}/{uuid.uuid4().hex}{extension}"
+                expires = now + timedelta(minutes=int(settings.get("retention_minutes", 60)))
+                item = {
+                    "rel": rel, "path": rel, "name": Path(rel).name, "date": now.strftime("%Y-%m-%d"),
+                    "storage": "r2", "account_id": account["id"], "object_key": rel, "image_id": rel,
+                    "size": len(image_data), "mime": mime, "created_at": now.isoformat(),
+                    "expires_at": expires.isoformat(), "pending": True, "local": False, "webdav": False,
+                }
+                if dimensions:
+                    item["width"], item["height"] = dimensions
+                document["items"][rel] = item
+                self._increment_a(document["r2_usage"].setdefault(account["id"], {}), account, 1, now)
+                _write_json_object(self.index_file, document)
+                self._uploading.add(rel)
+        if settings.get("mode") != "r2":
+            return self._save_legacy(image_data, settings, base_url)
         try:
             client = CloudflareR2Client({**account, "prefix": "images"})
             try:
@@ -570,16 +578,18 @@ class ImageStorageService:
                 client.close()
             with self._index_lock:
                 document = self._load_document()
-                document["items"][rel].update(pending=False, uploaded_at=_now_iso())
+                item = document["items"][rel]
+                item.update(pending=False, uploaded_at=_now_iso())
                 _write_json_object(self.index_file, document)
-            return StoredImage(rel=rel, url=self.public_url(rel), storage="r2", size=len(image_data),
+                accounts = {account["id"]: account for account in self.settings().get("r2_accounts", [])}
+                url = self._r2_public_url(item, document, accounts)
+            return StoredImage(rel=rel, url=url, storage="r2", size=len(image_data),
                                image_id=rel, account_id=account["id"], expires_at=expires.isoformat())
         finally:
             with self._index_lock:
                 self._uploading.discard(rel)
 
-    def _public_url(self, rel: str, base_url: str | None = None) -> str:
-        settings = self.settings()
+    def _public_url(self, rel: str, settings: dict, base_url: str | None = None) -> str:
         public_base_url = _clean(settings.get("public_base_url"))
         if public_base_url:
             return f"{public_base_url.rstrip('/')}/{_safe_relative_path(rel)}"
@@ -591,10 +601,8 @@ class ImageStorageService:
         relative_dir = Path(time.strftime("%Y"), time.strftime("%m"), time.strftime("%d"))
         return f"{relative_dir.as_posix()}/{filename}"
 
-    def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
-        mode = self.mode()
-        if mode == "r2":
-            return self._save_r2(image_data)
+    def _save_legacy(self, image_data: bytes, settings: dict, base_url: str | None) -> StoredImage:
+        mode = settings.get("mode")
         config.cleanup_old_images()
         rel = self.make_relative_path(image_data)
         if mode not in {"local", "webdav", "both"}:
@@ -610,7 +618,7 @@ class ImageStorageService:
             stored_local = True
 
         if mode in {"webdav", "both"}:
-            remote_url = WebDAVClient(self.settings()).put(rel, image_data)
+            remote_url = WebDAVClient(settings).put(rel, image_data)
             stored_webdav = True
 
         dimensions = _image_dimensions(image_data)
@@ -629,10 +637,11 @@ class ImageStorageService:
         if dimensions:
             item["width"], item["height"] = dimensions
         with self._index_lock:
-            items = self._load_clean_index()
+            document = self._load_document()
+            items = self._clean_index(document)
             items[rel] = item
-            self._save_index(items)
-        return StoredImage(rel=rel, url=self._public_url(rel, base_url), storage=str(item["storage"]), size=len(image_data))
+            _write_json_object(self.index_file, document)
+        return StoredImage(rel=rel, url=self._public_url(rel, settings, base_url), storage=str(item["storage"]), size=len(image_data))
 
     def get_bytes(self, rel: str) -> bytes:
         safe_rel = _safe_relative_path(rel)
@@ -674,10 +683,13 @@ class ImageStorageService:
 
     def list_items(self, base_url: str, start_date: str = "", end_date: str = "") -> list[dict[str, object]]:
         with self._index_lock:
-            indexed = self._load_clean_index()
+            document = self._load_document()
+            indexed = document["items"]
+            settings = self.settings()
+            accounts = {account["id"]: account for account in settings.get("r2_accounts", [])}
             root = DATA_DIR / "images"
             changed = False
-            for path in (() if self.mode() == "r2" else root.rglob("*")):
+            for path in (() if settings.get("mode") == "r2" else root.rglob("*")):
                 if not path.is_file() or not _is_image_rel(path.name):
                     continue
                 rel = path.relative_to(root).as_posix()
@@ -703,7 +715,6 @@ class ImageStorageService:
                 changed = True
 
             items: list[dict[str, object]] = []
-            document = self._load_document()
             for rel, item in list(indexed.items()):
                 if item.get("storage") == "r2":
                     if item.get("pending"):
@@ -713,7 +724,7 @@ class ImageStorageService:
                         continue
                     visible = {**item, "rel": rel, "path": rel, "url": ""}
                     try:
-                        visible["url"] = self._r2_public_url(item, document)
+                        visible["url"] = self._r2_public_url(item, document, accounts)
                     except HTTPException as exc:
                         visible["expired" if exc.status_code == 410 else "unavailable"] = True
                     items.append(visible)
@@ -746,16 +757,19 @@ class ImageStorageService:
                     **item,
                     "rel": rel,
                     "path": rel,
-                    "url": self._public_url(rel, base_url),
+                    "url": self._public_url(rel, settings, base_url),
                 })
             if changed:
-                self._save_index(indexed)
+                _write_json_object(self.index_file, document)
         items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return items
 
-    def _delete_r2(self, rel: str, client: CloudflareR2Client | None = None) -> bool:
+    def _delete_r2(self, rel: str, client: CloudflareR2Client | None = None, *, item: dict | None = None) -> bool:
         with self._index_lock:
-            item = self._load_document()["items"].get(rel)
+            # Direct deletes already selected the item; expiry cleanup rechecks
+            # each key because earlier deletes have released the lock for I/O.
+            if item is None:
+                item = self._load_document()["items"].get(rel)
             if not item:
                 return False
             if rel in self._uploading:
@@ -809,36 +823,38 @@ class ImageStorageService:
 
     def delete(self, rel: str) -> bool:
         safe_rel = _safe_relative_path(rel)
-        if (self.metadata(safe_rel) or {}).get("storage") == "r2":
-            return self._delete_r2(safe_rel)
-        removed = False
-        path = _local_image_path(safe_rel)
-        if path.is_file():
-            path.unlink()
-            removed = True
         with self._index_lock:
-            items = self._load_clean_index()
-            item = items.get(safe_rel, {})
-            if item.get("webdav"):
-                try:
-                    removed = WebDAVClient(self.settings()).delete(safe_rel) or removed
-                except ImageStorageError:
-                    if not removed:
-                        raise
-            if safe_rel in items:
-                items.pop(safe_rel, None)
-                self._save_index(items)
-        return removed
+            document = self._load_document()
+            item = document["items"].get(safe_rel, {})
+            if item.get("storage") != "r2":
+                removed = False
+                path = _local_image_path(safe_rel)
+                if path.is_file():
+                    path.unlink()
+                    removed = True
+                items = self._clean_index(document)
+                if item.get("webdav"):
+                    try:
+                        removed = WebDAVClient(self.settings()).delete(safe_rel) or removed
+                    except ImageStorageError:
+                        if not removed:
+                            raise
+                if safe_rel in items:
+                    items.pop(safe_rel, None)
+                    _write_json_object(self.index_file, document)
+                return removed
+        return self._delete_r2(safe_rel, item=item)
 
     def sync_all(self) -> dict[str, int]:
         settings = self.settings()
-        if self.mode() not in {"webdav", "both"}:
+        if settings.get("mode") not in {"webdav", "both"}:
             raise ImageStorageError("WebDAV 图片存储未启用")
         uploaded = 0
         skipped = 0
         failed = 0
         with self._index_lock:
-            items = self._load_clean_index()
+            document = self._load_document()
+            items = self._clean_index(document)
             client = WebDAVClient(settings)
             root = DATA_DIR / "images"
             for path in sorted(root.rglob("*")):
@@ -870,7 +886,7 @@ class ImageStorageService:
                     uploaded += 1
                 except Exception:
                     failed += 1
-            self._save_index(items)
+            _write_json_object(self.index_file, document)
         return {"uploaded": uploaded, "skipped": skipped, "failed": failed}
 
     def test_webdav(self) -> dict[str, object]:

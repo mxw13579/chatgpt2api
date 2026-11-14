@@ -11,6 +11,7 @@ from unittest import mock
 from fastapi import HTTPException
 
 from services import config as config_module
+from services.image_storage_service import StoredImage
 from services.protocol import conversation, image_compat
 from utils import helper
 
@@ -19,6 +20,7 @@ JPEG_BYTES = b"synthetic-jpeg"
 PNG_B64 = base64.b64encode(PNG_BYTES).decode("ascii")
 PNG_URL = "data:image/png;base64," + PNG_B64
 JPEG_URL = "data:image/jpeg;base64," + base64.b64encode(JPEG_BYTES).decode("ascii")
+STORED_IMAGE = StoredImage("image.png", "https://synthetic.invalid/image.png", "local", len(PNG_BYTES))
 
 
 class ImageCompatTests(unittest.TestCase):
@@ -561,7 +563,7 @@ class ImageCompatTests(unittest.TestCase):
     def test_upstream_base64_is_validated_once_and_only_url_is_saved(self) -> None:
         for response_format in ("b64_json", "url"):
             with self.subTest(response_format=response_format), mock.patch.object(
-                conversation, "save_image_bytes", return_value="https://synthetic.invalid/image.png",
+                conversation.image_storage_service, "save", return_value=STORED_IMAGE,
             ) as save, mock.patch.object(base64, "b64decode", wraps=base64.b64decode) as decode, mock.patch.object(
                 base64, "b64encode", side_effect=AssertionError("upstream base64 must not be re-encoded"),
             ):
@@ -589,7 +591,10 @@ class ImageCompatTests(unittest.TestCase):
         before = copy.deepcopy(items)
         for response_format in ("b64_json", "url"):
             with self.subTest(response_format=response_format), mock.patch.object(
-                conversation, "save_image_bytes", side_effect=["/first.png", "/second.png", "/third.png"],
+                conversation.image_storage_service, "save", side_effect=[
+                    StoredImage(path.lstrip("/"), path, "local", len(PNG_BYTES))
+                    for path in ("/first.png", "/second.png", "/third.png")
+                ],
             ) as save:
                 result = conversation.format_image_result(
                     items, " draw ", response_format, "https://synthetic.invalid", created=123, message="ignored",
@@ -609,7 +614,7 @@ class ImageCompatTests(unittest.TestCase):
     def test_invalid_upstream_base64_fails_before_storage(self) -> None:
         for response_format in ("b64_json", "url"):
             for encoded in ("invalid!", "图片", "===="):
-                with self.subTest(response_format=response_format, encoded=encoded), mock.patch.object(conversation, "save_image_bytes") as save:
+                with self.subTest(response_format=response_format, encoded=encoded), mock.patch.object(conversation.image_storage_service, "save") as save:
                     with self.assertRaises(conversation.ImageGenerationError) as caught:
                         conversation.format_image_result([{"b64_json": encoded}], "draw", response_format)
                     self.assertEqual(caught.exception.code, "no_image_generated")
@@ -617,7 +622,9 @@ class ImageCompatTests(unittest.TestCase):
 
     def test_invalid_later_image_does_not_return_partial_success(self) -> None:
         for response_format in ("b64_json", "url"):
-            with self.subTest(response_format=response_format), mock.patch.object(conversation, "save_image_bytes") as save:
+            with self.subTest(response_format=response_format), mock.patch.object(
+                conversation.image_storage_service, "save", return_value=STORED_IMAGE,
+            ) as save:
                 with self.assertRaises(conversation.ImageGenerationError) as caught:
                     conversation.format_image_result(
                         [{"b64_json": PNG_B64}, {"b64_json": "invalid!"}], "draw", response_format,
@@ -630,7 +637,7 @@ class ImageCompatTests(unittest.TestCase):
 
     def test_blank_upstream_images_cannot_become_successful_results(self) -> None:
         for encoded in ("", " "):
-            with self.subTest(encoded=encoded), mock.patch.object(conversation, "save_image_bytes") as save:
+            with self.subTest(encoded=encoded), mock.patch.object(conversation.image_storage_service, "save") as save:
                 data = conversation.format_image_result([{"b64_json": encoded}], "draw", "b64_json")["data"]
                 self.assert_output_error([self.output(data=data)], "no_image_generated")
                 save.assert_not_called()

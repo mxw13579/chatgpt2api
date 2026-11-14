@@ -69,10 +69,14 @@ def _stored_image_data(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not isinstance(item, dict) or "b64_json" in item:
             raise ValueError("image tasks require URL results, not embedded image payloads")
         url = _clean(item.get("url"))
-        if not url or url.lower().startswith("data:"):
+        if url.lower().startswith("data:"):
             raise ValueError("image tasks require URL results, not embedded image payloads")
-        reference = image_storage_service.reference_for_url(url)
-        result = dict(reference) if reference is not None else {"url": url}
+        if "_storage_reference" in item:
+            result = dict(item["_storage_reference"])
+        else:
+            if not url:
+                raise ValueError("image tasks require URL results, not embedded image payloads")
+            result = {"url": url}
         if "revised_prompt" in item:
             result["revised_prompt"] = item["revised_prompt"]
         stored.append(result)
@@ -123,8 +127,8 @@ class ImageTaskService:
         self,
         path: Path,
         *,
-        generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_generations.handle,
-        edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
+        generation_handler: Callable[..., dict[str, Any]] = openai_v1_image_generations.handle,
+        edit_handler: Callable[..., dict[str, Any]] = openai_v1_image_edit.handle,
         retention_days_getter: Callable[[], int] | None = None,
     ):
         self.path = path
@@ -280,7 +284,7 @@ class ImageTaskService:
         payload_with_progress = {**payload, "progress_callback": progress_callback}
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
-            result = handler(payload_with_progress)
+            result = handler(payload_with_progress, include_storage_reference=True)
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")

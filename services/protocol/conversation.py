@@ -194,10 +194,6 @@ def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
     return [base64.b64encode(data).decode("ascii") for data, _, _ in images if data]
 
 
-def save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
-    return image_storage_service.save(image_data, base_url).url
-
-
 def message_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -328,11 +324,18 @@ def _format_image_result_item(
     base_url: str | None,
     b64_json: str = "",
 ) -> dict[str, Any]:
-    result_item = {"revised_prompt": revised_prompt}
+    result_item: dict[str, Any] = {"revised_prompt": revised_prompt}
     if response_format == "b64_json":
         result_item["b64_json"] = b64_json or base64.b64encode(image_data).decode("ascii")
     else:
-        result_item["url"] = save_image_bytes(image_data, base_url)
+        stored = image_storage_service.save(image_data, base_url)
+        result_item["url"] = stored.url
+        if stored.storage == "r2":
+            result_item["_storage_reference"] = {
+                "image_id": stored.image_id,
+                "account_id": stored.account_id,
+                "expires_at": stored.expires_at,
+            }
     return result_item
 
 
@@ -463,7 +466,10 @@ class ImageOutput:
         elif self.kind == "result":
             chunk.update({
                 "object": "image.generation.result",
-                "data": self.data,
+                "data": [
+                    {key: value for key, value in item.items() if key != "_storage_reference"}
+                    for item in self.data
+                ],
             })
             chunk.pop("progress_text", None)
             chunk.pop("upstream_event_type", None)
@@ -2030,7 +2036,9 @@ def stream_image_chunks(outputs: Iterable[ImageOutput]) -> Iterator[dict[str, An
         yield output.to_chunk()
 
 
-def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
+def collect_image_outputs(
+    outputs: Iterable[ImageOutput], *, include_storage_reference: bool = False,
+) -> dict[str, Any]:
     created = None
     data: list[dict[str, Any]] = []
     message = ""
@@ -2045,7 +2053,11 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
         elif output.kind == "message":
             message = output.text
         elif output.kind == "result":
-            data.extend(output.data)
+            data.extend(
+                dict(item) if include_storage_reference else
+                {key: value for key, value in item.items() if key != "_storage_reference"}
+                for item in output.data
+            )
 
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if not data:

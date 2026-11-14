@@ -26,6 +26,7 @@ from services import image_tags_service, image_task_service as task_module
 from services import r2_management_service as management
 from services.cloudflare_api import CloudflareAPIError
 from services.log_service import LogService
+from services.protocol import conversation
 from services.r2_client import R2Error
 from test.test_r2_image_storage import image_bytes
 from test.test_r2_management import ACCOUNT, HOSTS, NOW, ZONE, FakeCloudflare, settings_fixture
@@ -112,7 +113,7 @@ def integrated(monkeypatch, tmp_path):
     for module in (config_module, storage_module, management, image_service, task_module,
                    support, system, tasks_api):
         monkeypatch.setattr(module, "config", store)
-    for module in (storage_module, management, image_service, task_module, system):
+    for module in (storage_module, management, image_service, task_module, system, conversation):
         monkeypatch.setattr(module, "image_storage_service", storage)
     for module in (storage_module, image_service):
         monkeypatch.setattr(module, "DATA_DIR", data_dir)
@@ -130,8 +131,8 @@ def integrated(monkeypatch, tmp_path):
     for module in (storage_module, management):
         monkeypatch.setattr(module, "CloudflareR2Client", lambda settings: ObjectClient(settings, remote))
 
-    # Seed only task bookkeeping. The test passes an uploaded URL through the
-    # real completion/persistence path; no upstream generator is called/faked.
+    # Seed only task bookkeeping. Tests pass a storage receipt through the real
+    # formatter/completion/persistence path; no upstream generator is called.
     task_path = data_dir / "image_tasks.json"
     timestamp = task_module._now_iso()
     task_path.write_text(json.dumps({"tasks": [{
@@ -213,6 +214,9 @@ def onboard(env):
 def complete_task(env, stored):
     env.tasks._update_task(f"admin:{TASK_ID}", status="success", data=[{
         "url": stored.url, "revised_prompt": "synthetic image",
+        "_storage_reference": {
+            "image_id": stored.image_id, "account_id": stored.account_id, "expires_at": stored.expires_at,
+        },
     }])
 
 
@@ -304,6 +308,52 @@ def test_onboarding_upload_task_reference_domain_switch_and_expiry(integrated, m
     assert env.storage.get_r2_usage(ACCOUNT)["a_local"] == 21
     assert task_image(env)["url"] == "" and resolve(env, stored)["expired"] is True
     assert env.tasks.path.read_text(encoding="utf-8") == persisted
+    assert_metadata_only(env)
+
+
+@pytest.mark.parametrize("mode", ["generate", "edit"])
+def test_upload_receipt_survives_old_domain_removal_before_task_persistence(integrated, monkeypatch, mode):
+    env = integrated
+    onboard(env)
+    payload = image_bytes()
+    formatted = []
+    protocol = task_module.openai_v1_image_edit if mode == "edit" else task_module.openai_v1_image_generations
+
+    def outputs(request):
+        data = conversation._format_image_bytes([payload], request.prompt, request.response_format, request.base_url)
+        formatted.extend(data)
+        # The upload URL is no longer a configured domain when the real handler
+        # returns to _run_task. Only the receipt can identify this stored result.
+        call(env, "PATCH", ACCOUNT_PATH + "/domains/" + HOSTS[1], {"active": True})
+        call(env, "DELETE", ACCOUNT_PATH + "/domains/" + HOSTS[0])
+        assert all(domain["domain"] != HOSTS[0] for domain in env.storage.account(ACCOUNT)["domains"])
+        yield conversation.ImageOutput(kind="result", model=request.model, index=1, total=1, data=data)
+
+    monkeypatch.setattr(protocol, "stream_image_outputs_with_pool", outputs)
+    monkeypatch.setattr(protocol, "count_text_tokens", lambda *_args: 1)
+    if mode == "edit":
+        monkeypatch.setattr(protocol, "count_image_inputs_tokens", lambda *_args: 1)
+    env.tasks._run_task(f"admin:{TASK_ID}", mode, {
+        "prompt": "synthetic image", "model": "gpt-image-2", "response_format": "url",
+        **({"images": [(payload, "synthetic-input.png", "image/png")]} if mode == "edit" else {}),
+    }, {"id": "admin", "role": "admin"}, "gpt-image-2")
+
+    assert len(formatted) == 1
+    reference = formatted[0]["_storage_reference"]
+    old_url = formatted[0]["url"]
+    assert old_url == f"https://{HOSTS[0]}/{reference['image_id']}"
+    persisted = env.tasks.path.read_text(encoding="utf-8")
+    task = json.loads(persisted)["tasks"][0]
+    assert task["status"] == "success"
+    assert task["data"] == [{**reference, "revised_prompt": "synthetic image"}]
+    assert old_url not in persisted and "_storage_reference" not in persisted and "b64_json" not in persisted
+    reloaded = task_module.ImageTaskService(env.tasks.path)
+    monkeypatch.setattr(tasks_api, "image_task_service", reloaded)
+    public_image = task_image(env)
+    assert public_image["image_id"] == reference["image_id"]
+    assert public_image["url"] == f"https://{HOSTS[1]}/{reference['image_id']}"
+    assert env.tasks.path.read_text(encoding="utf-8") == persisted
+    assert env.remote.calls == [("PUT", "synthetic-images", reference["image_id"])]
     assert_metadata_only(env)
 
 
