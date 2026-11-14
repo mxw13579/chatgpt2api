@@ -16,8 +16,14 @@ export function imageStorageSettingsAffectImages(previous: ImageStorageSettings,
 }
 
 export function newR2Account(): R2Account {
+  // getRandomValues also works over HTTP, unlike secure-context-only randomUUID.
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  const id = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
   return {
-    id: crypto.randomUUID(), name: "新 R2 账号", enabled: false, account_id: "", bucket: "",
+    id, name: "新 R2 账号", enabled: false, account_id: "", bucket: "",
     access_key_id: "", secret_access_key: "", api_token: "", capacity_bytes: 8_000_000_000,
     a_budget: 800_000, b_warn: 7_000_000, b_budget: 8_000_000,
     billing_cycle_day: 1, billing_cycle_confirmed: false, active_domain_id: "", domains: [],

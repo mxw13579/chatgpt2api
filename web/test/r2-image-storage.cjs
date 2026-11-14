@@ -50,6 +50,41 @@ test("ordinary settings saves omit the entire stale R2 config without mutating t
   assert.equal(config.image_storage.mode, "r2");
 });
 
+for (const [fill, expected] of [
+  [0, "00000000-0000-4000-8000-000000000000"],
+  [255, "ffffffff-ffff-4fff-bfff-ffffffffffff"],
+]) {
+  test(`HTTP account creation needs no randomUUID and preserves UUID v4 bits (${fill})`, (t) => {
+    const previous = Object.getOwnPropertyDescriptor(globalThis, "crypto");
+    let calls = 0;
+    Object.defineProperty(globalThis, "crypto", { configurable: true, value: {
+      getRandomValues(bytes) {
+        calls += 1;
+        assert.ok(bytes instanceof Uint8Array);
+        assert.equal(bytes.length, 16);
+        return bytes.fill(fill);
+      },
+    } });
+    t.after(() => Object.defineProperty(globalThis, "crypto", previous));
+    assert.equal(crypto.randomUUID, undefined);
+    const api = load("lib/image-storage.ts", { "@/lib/request": { httpRequest: () => assert.fail("Draft creation must not request the server") } });
+    const account = api.newR2Account();
+    assert.equal(account.id, expected);
+    assert.equal(account.enabled, false);
+    assert.equal(calls, 1);
+  });
+}
+
+test("new account drafts receive distinct canonical UUID v4 identifiers", () => {
+  const api = load("lib/image-storage.ts", { "@/lib/request": { httpRequest: () => assert.fail("No request expected") } });
+  const first = api.newR2Account();
+  const second = api.newR2Account();
+  for (const { id } of [first, second]) {
+    assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  }
+  assert.notEqual(first.id, second.id);
+});
+
 test("dedicated settings keep all account budgets, cycle, domains and blank secrets", async () => {
   let body;
   const api = load("lib/image-storage.ts", { "@/lib/request": { httpRequest: async (_url, options) => { body = options.body; return {}; } } });
