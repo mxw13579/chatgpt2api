@@ -12,10 +12,8 @@ import {
   fetchBackups,
   fetchSettingsConfig,
   runBackupNow,
-  syncImageStorage,
   startCPAImport,
   testBackupConnection,
-  testImageStorageConnection,
   updateCPAPool,
   updateSettingsConfig,
   type BackupItem,
@@ -23,14 +21,14 @@ import {
   type BackupState,
   type CPAPool,
   type CPARemoteFile,
-  type ImageStorageMode,
-  type ImageStorageSettings,
   type ProxyRuntimeClearanceMode,
   type ProxyRuntimeEgressMode,
   type ProxyRuntimeSettings,
   type SettingsConfig,
   type ThirdPartyAppsSettings,
 } from "@/lib/api";
+
+import { DEFAULT_IMAGE_STORAGE } from "@/lib/image-storage";
 
 export const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
 
@@ -156,22 +154,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
   const configuredImageModels = normalizeImageModelList(config.image_models);
   const imageModels = configuredImageModels.length > 0 ? configuredImageModels : DEFAULT_IMAGE_MODELS;
   const requestedDefaultImageModel = String(config.default_image_model || DEFAULT_IMAGE_MODEL).trim().toLowerCase();
-  const imageStorage = typeof config.image_storage === "object" && config.image_storage
-    ? config.image_storage as ImageStorageSettings
-    : {
-      enabled: false,
-      mode: "local",
-      webdav_url: "",
-      webdav_username: "",
-      webdav_password: "",
-      webdav_root_path: "chatgpt2api/images",
-      public_base_url: "",
-    };
-  const imageStorageMode: ImageStorageMode = imageStorage.enabled && imageStorage.mode === "both"
-    ? "both"
-    : imageStorage.enabled && imageStorage.mode === "webdav"
-      ? "webdav"
-      : "local";
+  const imageStorage = { ...DEFAULT_IMAGE_STORAGE, ...config.image_storage };
   const backup = typeof config.backup === "object" && config.backup
     ? config.backup as BackupSettings
     : {
@@ -231,15 +214,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
       model: String(config.ai_review?.model || ""),
       prompt: String(config.ai_review?.prompt || ""),
     },
-    image_storage: {
-      enabled: Boolean(imageStorage.enabled),
-      mode: imageStorageMode,
-      webdav_url: String(imageStorage.webdav_url || ""),
-      webdav_username: String(imageStorage.webdav_username || ""),
-      webdav_password: String(imageStorage.webdav_password || ""),
-      webdav_root_path: String(imageStorage.webdav_root_path || "chatgpt2api/images"),
-      public_base_url: String(imageStorage.public_base_url || ""),
-    },
+    image_storage: imageStorage,
     proxy_runtime: normalizeProxyRuntime(config.proxy_runtime),
     third_party_apps: normalizeThirdPartyApps(config.third_party_apps),
     backup: {
@@ -295,8 +270,6 @@ type SettingsStore = {
   isRunningBackup: boolean;
   deletingBackupKey: string | null;
   isTestingBackup: boolean;
-  isTestingImageStorage: boolean;
-  isSyncingImageStorage: boolean;
 
   pools: CPAPool[];
   isLoadingPools: boolean;
@@ -349,13 +322,10 @@ type SettingsStore = {
   setDefaultThinkingEffort: (value: "auto" | "standard" | "extended" | "max") => void;
   setSensitiveWordsText: (value: string) => void;
   setAIReviewField: (key: "enabled" | "base_url" | "api_key" | "model" | "prompt", value: string | boolean) => void;
-  setImageStorageField: (key: keyof ImageStorageSettings, value: string | boolean) => void;
   setProxyRuntimeField: <K extends keyof ProxyRuntimeSettings>(key: K, value: ProxyRuntimeSettings[K]) => void;
   setProxyRuntimeClearanceField: <K extends keyof ProxyRuntimeSettings["clearance"]>(key: K, value: ProxyRuntimeSettings["clearance"][K]) => void;
   setProxyRuntimeStatusCodesText: (value: string) => void;
   setInfiniteCanvasField: <K extends keyof ThirdPartyAppsSettings["infinite_canvas"]>(key: K, value: ThirdPartyAppsSettings["infinite_canvas"][K]) => void;
-  testImageStorage: () => Promise<void>;
-  syncImagesToWebDAV: () => Promise<void>;
   setBackupField: (key: keyof BackupSettings, value: string | boolean) => void;
   setBackupInclude: (key: keyof BackupSettings["include"], value: boolean) => void;
 
@@ -390,8 +360,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   isRunningBackup: false,
   deletingBackupKey: null,
   isTestingBackup: false,
-  isTestingImageStorage: false,
-  isSyncingImageStorage: false,
 
   pools: [],
   isLoadingPools: true,
@@ -485,15 +453,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           model: String(config.ai_review?.model || "").trim(),
           prompt: String(config.ai_review?.prompt || "").trim(),
         },
-        image_storage: {
-          enabled: Boolean(config.image_storage?.enabled),
-          mode: config.image_storage?.enabled && ["webdav", "both"].includes(String(config.image_storage?.mode)) ? config.image_storage.mode : "local",
-          webdav_url: String(config.image_storage?.webdav_url || "").trim(),
-          webdav_username: String(config.image_storage?.webdav_username || "").trim(),
-          webdav_password: String(config.image_storage?.webdav_password || "").trim(),
-          webdav_root_path: String(config.image_storage?.webdav_root_path || "chatgpt2api/images").trim(),
-          public_base_url: String(config.image_storage?.public_base_url || "").trim(),
-        },
+        // updateSettingsConfig 会移除 image_storage，不回写专用页面的旧快照。
         proxy_runtime: {
           ...normalizeProxyRuntime(config.proxy_runtime),
           proxy_url: String(config.proxy_runtime?.proxy_url || "").trim(),
@@ -670,30 +630,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set((state) => state.config ? { config: { ...state.config, ai_review: { ...(state.config.ai_review || {}), [key]: value } } } : {});
   },
 
-  setImageStorageField: (key, value) => {
-    set((state) => {
-      if (!state.config?.image_storage) {
-        return {};
-      }
-      const next = {
-        ...state.config.image_storage,
-        [key]: value,
-      };
-      if (key === "enabled" && !value) {
-        next.mode = "local";
-      }
-      if (key === "enabled" && value && next.mode === "local") {
-        next.mode = "webdav";
-      }
-      return {
-        config: {
-          ...state.config,
-          image_storage: next,
-        },
-      };
-    });
-  },
-
   setProxyRuntimeField: (key, value) => {
     set((state) => {
       if (!state.config) {
@@ -776,42 +712,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         },
       };
     });
-  },
-
-  testImageStorage: async () => {
-    set({ isTestingImageStorage: true });
-    try {
-      const saved = await get().saveConfig();
-      if (!saved) {
-        return;
-      }
-      const data = await testImageStorageConnection();
-      if (data.result.ok) {
-        toast.success(`WebDAV 连接可用：HTTP ${data.result.status}`);
-      } else {
-        toast.error(`WebDAV 连接失败：${data.result.error ?? `HTTP ${data.result.status}`}`);
-      }
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "测试 WebDAV 失败");
-    } finally {
-      set({ isTestingImageStorage: false });
-    }
-  },
-
-  syncImagesToWebDAV: async () => {
-    set({ isSyncingImageStorage: true });
-    try {
-      const saved = await get().saveConfig();
-      if (!saved) {
-        return;
-      }
-      const data = await syncImageStorage();
-      toast.success(`同步完成：上传 ${data.result.uploaded}，跳过 ${data.result.skipped}，失败 ${data.result.failed}`);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "同步图片失败");
-    } finally {
-      set({ isSyncingImageStorage: false });
-    }
   },
 
   setBackupField: (key, value) => {

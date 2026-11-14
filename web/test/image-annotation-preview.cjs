@@ -15,6 +15,9 @@ const load = (name) => {
     return { cn: (...values) => values.filter(Boolean).join(" ") };
   }
   if (name === "@/components/image-lightbox") return { ImageLightbox: () => null };
+  if (name === "@/hooks/use-image-expiry") return { useImageExpiry: () => Date.now() };
+  if (name === "@/lib/image-reference") return loadComponent("../src/lib/image-reference.ts");
+  if (name === "@/lib/image-storage") return { resolveImageReferences: async () => { throw new Error("no network in rendering fixture"); } };
   if (name === "@/hooks/use-cached-image-source") return { useCachedImageSource: (source) => source };
   if (name === "@/lib/image-cache") {
     return {
@@ -44,7 +47,7 @@ function loadComponent(file, exportName) {
   }).outputText;
   const componentModule = { exports: {} };
   new Function("require", "module", "exports", compiled)(load, componentModule, componentModule.exports);
-  return componentModule.exports[exportName];
+  return exportName ? componentModule.exports[exportName] : componentModule.exports;
 }
 const ImageResults = loadComponent("../src/app/image/components/image-results.tsx", "ImageResults");
 const ImageComposer = loadComponent("../src/app/image/components/image-composer.tsx", "ImageComposer");
@@ -135,6 +138,26 @@ test("successful image keeps metadata and actions in separate rows", () => {
   assert.match(actionsMarkup, /aria-label="编辑"/);
   assert.match(actionsMarkup, /aria-label="引用"/);
   assert.doesNotMatch(actionsMarkup, /标注编辑|加入编辑/);
+});
+
+test("expired R2 results render metadata rather than loading their remote URL", () => {
+  const noop = () => {};
+  const turn = {
+    id: "turn-expired", prompt: "synthetic", model: "gpt-image-2", mode: "generate",
+    referenceImages: [], maskImages: [], count: 1, size: "1024x1024", ratio: "1:1", tier: "1k", quality: "auto",
+    images: [{ id: "result", status: "success", image_id: "images/fixture.png", account_id: "fixture-account", expires_at: "2000-01-01T00:00:00Z", url: "https://images.example.test/images/fixture.png" }],
+    createdAt: "2000-01-01T00:00:00Z", status: "success",
+  };
+  const markup = renderToStaticMarkup(React.createElement(ImageResults, {
+    selectedConversation: { id: "conversation", title: "fixture", model: turn.model, turns: [turn], createdAt: turn.createdAt, updatedAt: turn.createdAt },
+    onOpenLightbox: noop, onContinueEdit: noop, onAnnotateImage: noop, onDeletePrompt: noop,
+    onDeleteResults: noop, onReuseTurnConfig: noop, onRegenerateTurn: noop, onRetryImage: noop,
+    onTimeoutRetryContinue: noop, onDismissErrors: noop, formatConversationTime: () => "fixture",
+  }));
+  assert.match(markup, /图片已过期/);
+  assert.match(markup, /fixture-account/);
+  assert.doesNotMatch(markup, /src="https:\/\/images\.example\.test/);
+  assert.doesNotMatch(markup, /aria-label="下载"/);
 });
 
 test("annotation overlay uses a light neutral wash without hatching", () => {

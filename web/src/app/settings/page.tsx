@@ -12,6 +12,7 @@ import { ConfigCard } from "./components/config-card";
 import { CPAPoolDialog } from "./components/cpa-pool-dialog";
 import { CPAPoolsCard } from "./components/cpa-pools-card";
 import { ImportBrowserDialog } from "./components/import-browser-dialog";
+import { ImageStorageCard } from "./components/image-storage-card";
 import { ProxyRuntimeCard } from "./components/proxy-runtime-card";
 import { SettingsHeader } from "./components/settings-header";
 import { Sub2APIConnections } from "./components/sub2api-connections";
@@ -21,6 +22,7 @@ import { useSettingsStore } from "./store";
 
 const settingsTabs = [
   { value: "basic", title: "基础配置" },
+  { value: "image-storage", title: "图片存储" },
   { value: "backup", title: "备份" },
   { value: "keys", title: "用户密钥" },
   { value: "api-docs", title: "接口接入" },
@@ -91,6 +93,9 @@ function SettingsPageContent() {
         </div>
         <TabsContent value="basic">
           <ConfigCard />
+        </TabsContent>
+        <TabsContent value="image-storage">
+          <ImageStorageCard />
         </TabsContent>
         <TabsContent value="proxy">
           <ProxyRuntimeCard />

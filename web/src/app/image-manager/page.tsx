@@ -6,6 +6,13 @@ import { toast } from "sonner";
 
 import { DateRangeFilter } from "@/components/date-range-filter";
 import { ImageLightbox } from "@/components/image-lightbox";
+import { ImageThumbnail } from "@/components/image-thumbnail";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { useImageExpiry } from "@/hooks/use-image-expiry";
+import { imageReference, isImageExpired, isImageUnavailable, isR2Image } from "@/lib/image-reference";
+import { downloadImageSource } from "@/lib/image-cache";
+import { IMAGE_STORAGE_CHANGED, getImageStorageOverview, resolveImageReferences } from "@/lib/image-storage";
+import type { ImageStorageMode } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -73,13 +80,22 @@ function ImageManagerContent() {
   const [storageLoading, setStorageLoading] = useState(false);
   const [compressResult, setCompressResult] = useState<string>("");
   const [targetFreeMb, setTargetFreeMb] = useState(500);
+  const [storageMode, setStorageMode] = useState<ImageStorageMode>();
+  const [accountNames, setAccountNames] = useState<Record<string, string>>({});
+  const [accountFilter, setAccountFilter] = useState("all");
+  const [expiryFilter, setExpiryFilter] = useState("all");
+  const now = useImageExpiry(items);
+  const r2Mode = storageMode === "r2";
 
   const loadStorage = useCallback(async () => {
     try {
       setStorageLoading(true);
-      const data = await fetchImageStorage();
+      setStorageMode(undefined);
+      const [data, overview] = await Promise.all([fetchImageStorage(), getImageStorageOverview()]);
       setStorage(data);
-    } catch { /* ignore */ }
+      setStorageMode(overview.settings.mode);
+      setAccountNames(Object.fromEntries(overview.settings.r2_accounts.map((account) => [account.id, account.name])));
+    } catch { toast.error("读取存储统计失败"); }
     finally { setStorageLoading(false); }
   }, []);
 
@@ -93,12 +109,15 @@ function ImageManagerContent() {
   const [deleteMode, setDeleteMode] = useState<"selected" | "filtered" | "byDate" | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
 
-  const filteredItems = selectedTags.length > 0
-    ? items.filter((item) => selectedTags.every((t) => (item.tags ?? []).includes(t)))
-    : items;
+  const filteredItems = items.filter((item) =>
+    selectedTags.every((tag) => (item.tags ?? []).includes(tag)) &&
+    (accountFilter === "all" || (accountFilter === "legacy" ? !isR2Image(item) : item.account_id === accountFilter)) &&
+    (expiryFilter === "all" || (expiryFilter === "expired" ? isImageExpired(item, now) : expiryFilter === "unavailable" ? isImageUnavailable(item, now) : !isImageUnavailable(item, now))),
+  );
 
   const lightboxImages = filteredItems.map((item) => ({
-    id: item.name,
+    ...imageReference(item),
+    id: item.image_id || item.rel,
     src: item.url,
     sizeLabel: formatSize(item.size),
     dimensions: item.width && item.height ? `${item.width} x ${item.height}` : undefined,
@@ -108,11 +127,11 @@ function ImageManagerContent() {
   const safePage = Math.min(page, pageCount);
   const currentRows = filteredItems.slice((safePage - 1) * pageSize, safePage * pageSize);
   const selectedSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
-  const selectedCount = deleteMode === "filtered" ? items.length : deleteMode === "byDate" ? 0 : selectedPaths.length;
+  const selectedCount = deleteMode === "filtered" ? filteredItems.length : deleteMode === "byDate" ? 0 : selectedPaths.length;
   const currentPageSelected = currentRows.length > 0 && currentRows.every((item) => selectedSet.has(imageKey(item)));
   const allSelected = filteredItems.length > 0 && filteredItems.every((item) => selectedSet.has(imageKey(item)));
 
-  const loadImages = async () => {
+  const loadImages = useCallback(async () => {
     setIsLoading(true);
     try {
       const [data, tagsData] = await Promise.all([
@@ -124,11 +143,12 @@ function ImageManagerContent() {
       setSelectedPaths((current) => current.filter((path) => data.items.some((item) => imageKey(item) === path)));
       setPage(1);
     } catch (error) {
+      setItems((current) => current.map((image) => isR2Image(image) ? { ...image, url: "", unavailable: true } : image));
       toast.error(error instanceof Error ? error.message : "加载图片失败");
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [startDate, endDate]);
 
   const closeDialog = useCallback(() => {
     setDialogVisible(false);
@@ -228,6 +248,7 @@ function ImageManagerContent() {
     setStartDate("");
     setEndDate("");
     setSelectedTags([]);
+    setAccountFilter("all"); setExpiryFilter("all"); setPage(1);
   };
 
   const togglePaths = (paths: string[], checked: boolean) => {
@@ -238,7 +259,7 @@ function ImageManagerContent() {
     if (!deleteMode || selectedCount === 0) return;
     setIsDeleting(true);
     try {
-      const data = await deleteManagedImages(deleteMode === "filtered" ? { start_date: startDate, end_date: endDate, all_matching: true } : { paths: selectedPaths });
+      const data = await deleteManagedImages({ paths: deleteMode === "filtered" ? filteredItems.map((item) => item.rel) : selectedPaths });
       toast.success(`已删除 ${data.removed} 张图片`);
       setDeleteMode(null);
       setSelectedPaths([]);
@@ -251,8 +272,11 @@ function ImageManagerContent() {
   };
 
   const handleBatchDownload = async () => {
-    const paths = deleteMode === "filtered" ? items.map((item) => item.rel) : selectedPaths;
+    const paths = selectedPaths;
     if (paths.length === 0) return;
+    if (items.some((item) => paths.includes(item.rel) && isImageUnavailable(item))) {
+      toast.error("所选包含已过期或暂停访问的图片，请取消这些选择后下载"); return;
+    }
     setIsDownloading(true);
     try {
       await downloadImages(paths);
@@ -264,13 +288,38 @@ function ImageManagerContent() {
     }
   };
 
+  const currentImage = async (item: ManagedImage) => {
+    if (!isR2Image(item)) return item;
+    const resolved = (await resolveImageReferences([item])).items[0];
+    if (!resolved?.url || isImageUnavailable(resolved)) throw new Error("图片已过期或暂不可访问");
+    const next = { ...item, ...resolved, expired: Boolean(resolved.expired), unavailable: Boolean(resolved.unavailable) };
+    setItems((current) => current.map((image) => image.rel === item.rel ? next : image));
+    return next;
+  };
   const handleSingleDownload = async (item: ManagedImage) => {
-    await downloadSingleImage(item.rel);
+    try {
+      const image = await currentImage(item);
+      if (isR2Image(image)) await downloadImageSource(image.url, image.name, image);
+      else await downloadSingleImage(image.rel);
+    } catch { toast.error("下载失败，请检查图片期限、访问状态与 CORS"); }
+  };
+  const copyCurrentLink = async (item: ManagedImage) => {
+    try {
+      const image = await currentImage(item);
+      await navigator.clipboard.writeText(image.url);
+      toast.success("当前图片地址已复制；外部旧地址不会自动更新");
+    } catch { toast.error("无法复制当前链接，请刷新访问状态"); }
   };
 
+  useEffect(() => { void loadImages(); }, [loadImages]);
   useEffect(() => {
-    void loadImages();
-  }, [startDate, endDate]);
+    const refresh = () => { void loadImages(); void loadStorage(); };
+    const changed = (event: StorageEvent) => { if (event.key === IMAGE_STORAGE_CHANGED) refresh(); };
+    window.addEventListener("focus", refresh);
+    window.addEventListener(IMAGE_STORAGE_CHANGED, refresh);
+    window.addEventListener("storage", changed);
+    return () => { window.removeEventListener("focus", refresh); window.removeEventListener(IMAGE_STORAGE_CHANGED, refresh); window.removeEventListener("storage", changed); };
+  }, [loadImages, loadStorage]);
 
   return (
     <section className="space-y-5">
@@ -288,11 +337,17 @@ function ImageManagerContent() {
             {isLoading ? <LoaderCircle className="size-4 animate-spin" /> : <Search className="size-4" />}
             查询
           </Button>
-          <Button variant="outline" onClick={() => setDeleteMode("filtered")} disabled={isDeleting || items.length === 0 || (!startDate && !endDate)} className="h-10 rounded-xl border-rose-200 bg-white px-4 text-rose-600 hover:bg-rose-50">
+          <Button variant="outline" onClick={() => setDeleteMode("filtered")} disabled={isDeleting || filteredItems.length === 0} className="h-10 rounded-xl border-rose-200 bg-white px-4 text-rose-600 hover:bg-rose-50">
             <Trash2 className="size-4" />
-            删除匹配日期
+            删除筛选结果
           </Button>
         </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-3">
+        <Select value={accountFilter} onValueChange={(value) => { setAccountFilter(value); setPage(1); }}><SelectTrigger className="w-56 rounded-xl bg-white"><SelectValue placeholder="按存储账号筛选" /></SelectTrigger><SelectContent><SelectItem value="all">全部账号 / 存储</SelectItem><SelectItem value="legacy">非 R2 图片</SelectItem>{Object.entries(accountNames).map(([id, name]) => <SelectItem key={id} value={id}>{name || id}</SelectItem>)}</SelectContent></Select>
+        <Select value={expiryFilter} onValueChange={(value) => { setExpiryFilter(value); setPage(1); }}><SelectTrigger className="w-44 rounded-xl bg-white"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="all">全部期限状态</SelectItem><SelectItem value="available">有效 / 可访问</SelectItem><SelectItem value="expired">已过期</SelectItem><SelectItem value="unavailable">过期 / 暂不可用</SelectItem></SelectContent></Select>
+        <span className="text-xs text-stone-500">R2 原图直接从当前域名加载，不写 IndexedDB；到期后仅显示元数据。</span>
       </div>
 
       {allTags.length > 0 ? (
@@ -347,7 +402,7 @@ function ImageManagerContent() {
       <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3 mb-4">
         {storage ? (
           <>
-            <div className="rounded-xl border border-stone-200 bg-white/80 p-3">
+            {!r2Mode ? <><div className="rounded-xl border border-stone-200 bg-white/80 p-3">
               <div className="text-xs text-stone-500">磁盘总量</div>
               <div className="text-lg font-bold text-stone-800">{storage.disk_total_mb >= 1024 ? `${(storage.disk_total_mb / 1024).toFixed(1)} GB` : `${storage.disk_total_mb} MB`}</div>
             </div>
@@ -355,6 +410,7 @@ function ImageManagerContent() {
               <div className="text-xs text-stone-500">剩余空间</div>
               <div className={`text-lg font-bold ${storage.disk_free_mb < 200 ? "text-red-500" : storage.disk_free_mb < 500 ? "text-yellow-500" : "text-green-600"}`}>{storage.disk_free_mb >= 1024 ? `${(storage.disk_free_mb / 1024).toFixed(1)} GB` : `${storage.disk_free_mb} MB`}</div>
             </div>
+            </> : <div className="col-span-2 rounded-xl border border-stone-200 bg-white/80 p-3 text-xs leading-6 text-stone-500">R2 元数据视图（非本地磁盘占用）<br /><a className="underline" href="/settings">账号预算、域名切换、到期/旧图清理请到设置 → 图片存储</a>{storage.legacy_size_bytes !== undefined ? <p>旧本地图：{formatSize(storage.legacy_size_bytes)}</p> : null}</div>}
             <div className="rounded-xl border border-stone-200 bg-white/80 p-3">
               <div className="text-xs text-stone-500">图片数量</div>
               <div className="text-lg font-bold text-stone-800">{storage.image_count}</div>
@@ -368,7 +424,7 @@ function ImageManagerContent() {
               <Button size="sm" variant="outline" className="h-7 text-xs" disabled={storageLoading} onClick={() => { void loadStorage(); }}>
                 <RefreshCw className={`size-3 mr-1 ${storageLoading ? "animate-spin" : ""}`} />刷新
               </Button>
-              <Button size="sm" variant="outline" className="h-7 text-xs"
+              <Button size="sm" variant="outline" className="h-7 text-xs" disabled={!storageMode || r2Mode}
                 onClick={async () => {
                   try { const r = await compressAllImages(); setCompressResult(`已压缩${r.saved_mb}MB`); void loadStorage(); }
                   catch { setCompressResult("压缩失败"); }
@@ -380,13 +436,14 @@ function ImageManagerContent() {
                 🗑️ 按日期删除
               </Button>
               <form onSubmit={async (e) => { e.preventDefault();
+                if (!storageMode || r2Mode) return;
                 try {
                   const r = await deleteToTarget(targetFreeMb);
                   toast.success(`已删除 ${r.removed} 张图片，释放 ${r.freed_mb ?? 0}MB`);
                   void loadStorage();
                 } catch { toast.error("清理失败"); }
               }} className="flex items-center gap-1">
-                <Button size="sm" variant="outline" className="h-7 text-xs border-amber-200 text-amber-700" type="submit">
+                <Button size="sm" variant="outline" className="h-7 text-xs border-amber-200 text-amber-700" type="submit" disabled={!storageMode || r2Mode}>
                   🧹 清理至
                 </Button>
                 <Input className="h-7 w-14 text-xs text-center px-1" type="number" min={50} value={targetFreeMb}
@@ -474,28 +531,21 @@ function ImageManagerContent() {
           </div>
           <div className="grid gap-0 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {currentRows.map((item) => {
-              const imageIndex = filteredItems.findIndex((row) => row.url === item.url);
+              const imageIndex = filteredItems.findIndex((row) => row.rel === item.rel);
+              const blocked = isImageUnavailable(item, now) || !item.url;
               return (
               <div key={item.rel} className="group border-r border-b border-stone-100 p-4 transition hover:bg-stone-50 dark:hover:bg-white/5">
                 <div className="relative">
                   <button
                     type="button"
                     className="relative block aspect-square w-full cursor-zoom-in overflow-hidden rounded-lg bg-stone-100 text-left"
+                    disabled={blocked}
                     onClick={() => {
                       setLightboxIndex(imageIndex);
                       setLightboxOpen(true);
                     }}
                   >
-                    <img
-                      src={item.thumbnail_url || item.url}
-                      alt={item.name}
-                      className="h-full w-full object-cover transition group-hover:scale-[1.02]"
-                      onError={(event) => {
-                        if (event.currentTarget.src !== item.url) {
-                          event.currentTarget.src = item.url;
-                        }
-                      }}
-                    />
+                    <ImageThumbnail src={item.url} thumbnailSrc={item.thumbnail_url} reference={item} alt={item.name} className="h-full w-full" imageClassName="transition group-hover:scale-[1.02]" />
                     <span className="absolute right-2 bottom-2 rounded-full bg-black/50 p-2 text-white opacity-100 transition sm:opacity-0 sm:group-hover:opacity-100">
                       <Maximize2 className="size-4" />
                     </span>
@@ -525,6 +575,7 @@ function ImageManagerContent() {
                         className="size-8 rounded-lg text-stone-400 hover:bg-stone-100 hover:text-stone-700"
                         onClick={() => void handleSingleDownload(item)}
                         title="下载图片"
+                        disabled={blocked}
                       >
                         <Download className="size-4" />
                       </Button>
@@ -532,10 +583,9 @@ function ImageManagerContent() {
                         variant="ghost"
                         size="icon"
                         className="size-8 rounded-lg text-stone-400 hover:bg-stone-100 hover:text-stone-700"
-                        onClick={() => {
-                          void navigator.clipboard.writeText(item.url);
-                          toast.success("图片地址已复制");
-                        }}
+                        disabled={blocked}
+                        title="复制当前链接"
+                        onClick={() => void copyCurrentLink(item)}
                       >
                         <Copy className="size-4" />
                       </Button>
@@ -546,6 +596,11 @@ function ImageManagerContent() {
                     <span>{formatSize(item.size)}</span>
                     <span>{item.width && item.height ? `${item.width} x ${item.height}` : "-"}</span>
                   </div>
+                  {isR2Image(item) ? <div className="space-y-1 break-all">
+                    <p>R2 · {accountNames[item.account_id || ""] || item.account_id || "未知账号"} · {isImageExpired(item, now) ? "已过期" : blocked ? "暂不可用" : "有效"}</p>
+                    <p>到期：{item.expires_at ? new Date(item.expires_at).toLocaleString("zh-CN") : "未提供"}</p>
+                    {!blocked ? <p className="truncate" title={item.url}>当前 URL：{item.url}</p> : null}
+                  </div> : null}
                   <div className="flex flex-wrap items-center gap-1">
                     {(item.tags ?? []).map((tag) => (
                       <Badge key={tag} variant="secondary" className="gap-0.5 rounded-md py-0 pr-0.5 text-[10px]">
@@ -643,12 +698,7 @@ function ImageManagerContent() {
           </p>
           {deleteTarget ? (
             <div className="flex items-center gap-3 overflow-hidden rounded-xl border border-stone-200 bg-stone-50 p-3">
-              <img
-                src={deleteTarget.thumbnail_url || deleteTarget.url}
-                alt=""
-                className="size-16 shrink-0 rounded-lg object-cover"
-                onError={(e) => { if (e.currentTarget.src !== deleteTarget.url) e.currentTarget.src = deleteTarget.url; }}
-              />
+              <ImageThumbnail src={deleteTarget.url} thumbnailSrc={deleteTarget.thumbnail_url} reference={deleteTarget} className="size-16 shrink-0 rounded-lg" />
               <div className="min-w-0 overflow-hidden text-xs text-stone-500">
                 <div className="truncate font-medium text-stone-700">{deleteTarget.name}</div>
                 <div className="truncate">{deleteTarget.created_at}</div>
@@ -678,7 +728,7 @@ function ImageManagerContent() {
       <Dialog open={deleteMode === "selected" || deleteMode === "filtered"} onOpenChange={(open) => (!open ? setDeleteMode(null) : null)}>
         <DialogContent showCloseButton={false} className="rounded-2xl p-6">
           <DialogHeader className="gap-2">
-            <DialogTitle>{deleteMode === "filtered" ? "删除匹配日期的图片" : "删除所选图片"}</DialogTitle>
+            <DialogTitle>{deleteMode === "filtered" ? "删除当前筛选结果（含账号、期限及标签）" : "删除所选图片"}</DialogTitle>
           </DialogHeader>
           <p className="text-sm text-stone-600">
             确认删除 {selectedCount} 张图片吗？删除后无法恢复。

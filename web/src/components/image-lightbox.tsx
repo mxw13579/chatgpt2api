@@ -5,10 +5,14 @@ import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { ChevronLeft, ChevronRight, Download, X } from "lucide-react";
 
 import { useCachedImageSource } from "@/hooks/use-cached-image-source";
-import { resolveCachedImage } from "@/lib/image-cache";
+import { downloadImageSource } from "@/lib/image-cache";
+import { toast } from "sonner";
+import type { ImageReference } from "@/lib/api";
+import { isImageExpired, isImageUnavailable, isR2Image } from "@/lib/image-reference";
+import { resolveImageReferences } from "@/lib/image-storage";
 import { cn } from "@/lib/utils";
 
-type LightboxImage = {
+type LightboxImage = ImageReference & {
   id: string;
   src: string;
   sizeLabel?: string;
@@ -103,7 +107,31 @@ export function ImageLightbox({
   const [transform, setTransform] = useState<ImageTransform>({ scale: 1, x: 0, y: 0 });
   const [isGesturing, setIsGesturing] = useState(false);
   const current = images[currentIndex];
-  const currentImageSrc = useCachedImageSource(current?.src || "", open && Boolean(current));
+  const [resolved, setResolved] = useState<{ id: string; original: string; image: ImageReference & { url: string } } | null>(null);
+  const imageId = current?.image_id;
+  const accountId = current?.account_id;
+  const original = current?.src || "";
+  const expiresAt = current?.expires_at;
+  useEffect(() => {
+    if (!open) { setResolved(null); return; }
+    if (!imageId || isImageExpired({ expires_at: expiresAt })) return;
+    let active = true;
+    setResolved(null);
+    void resolveImageReferences([{ image_id: imageId, account_id: accountId }]).then(({ items }) => {
+      if (active) setResolved({ id: imageId, original, image: items[0] || { url: "", unavailable: true } });
+    }).catch(() => {
+      if (active) setResolved({ id: imageId, original, image: { url: "", unavailable: true } });
+    });
+    return () => { active = false; };
+  }, [open, imageId, accountId, original, expiresAt]);
+  const reference = isR2Image(current)
+    ? resolved && resolved.id === imageId && resolved.original === original
+      ? { ...current, ...resolved.image, expired: Boolean(current?.expired || resolved.image.expired), unavailable: Boolean(current?.unavailable || resolved.image.unavailable) }
+      : { ...current, url: "", unavailable: true }
+    : current;
+  const source = isR2Image(current) ? (reference as (ImageReference & { url?: string }))?.url || "" : original;
+  const currentImageSrc = useCachedImageSource(source, open && Boolean(current), reference);
+  const blocked = isImageUnavailable(reference);
   const hasPrev = currentIndex > 0;
   const hasNext = currentIndex < images.length - 1;
 
@@ -186,19 +214,16 @@ export function ImageLightbox({
   }, [open, goPrev, goNext]);
 
   const handleDownload = useCallback(async () => {
-    if (!current) return;
-    let downloadSrc = currentImageSrc;
-    if (!downloadSrc) {
-      try {
-        downloadSrc = (await resolveCachedImage(current.src)).src;
-      } catch {
-        downloadSrc = current.src;
+    if (!current || !currentImageSrc) return;
+    try {
+      if (isR2Image(current)) {
+        const fresh = (await resolveImageReferences([current])).items[0];
+        if (!fresh?.url || isImageUnavailable(fresh)) throw new Error("图片已过期或暂不可访问");
+        await downloadImageSource(fresh.url, "image.png", fresh);
+      } else {
+        await downloadImageSource(current.src, `image-${current.id}.png`, current);
       }
-    }
-    const link = document.createElement("a");
-    link.href = downloadSrc;
-    link.download = `image-${current.id}.png`;
-    link.click();
+    } catch { toast.error("下载失败，请检查图片期限、访问状态与 CORS"); }
   }, [current, currentImageSrc]);
 
   const toggleZoom = useCallback(() => {
@@ -365,6 +390,7 @@ export function ImageLightbox({
           </DialogPrimitive.Title>
 
           <div className="absolute top-[calc(env(safe-area-inset-top)+1rem)] right-4 z-10 flex items-center gap-2">
+            {current.expires_at ? <span className="rounded-full bg-black/50 px-3 py-1.5 text-xs text-white/90">到期 {new Date(current.expires_at).toLocaleString("zh-CN")}</span> : null}
             {current.sizeLabel || current.dimensions ? (
               <span className="rounded-full bg-black/50 px-3 py-1.5 text-xs font-medium text-white/90">
                 {[current.sizeLabel, current.dimensions].filter(Boolean).join(" · ")}
@@ -378,6 +404,7 @@ export function ImageLightbox({
             <button
               type="button"
               onClick={() => void handleDownload()}
+              disabled={blocked || !currentImageSrc}
               className="inline-flex size-9 items-center justify-center rounded-full bg-black/50 text-white/90 transition hover:bg-black/70"
               aria-label="下载图片"
             >
@@ -427,8 +454,10 @@ export function ImageLightbox({
                 }}
                 draggable={false}
               />
+            ) : blocked ? (
+              <p className="px-8 text-center text-sm text-white/80">{isImageExpired(reference) ? "图片已过期，不再加载" : "正在解析当前地址或图片暂不可访问，请刷新后重试"}</p>
             ) : (
-              <div className="h-[min(70vh,720px)] w-[min(80vw,720px)] animate-pulse rounded-lg bg-white/10" aria-label="正在读取本地图片缓存" />
+              <div className="h-[min(70vh,720px)] w-[min(80vw,720px)] animate-pulse rounded-lg bg-white/10" aria-label="正在读取图片" />
             )}
           </div>
 

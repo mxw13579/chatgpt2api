@@ -5,11 +5,16 @@ import { Brush, Clock3, Download, EyeOff, LoaderCircle, RotateCcw, Sparkles, Tra
 
 import { Button } from "@/components/ui/button";
 import { useCachedImageSource } from "@/hooks/use-cached-image-source";
-import { getImmediateCachedImageSource, resolveCachedImage } from "@/lib/image-cache";
+import { getImmediateCachedImageSource, downloadImageSource } from "@/lib/image-cache";
+import { toast } from "sonner";
+import type { ImageReference } from "@/lib/api";
+import { useImageExpiry } from "@/hooks/use-image-expiry";
+import { imageReference, isImageExpired, isImageUnavailable, isR2Image } from "@/lib/image-reference";
+import { resolveImageReferences } from "@/lib/image-storage";
 import { cn } from "@/lib/utils";
 import type { ImageConversation, ImageTurnStatus, StoredImage, StoredReferenceImage } from "@/store/image-conversations";
 
-export type ImageLightboxItem = {
+export type ImageLightboxItem = ImageReference & {
   id: string;
   src: string;
   sizeLabel?: string;
@@ -35,6 +40,8 @@ type ImageResultsProps = {
 const b64BlobUrlCache = new Map<string, string>();
 
 function getStoredImageSrc(image: StoredImage) {
+  if (isImageUnavailable(image)) return "";
+  if (isR2Image(image)) return image.url || "";
   if (image.b64_json) {
     let url = b64BlobUrlCache.get(image.b64_json);
     if (!url) {
@@ -51,35 +58,15 @@ function getStoredImageSrc(image: StoredImage) {
 }
 
 async function downloadStoredImage(image: StoredImage, index: number) {
-  let blob: Blob | null = null;
   try {
-    if (image.b64_json) {
-      const binary = atob(image.b64_json);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      blob = new Blob([bytes], { type: "image/png" });
-    } else if (image.url) {
-      blob = (await resolveCachedImage(image.url)).blob;
+    if (isR2Image(image)) {
+      const current = (await resolveImageReferences([image])).items[0];
+      if (!current?.url || isImageUnavailable(current)) throw new Error("图片已过期或暂不可访问");
+      await downloadImageSource(current.url, `image-${index + 1}.png`, current);
     } else {
-      return;
+      await downloadImageSource(getStoredImageSrc(image), `image-${index + 1}.png`, image);
     }
-  } catch (err) {
-    console.error("Failed to download image:", err);
-    // 如果 fetch 失败，尝试直接在新窗口打开
-    if (image.url) {
-      window.open(image.url, "_blank");
-    }
-    return;
-  }
-  if (!blob) return;
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `image-${index + 1}.png`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  } catch { toast.error("下载失败，请检查图片期限、访问状态及 CORS 配置"); }
 }
 
 export function ImageResults({
@@ -97,6 +84,7 @@ export function ImageResults({
   formatConversationTime,
 }: ImageResultsProps) {
   const imageDimensionsRef = useRef<Record<string, string>>({});
+  const now = useImageExpiry(selectedConversation?.turns.flatMap((turn) => [...turn.images, ...turn.referenceImages]) || []);
   const [currentTime, setCurrentTime] = useState(Date.now());
   
   // 仅在存在 loading 图片时启动定时器，避免空闲时无谓重渲染
@@ -149,8 +137,9 @@ export function ImageResults({
       {selectedConversation.turns.map((turn, turnIndex) => {
         const referenceLightboxImages = [
           ...turn.referenceImages.map((image, index) => ({
+            ...imageReference(image),
             id: `${turn.id}-reference-${index}`,
-            src: image.dataUrl,
+            src: isImageUnavailable(image, now) ? "" : image.dataUrl,
           })),
           ...turn.maskImages.map((image, index) => ({
             id: `${turn.id}-mask-${index}`,
@@ -162,6 +151,7 @@ export function ImageResults({
           return src
             ? [
                 {
+                  ...imageReference(image),
                   id: image.id,
                   src,
                   sizeLabel: image.b64_json ? formatBase64ImageSize(image.b64_json) : undefined,
@@ -220,18 +210,20 @@ export function ImageResults({
                               onClick={() => onOpenLightbox(referenceLightboxImages, index)}
                               className="group relative h-24 w-24 overflow-hidden border border-stone-200/80 bg-stone-100/60 text-left transition hover:border-stone-300"
                               aria-label={`预览参考图 ${image.name || index + 1}`}
+                              disabled={isImageUnavailable(image, now) || !image.dataUrl}
                             >
-                              <img
+                              {isImageUnavailable(image, now) || !image.dataUrl ? <span className="p-2 text-xs text-stone-500">参考图已过期 / 暂不可用</span> : <img
                                 src={image.dataUrl}
                                 alt={image.name || `参考图 ${index + 1}`}
                                 className="absolute inset-0 h-full w-full object-cover transition duration-200 group-hover:scale-[1.02]"
-                              />
+                              />}
                             </button>
                             <Button
                               variant="outline"
                               size="sm"
                               className="rounded-full border-stone-200 bg-white text-stone-700 hover:bg-stone-50"
                               onClick={() => onContinueEdit(selectedConversation.id, image)}
+                              disabled={isImageUnavailable(image, now) || !image.dataUrl}
                             >
                               <Sparkles className="size-4" />
                               引用
@@ -271,6 +263,14 @@ export function ImageResults({
                   <div className="grid grid-cols-3 gap-2 sm:block sm:columns-2 sm:gap-4 sm:space-y-4 xl:columns-3">
                     {turn.images.map((image, index) => {
                       const imageSrc = image.status === "success" ? getStoredImageSrc(image) : "";
+                      if (image.status === "success" && (isImageUnavailable(image, now) || (isR2Image(image) && !imageSrc))) {
+                        return <div key={image.id} className="break-inside-avoid rounded-xl border border-stone-200 bg-stone-50 p-4 text-xs leading-6 text-stone-500">
+                          <p className="font-medium">{isImageExpired(image, now) ? "图片已过期" : "图片暂不可访问，请刷新链接 / 访问状态"}</p>
+                          <p className="break-all">账号：{image.account_id || "—"}</p>
+                          <p>到期：{image.expires_at ? new Date(image.expires_at).toLocaleString("zh-CN") : "—"}</p>
+                          <p>仅保留元数据，不加载远程图片。</p>
+                        </div>;
+                      }
                       if (image.status === "success" && imageSrc) {
                         const currentIndex = successfulTurnImages.findIndex((item) => item.id === image.id);
                         const sizeLabel = image.b64_json ? formatBase64ImageSize(image.b64_json) : "";
@@ -284,6 +284,7 @@ export function ImageResults({
                           >
                             <LazyImage
                               src={imageSrc}
+                              reference={image}
                               alt={`Generated result ${index + 1}`}
                               className="group block aspect-square w-full cursor-zoom-in overflow-hidden rounded-xl sm:aspect-auto"
                               onLoad={(event) => {
@@ -300,6 +301,8 @@ export function ImageResults({
                                 <span>结果 {index + 1}</span>
                                 {image.durationMs != null ? <span className="whitespace-nowrap text-stone-400">{formatDuration(image.durationMs)}</span> : null}
                                 {imageMeta ? <span className="whitespace-nowrap text-stone-400">{imageMeta}</span> : null}
+                                {image.account_id ? <span className="break-all">R2 · {image.account_id}</span> : null}
+                                {image.expires_at ? <span>到期 {new Date(image.expires_at).toLocaleString("zh-CN")}</span> : null}
                               </div>
                               <div data-slot="image-result-actions" className="grid grid-cols-3 gap-1.5 sm:flex sm:items-center sm:justify-end">
                                 <Button
@@ -309,7 +312,7 @@ export function ImageResults({
                                   onClick={() => onAnnotateImage(
                                     selectedConversation.id,
                                     image,
-                                    getImmediateCachedImageSource(imageSrc) || imageSrc,
+                                    getImmediateCachedImageSource(imageSrc, image) || imageSrc,
                                   )}
                                   aria-label="编辑"
                                 >
@@ -541,8 +544,9 @@ function formatImageDimensions(width: number, height: number) {
   return `${width} x ${height}`;
 }
 
-const LazyImage = memo(function LazyImage({ src, alt, className, onLoad, onOpen }: {
+const LazyImage = memo(function LazyImage({ src, reference, alt, className, onLoad, onOpen }: {
   src: string;
+  reference?: ImageReference;
   alt: string;
   className: string;
   onLoad?: (event: React.SyntheticEvent<HTMLImageElement>) => void;
@@ -550,7 +554,7 @@ const LazyImage = memo(function LazyImage({ src, alt, className, onLoad, onOpen 
 }) {
   const [isVisible, setIsVisible] = useState(false);
   const imgRef = useRef<HTMLDivElement>(null);
-  const cachedSrc = useCachedImageSource(src, isVisible);
+  const cachedSrc = useCachedImageSource(src, isVisible, reference);
 
   useEffect(() => {
     const element = imgRef.current;

@@ -4,7 +4,47 @@ export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
 export type ImageModel = string;
 export type AuthRole = "admin" | "user";
-export type ImageStorageMode = "local" | "webdav" | "both";
+export type ImageStorageMode = "local" | "webdav" | "both" | "r2";
+
+export type ImageReference = {
+  image_id?: string;
+  account_id?: string;
+  expires_at?: string;
+  expired?: boolean;
+  unavailable?: boolean;
+  storage?: string;
+};
+
+export type R2Domain = {
+  id: string;
+  domain: string;
+  zone_id: string;
+  enabled: boolean;
+};
+
+export type R2Account = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  account_id: string;
+  bucket: string;
+  access_key_id: string;
+  secret_access_key: string;
+  api_token: string;
+  has_access_key_id?: boolean;
+  has_secret_access_key?: boolean;
+  has_api_token?: boolean;
+  capacity_bytes: number;
+  a_budget: number;
+  b_warn: number;
+  b_budget: number;
+  billing_cycle_day: number;
+  billing_cycle_confirmed: boolean;
+  active_domain_id: string;
+  domains: R2Domain[];
+  rate_limit_requests: number;
+  restrict_methods: boolean;
+};
 
 export type ImageStorageSettings = {
   enabled: boolean;
@@ -14,6 +54,13 @@ export type ImageStorageSettings = {
   webdav_password: string;
   webdav_root_path: string;
   public_base_url: string;
+  retention_minutes: number;
+  cleanup_interval_seconds: number;
+  usage_refresh_seconds: number;
+  usage_max_age_seconds: number;
+  cache_ttl_seconds: number;
+  cors_origins: string[];
+  r2_accounts: R2Account[];
 };
 
 export type Account = {
@@ -258,7 +305,7 @@ export type BackupDetail = {
   }>;
 };
 
-export type ManagedImage = {
+export type ManagedImage = ImageReference & {
   rel: string;
   path?: string;
   name: string;
@@ -291,7 +338,7 @@ export type ImageTask = {
   created_at: string;
   updated_at: string;
   conversation_id?: string;
-  data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
+  data?: Array<ImageReference & { b64_json?: string; url?: string; revised_prompt?: string }>;
   error?: string;
   progress?: string;
   elapsed_secs?: number;
@@ -484,9 +531,12 @@ export async function fetchSettingsConfig() {
 }
 
 export async function updateSettingsConfig(settings: SettingsConfig) {
+  // 图片存储只能通过专用接口保存；基础设置/备份等不能回写旧 R2 快照。
+  const body = { ...settings };
+  delete body.image_storage;
   return httpRequest<{ config: SettingsConfig }>("/api/settings", {
     method: "POST",
-    body: settings,
+    body,
   });
 }
 
@@ -622,6 +672,8 @@ export async function deleteImageTag(tag: string) {
 }
 
 export type ImageStorageStats = {
+  mode?: ImageStorageMode;
+  legacy_size_bytes?: number;
   disk_total_mb: number; disk_used_mb: number; disk_free_mb: number;
   image_count: number; image_size_mb: number; image_size_bytes: number;
 };

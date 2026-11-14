@@ -7,6 +7,9 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
+import type { ImageReference } from "@/lib/api";
+import { isImageUnavailable } from "@/lib/image-reference";
+import { useImageExpiry } from "@/hooks/use-image-expiry";
 
 type DrawingMode = "annotate" | "sketch";
 type DrawingTool = "draw" | "erase";
@@ -15,6 +18,7 @@ type ImageDrawingDialogProps = {
   mode: DrawingMode;
   open: boolean;
   source?: string;
+  reference?: ImageReference;
   onOpenChange: (open: boolean) => void;
   onApply: (file: File) => void | Promise<void>;
 };
@@ -74,7 +78,9 @@ function canvasBlob(canvas: HTMLCanvasElement) {
   });
 }
 
-export function ImageDrawingDialog({ mode, open, source, onOpenChange, onApply }: ImageDrawingDialogProps) {
+export function ImageDrawingDialog({ mode, open, source, reference, onOpenChange, onApply }: ImageDrawingDialogProps) {
+  const now = useImageExpiry(reference ? [reference] : []);
+  const blocked = mode === "annotate" && isImageUnavailable(reference, now);
   const visibleCanvasRef = useRef<HTMLCanvasElement>(null);
   const maskCanvasRef = useRef<HTMLCanvasElement>(null);
   const lastPointRef = useRef<Point | null>(null);
@@ -190,6 +196,7 @@ export function ImageDrawingDialog({ mode, open, source, onOpenChange, onApply }
   };
 
   const handleApply = async () => {
+    if (blocked) { toast.error("图片已过期或暂不可访问"); return; }
     if (!hasDrawing) {
       toast.error(mode === "annotate" ? "请先标记需要修改的区域" : "请先画出草图");
       return;
@@ -254,7 +261,8 @@ export function ImageDrawingDialog({ mode, open, source, onOpenChange, onApply }
             )}
             style={mode === "annotate" ? { aspectRatio: `${dimensions.width} / ${dimensions.height}` } : undefined}
           >
-            {mode === "annotate" && source ? (
+            {blocked ? <p className="relative z-10 bg-stone-100 p-4 text-sm text-stone-500">图片已过期 / 暂不可访问，不再加载。请关闭并重新选择图片。</p> : null}
+            {mode === "annotate" && source && !blocked ? (
               <img
                 src={source}
                 alt="待编辑图片"
@@ -282,7 +290,7 @@ export function ImageDrawingDialog({ mode, open, source, onOpenChange, onApply }
 
         <DialogFooter className="border-t border-stone-100 px-5 py-4">
           <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>取消</Button>
-          <Button type="button" onClick={() => void handleApply()} disabled={isApplying}>
+          <Button type="button" onClick={() => void handleApply()} disabled={isApplying || blocked}>
             {isApplying ? "处理中…" : mode === "annotate" ? "应用标注" : "使用草图"}
           </Button>
         </DialogFooter>

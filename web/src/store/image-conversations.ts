@@ -2,17 +2,18 @@
 
 import localforage from "localforage";
 
-import type { ImageModel } from "@/lib/api";
+import type { ImageModel, ImageReference } from "@/lib/api";
+import { isR2Image, r2ReferenceFromUrl } from "@/lib/image-reference";
 
 export type ImageConversationMode = "generate" | "edit";
 
-export type StoredReferenceImage = {
+export type StoredReferenceImage = ImageReference & {
   name: string;
   type: string;
   dataUrl: string;
 };
 
-export type StoredImage = {
+export type StoredImage = ImageReference & {
   id: string;
   taskId?: string;
   status?: "loading" | "success" | "error";
@@ -73,8 +74,11 @@ const IMAGE_CONVERSATIONS_KEY = "items";
 let imageConversationWriteQueue: Promise<void> = Promise.resolve();
 
 function normalizeStoredImage(image: StoredImage): StoredImage {
+  const reference = image.image_id ? image : { ...image, ...r2ReferenceFromUrl(image.url || "") };
   const normalized = {
-    ...image,
+    ...reference,
+    // R2 只持久化引用与期限，不接收图片本体。
+    b64_json: isR2Image(reference) ? undefined : image.b64_json,
     taskId: typeof image.taskId === "string" && image.taskId ? image.taskId : undefined,
     taskStatus: image.taskStatus === "queued" || image.taskStatus === "running" ? image.taskStatus : undefined,
     url: typeof image.url === "string" && image.url ? image.url : undefined,
@@ -89,15 +93,17 @@ function normalizeStoredImage(image: StoredImage): StoredImage {
   }
   return {
     ...normalized,
-    status: image.b64_json || image.url ? "success" : "loading",
+    status: image.b64_json || image.url || reference.image_id ? "success" : "loading",
   };
 }
 
 function normalizeReferenceImage(image: StoredReferenceImage): StoredReferenceImage {
+  const reference = image.image_id ? image : { ...image, ...r2ReferenceFromUrl(image.dataUrl) };
   return {
+    ...reference,
     name: image.name || "reference.png",
     type: image.type || "image/png",
-    dataUrl: image.dataUrl,
+    dataUrl: isR2Image(reference) && /^(data:|blob:)/.test(image.dataUrl) ? "" : image.dataUrl,
   };
 }
 
@@ -114,7 +120,7 @@ function getLegacyReferenceImages(source: Record<string, unknown>): StoredRefere
           return false;
         }
         const candidate = image as StoredReferenceImage;
-        return typeof candidate.dataUrl === "string" && candidate.dataUrl.length > 0;
+        return Boolean(candidate.image_id) || (typeof candidate.dataUrl === "string" && candidate.dataUrl.length > 0);
       })
       .map(normalizeReferenceImage);
   }

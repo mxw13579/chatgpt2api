@@ -7,7 +7,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import type { ImageModel } from "@/lib/api";
+import type { ImageModel, ImageReference } from "@/lib/api";
+import { imageReference, isImageUnavailable } from "@/lib/image-reference";
+import { useImageExpiry } from "@/hooks/use-image-expiry";
 import { cn } from "@/lib/utils";
 
 type ImageComposerProps = {
@@ -22,7 +24,7 @@ type ImageComposerProps = {
   imageModels: ImageModel[];
   availableQuota: string;
   activeTaskCount: number;
-  referenceImages: Array<{ name: string; dataUrl: string }>;
+  referenceImages: Array<ImageReference & { name: string; dataUrl: string }>;
   maskImages: Array<{ name: string; dataUrl: string }>;
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   fileInputRef: RefObject<HTMLInputElement | null>;
@@ -114,6 +116,7 @@ export function ImageComposer({
   onRemoveReferenceImage,
   onOpenSketch,
 }: ImageComposerProps) {
+  const now = useImageExpiry(referenceImages);
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [lightboxIndex, setLightboxIndex] = useState(0);
   const [isSizeMenuOpen, setIsSizeMenuOpen] = useState(false);
@@ -123,7 +126,7 @@ export function ImageComposer({
   const sizeMenuBtnRef = useRef<HTMLButtonElement>(null);
   const lightboxImages = useMemo(
     () => [
-      ...referenceImages.map((image, index) => ({ id: `${image.name}-${index}`, src: image.dataUrl })),
+      ...referenceImages.map((image, index) => ({ ...imageReference(image), id: `${image.name}-${index}`, src: image.dataUrl })),
       ...maskImages.map((image, index) => ({ id: `mask-${image.name}-${index}`, src: image.dataUrl })),
     ],
     [referenceImages, maskImages],
@@ -250,12 +253,13 @@ export function ImageComposer({
                   }}
                   className="group size-14 overflow-hidden rounded-2xl border border-stone-200 bg-stone-50 transition hover:border-stone-300 sm:size-16"
                   aria-label={`预览参考图 ${image.name || index + 1}`}
+                  disabled={isImageUnavailable(image, now)}
                 >
-                  <img
+                  {isImageUnavailable(image, now) ? <span className="text-[10px] text-stone-500">已过期 / 不可用</span> : <img
                     src={image.dataUrl}
                     alt={image.name || `参考图 ${index + 1}`}
                     className="h-full w-full object-cover"
-                  />
+                  />}
                 </button>
                 <button
                   type="button"

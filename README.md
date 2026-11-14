@@ -129,6 +129,13 @@ environment:
 
 ## 功能
 
+### 图片存储与多账号 R2
+
+- 默认 / `b64_json` 图片直接返回，不上传、不写本地；只有 `url` 及网页图片任务使用配置的图片存储。
+- 在「设置 → 图片存储」选择 R2，可管理多账号预算、自定义域名和备用域名、免费防护/CORS、用量刷新及分钟级过期清理，无需 Worker。
+- R2 模式只在服务器保留元数据，无本地原图或缩略图；无可用额度时不回退本地。旧图片须显式清理，不自动迁移或删除。
+- 接入步骤、额度限制及域名切换说明见 [R2 图片存储使用说明](docs/r2-image-storage.md)。
+
 ### API 兼容能力
 
 - 兼容 `POST /v1/images/generations` 图片生成接口
@@ -247,7 +254,7 @@ curl http://localhost:8000/v1/images/generations \
 | `model`           | 图片模型，当前可用值以 `/v1/models` 返回结果为准，推荐使用 `gpt-image-2` |
 | `prompt`          | 图片生成提示词                                            |
 | `n`               | 生成数量，当前后端限制为 `1-4`                                 |
-| `response_format` | 默认 `b64_json`，仅返回 Base64；设为 `url` 时仅返回图片 URL，不同时返回两者 |
+| `response_format` | 默认 `b64_json`，仅返回 Base64 且不存储；设为 `url` 时按配置保存并仅返回图片 URL |
 
 <br>
 </details>

@@ -79,8 +79,8 @@ Content-Type: application/json
 
 - `n` 为 1–4 的整数；不接受布尔值、0 或小数。
 - 顶层非 `null` 的 `n/size/quality` 优先于第一个图片工具里的同名设置，两种入口均传递给后端。`size` 接受 `auto` 或正整数 `宽x高`；`quality` 接受 `auto/low/medium/high/xhigh/max/standard/hd`，不接受任意提示文本。
-- Images 生成与编辑接口的 `response_format` 默认是 `b64_json`，仅返回 `data[].b64_json`；设为 `url` 时仅返回 `data[].url`，两者不同时返回。图片保存行为不受返回格式影响；URL 模式是本项目的扩展能力。
-- Chat/Responses 为保留各自响应结构，内部统一使用 Base64 图片结果；`response_format: "url"` 不会把它们改成 Images 接口的 `data[].url` 返回。
+- Images 生成与编辑接口的 `response_format` 默认是 `b64_json`，仅返回 `data[].b64_json`，不上传或保存图片；设为 `url` 时按配置存储并仅返回 `data[].url`，两者不同时返回。URL 模式是本项目的扩展能力；R2 配置与过期规则见 [R2 图片存储](r2-image-storage.md)。
+- Chat/Responses 为保留各自响应结构，内部统一使用 Base64 图片结果，不上传或保存图片；`response_format: "url"` 不会把它们改成 Images 接口的 `data[].url` 返回。
 - `size/quality` 的实际效果取决于上游。Web 画图链路可能将它们转为提示要求，并非硬性像素约束。
 - 目前不提供 JPEG/WebP 输出转码，也不提供 `partial_images` 实时预览；显式请求这些未支持选项会报错。
 - 不支持通过 `previous_response_id` 自动恢复之前的画图会话。需要编辑时，应重新提供参考图和本次要求。

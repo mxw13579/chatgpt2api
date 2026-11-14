@@ -1,12 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ChevronLeft, ChevronRight, ImageIcon, LoaderCircle, RefreshCw, Search, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { DateRangeFilter } from "@/components/date-range-filter";
 import { ImageLightbox } from "@/components/image-lightbox";
-import { ImageThumbnail, getImageThumbnailUrl } from "@/components/image-thumbnail";
+import { ImageThumbnail } from "@/components/image-thumbnail";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -14,7 +14,10 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { deleteSystemLogs, fetchSystemLogs, type SystemLog } from "@/lib/api";
+import { deleteSystemLogs, fetchSystemLogs, type ImageReference, type SystemLog } from "@/lib/api";
+import { isImageUnavailable, r2ReferenceFromUrl } from "@/lib/image-reference";
+import { IMAGE_STORAGE_CHANGED, resolveImageReferences } from "@/lib/image-storage";
+import { useImageExpiry } from "@/hooks/use-image-expiry";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 const LogType = {
@@ -63,8 +66,15 @@ function LogsContent() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [deletingItems, setDeletingItems] = useState<SystemLog[]>([]);
+  const [r2Images, setR2Images] = useState<Record<string, ImageReference & { url: string }>>({});
+  const now = useImageExpiry(Object.values(r2Images));
+  const imageForUrl = (url: string): ImageReference & { url: string } => {
+    const reference = r2ReferenceFromUrl(url);
+    if (!reference) return { url };
+    return r2Images[reference.image_id!] || { ...reference, url: "", unavailable: true };
+  };
   const detailUrls = getUrls(detailLog);
-  const detailImages = detailUrls.map((url, index) => ({ id: `${index}`, src: url }));
+  const detailImages = detailUrls.map((url, index) => ({ ...imageForUrl(url), id: `${index}`, src: imageForUrl(url).url }));
   const isCallLog = type === LogType.Call;
   const pageSize = 10;
   const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
@@ -74,19 +84,30 @@ function LogsContent() {
   const currentPageSelected = currentRows.length > 0 && currentRows.every((item) => selectedSet.has(item.id));
   const allSelected = items.length > 0 && items.every((item) => selectedSet.has(item.id));
 
-  const loadLogs = async () => {
+  const loadLogs = useCallback(async () => {
     setIsLoading(true);
     try {
       const data = await fetchSystemLogs({ type, start_date: startDate, end_date: endDate });
+      const references = [...new Map(data.items.flatMap(getUrls).map(r2ReferenceFromUrl).filter((image): image is ImageReference => Boolean(image)).map((image) => [image.image_id, image])).values()];
+      const resolved: Record<string, ImageReference & { url: string }> = {};
+      try {
+        for (let offset = 0; offset < references.length; offset += 100) {
+          for (const image of (await resolveImageReferences(references.slice(offset, offset + 100))).items) {
+            if (image.image_id) resolved[image.image_id] = image;
+          }
+        }
+      } catch { toast.error("日志图片地址解析失败，暂不加载 R2 旧链接"); }
+      setR2Images(resolved);
       setItems(data.items);
       setSelectedIds((current) => current.filter((id) => data.items.some((item) => item.id === id)));
       setPage(1);
     } catch (error) {
+      setR2Images({});
       toast.error(error instanceof Error ? error.message : "加载日志失败");
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [type, startDate, endDate]);
 
   const clearFilters = () => {
     setStartDate("");
@@ -129,9 +150,15 @@ function LogsContent() {
     }
   };
 
+  useEffect(() => { void loadLogs(); }, [loadLogs]);
   useEffect(() => {
-    void loadLogs();
-  }, [type, startDate, endDate]);
+    const refresh = () => { void loadLogs(); };
+    const changed = (event: StorageEvent) => { if (event.key === IMAGE_STORAGE_CHANGED) refresh(); };
+    window.addEventListener("focus", refresh);
+    window.addEventListener(IMAGE_STORAGE_CHANGED, refresh);
+    window.addEventListener("storage", changed);
+    return () => { window.removeEventListener("focus", refresh); window.removeEventListener(IMAGE_STORAGE_CHANGED, refresh); window.removeEventListener("storage", changed); };
+  }, [loadLogs]);
 
   return (
     <section className="space-y-5">
@@ -233,8 +260,9 @@ function LogsContent() {
                                   className="relative size-9 overflow-hidden rounded-lg border border-stone-200 bg-stone-100"
                                   onClick={() => openLogImage(item, imageIndex)}
                                   title="预览图片"
+                                  disabled={isImageUnavailable(imageForUrl(url), now)}
                                 >
-                                  <ImageThumbnail src={url} thumbnailSrc={getImageThumbnailUrl(url)} className="h-full w-full" />
+                                  <ImageThumbnail src={imageForUrl(url).url} reference={imageForUrl(url)} className="h-full w-full" />
                                 </button>
                               ))}
                               {urls.length > 3 ? <span className="text-xs text-stone-400">+{urls.length - 3}</span> : null}
@@ -305,7 +333,7 @@ function LogsContent() {
                         setLightboxOpen(true);
                       }}
                     >
-                      <img src={url} alt="" className="h-full w-full object-cover" />
+                      <ImageThumbnail src={imageForUrl(url).url} reference={imageForUrl(url)} className="h-full w-full" />
                     </button>
                   ))}
                 </div>

@@ -1,6 +1,8 @@
 "use client";
 
 import localforage from "localforage";
+import type { ImageReference } from "@/lib/api";
+import { isImageUnavailable, isR2Image, r2ReferenceFromUrl } from "@/lib/image-reference";
 
 type CachedImageRecord = {
   version: 1;
@@ -57,17 +59,26 @@ function rememberBlob(source: string, blob: Blob) {
   return src;
 }
 
-export function getImmediateCachedImageSource(source: string): string | null {
+export function getImmediateCachedImageSource(source: string, reference?: ImageReference): string | null {
+  reference = reference || r2ReferenceFromUrl(source);
+  if (isImageUnavailable(reference)) return null;
   const normalized = normalizeSource(source);
+  // R2 只用当前远程 URL，绝不读取历史 Blob 缓存。
+  if (isR2Image(reference)) return normalized || null;
   if (!normalized) return null;
   if (isInlineSource(normalized)) return normalized;
   return memoryCache.get(normalized)?.src || null;
 }
 
-export async function resolveCachedImage(source: string): Promise<ResolvedCachedImage> {
+export async function resolveCachedImage(source: string, reference?: ImageReference): Promise<ResolvedCachedImage> {
+  reference = reference || r2ReferenceFromUrl(source);
+  if (isImageUnavailable(reference)) throw new Error("图片已过期或暂不可访问");
   const normalized = normalizeSource(source);
   if (!normalized) {
     throw new Error("图片地址为空");
+  }
+  if (isR2Image(reference)) {
+    return { source: normalized, src: normalized, blob: null, fromCache: false };
   }
   if (isInlineSource(normalized)) {
     return { source: normalized, src: normalized, blob: null, fromCache: true };
@@ -128,6 +139,31 @@ export async function resolveCachedImage(source: string): Promise<ResolvedCached
   } finally {
     pendingLoads.delete(normalized);
   }
+}
+
+// 下载/编辑是显式读取；R2 内容只在调用者内存中使用，不写 IndexedDB 或全局 Blob 缓存。
+export async function readImageBlob(source: string, reference?: ImageReference): Promise<Blob> {
+  reference = reference || r2ReferenceFromUrl(source);
+  if (isImageUnavailable(reference)) throw new Error("图片已过期或暂不可访问");
+  if (!isR2Image(reference)) {
+    const cached = await resolveCachedImage(source, reference);
+    if (cached.blob) return cached.blob;
+  }
+  const response = await fetch(source, { mode: "cors", credentials: "omit", cache: "no-store", redirect: "error" });
+  if (!response.ok) throw new Error(`图片读取失败：HTTP ${response.status}`);
+  const blob = await response.blob();
+  if (isImageUnavailable(reference)) throw new Error("图片已过期或暂不可访问");
+  if (!blob.size) throw new Error("图片读取失败：响应为空");
+  return blob;
+}
+
+export async function downloadImageSource(source: string, name: string, reference?: ImageReference) {
+  const blob = await readImageBlob(source, reference);
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url; link.download = name;
+  document.body.appendChild(link); link.click(); link.remove();
+  URL.revokeObjectURL(url);
 }
 
 export async function deleteCachedImageSources(sources: Array<string | undefined>): Promise<void> {
