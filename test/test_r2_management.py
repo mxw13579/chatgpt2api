@@ -94,6 +94,14 @@ class FakeStorage:
     def account_status(self, account_id):
         return "access_paused" if self.state.get("access_paused") else "eligible"
 
+    def account_summaries(self):
+        summaries = []
+        for account in self.config.settings["r2_accounts"]:
+            usage = self.account_usage(account["id"])
+            summaries.append({"id": account["id"], "status": self.account_status(account["id"]),
+                              "usage": usage, "domains": usage.get("domains", [])})
+        return summaries
+
     def list_items(self, base_url):
         return copy.deepcopy(self.items)
 
@@ -290,6 +298,11 @@ class R2ManagementTests(unittest.TestCase):
         self.assertTrue(self.storage.state["shutdown_ok"])
         self.assertEqual(len(self.cloud.usage_calls), 1)
         self.assertEqual(self.storage.cleanup_count, 1)
+        self.assertEqual(self.cloud.calls.count(("managed", False)), 2)
+        calls = copy.deepcopy(self.cloud.calls)
+        self.service.maintenance_tick()
+        self.assertEqual(self.cloud.calls, calls, "confirmed closure must not be repeated")
+        self.assertEqual(self.storage.cleanup_count, 2)
 
     def test_missing_credentials_still_persist_pause_and_error(self):
         self.storage.state["cloud_b"] = 80
@@ -362,6 +375,7 @@ class R2ManagementTests(unittest.TestCase):
         result = self.service.restore_access(ACCOUNT)
         self.assertTrue(result["ok"])
         self.assertFalse(self.storage.state["access_paused"])
+        self.assertFalse(self.storage.state["shutdown_ok"])
         self.assertTrue(self.storage.state["domains_safe"])
         self.assertTrue(all(self.cloud.domains[host]["enabled"] for host in HOSTS))
         self.assertFalse(self.cloud.domains["other.example.test"]["enabled"])

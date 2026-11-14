@@ -13,7 +13,7 @@ from curl_cffi import requests
 from curl_cffi.requests.exceptions import RequestException
 
 from services.cloudflare_api import CloudflareAPI, CloudflareAPIError
-from services.config import config
+from services.config import IMAGE_STORAGE_LOCK, config
 from services.image_storage_service import image_storage_service
 from services.log_service import log_service
 from services.r2_client import CloudflareR2Client, R2Error
@@ -85,37 +85,36 @@ class R2ManagementService:
 
     def overview(self) -> dict:
         settings = config.get_public_image_storage_settings()
-        accounts = []
-        for account in settings["r2_accounts"]:
-            usage = image_storage_service.account_usage(account["id"])
-            accounts.append({"id": account["id"], "status": image_storage_service.account_status(account["id"]),
-                             "usage": usage, "domains": usage.get("domains", [])})
         from services.image_service import legacy_storage_stats
-        return {"settings": settings, "accounts": accounts, "legacy": legacy_storage_stats()}
+        return {"settings": settings, "accounts": image_storage_service.account_summaries(),
+                "legacy": legacy_storage_stats()}
 
     def save_settings(self, settings: dict) -> dict:
         with self._lock:
-            old = config.get_image_storage_settings()
-            old_accounts = {item["id"]: item for item in old["r2_accounts"]}
-            # General settings can also edit domain/template inputs. Invalidate before saving
-            # so the uploader cannot use a stale protection verdict with new settings.
-            incoming_accounts = settings.get("r2_accounts", old["r2_accounts"])
-            if not isinstance(incoming_accounts, list) or any(
-                not isinstance(item, dict) or not isinstance(item.get("id", ""), str) for item in incoming_accounts
-            ):
-                raise R2ManagementError("R2 账号配置必须是包含字符串 ID 的对象列表")
-            for item in incoming_accounts:
-                account_id = item.get("id", "").strip().lower()
-                previous = old_accounts.get(account_id)
-                if previous and item.get("active_domain_id", previous["active_domain_id"]) != previous["active_domain_id"]:
-                    raise R2ManagementError("当前域名必须通过域名管理手动切换")
-                if previous and any(item.get(key, previous[key]) != previous[key] for key in ("account_id", "bucket")):
-                    image_storage_service.update_r2_usage(account_id, {"complete": False, "error": "存储位置已变更，请重新刷新用量"})
-                if previous and (any(item.get(key, previous.get(key)) != previous.get(key) for key in
-                                     ("account_id", "bucket", "domains", "rate_limit_requests", "restrict_methods"))
-                                 or settings.get("cors_origins", old["cors_origins"]) != old["cors_origins"]):
-                    self._invalidate(account_id)
-            config.update({"image_storage": settings})
+            with IMAGE_STORAGE_LOCK:
+                old = config.get_image_storage_settings()
+                old_accounts = {item["id"]: item for item in old["r2_accounts"]}
+                incoming_accounts = settings.get("r2_accounts", old["r2_accounts"])
+                if not isinstance(incoming_accounts, list) or any(
+                    not isinstance(item, dict) or not isinstance(item.get("id", ""), str) for item in incoming_accounts
+                ):
+                    raise R2ManagementError("R2 账号配置必须是包含字符串 ID 的对象列表")
+                for item in incoming_accounts:
+                    previous = old_accounts.get(item.get("id", "").strip().lower())
+                    if previous and item.get("active_domain_id", previous["active_domain_id"]) != previous["active_domain_id"]:
+                        raise R2ManagementError("当前域名必须通过域名管理手动切换")
+                # Validate/commit first; keep the reservation lock until invalidation
+                # finishes so uploads cannot observe unchecked settings or a rejected edit.
+                config.update({"image_storage": settings})
+                for item in incoming_accounts:
+                    account_id = item.get("id", "").strip().lower()
+                    previous = old_accounts.get(account_id)
+                    if previous and any(item.get(key, previous[key]) != previous[key] for key in ("account_id", "bucket")):
+                        image_storage_service.update_r2_usage(account_id, {"complete": False, "error": "存储位置已变更，请重新刷新用量"})
+                    if previous and (any(item.get(key, previous.get(key)) != previous.get(key) for key in
+                                         ("account_id", "bucket", "domains", "rate_limit_requests", "restrict_methods"))
+                                     or settings.get("cors_origins", old["cors_origins"]) != old["cors_origins"]):
+                        self._invalidate(account_id)
             return self.overview()
 
     def _save_account(self, account: dict) -> None:
@@ -227,7 +226,9 @@ class R2ManagementService:
                     raise R2ManagementError("当前域名必须已启用")
                 account["active_domain_id"] = domain_id
             self._save_account(account)
-            result = next(item for item in self.list_domains(account_id)["items"] if item["id"] == domain_id)
+            result = item
+            if "enabled" in changes:
+                result = next(item for item in self.list_domains(account_id)["items"] if item["id"] == domain_id)
             if old_domain != account["active_domain_id"]:
                 log_service.add("image-storage", "手动切换 R2 图片域名", detail={
                     "account_id": account_id, "old_domain": old_domain, "new_domain": domain_id,
@@ -388,12 +389,16 @@ class R2ManagementService:
         return state
 
     def _mark_budget_paused(self, account: dict, observed_b: int = 0) -> bool:
+        """Persist the pause gate and report whether public closure is still needed."""
         state = image_storage_service.get_r2_usage(account["id"])
         paused = bool(observed_b >= account["b_budget"] or int(state.get("cloud_b", 0)) >= account["b_budget"] or state.get("access_paused"))
         if paused:
             # Persist the application GET/PUT gate even if client creation/credentials fail.
-            image_storage_service.update_r2_usage(account["id"], {"access_paused": True, "domains_safe": False})
-        return paused
+            updates = {"access_paused": True, "domains_safe": False}
+            if not state.get("access_paused"):
+                updates["shutdown_ok"] = False
+            state = image_storage_service.update_r2_usage(account["id"], updates)
+        return paused and state.get("shutdown_ok") is not True
 
     def _enforce_budget(self, account: dict, api: CloudflareAPI, observed_b: int = 0) -> None:
         if self._mark_budget_paused(account, observed_b):
@@ -431,7 +436,7 @@ class R2ManagementService:
                             "error": "", "b_warning": observed_b >= account["b_warn"],
                         })
                     finally:
-                        # Exactly one shutdown attempt, including a failed/incomplete query.
+                        # Only first/unfinished closure needs an attempt, even on query failure.
                         self._enforce_budget(account, api, observed_b)
             except (CloudflareAPIError, R2ManagementError) as exc:
                 message = cloud_error(exc) if isinstance(exc, CloudflareAPIError) else str(exc)
@@ -588,8 +593,8 @@ class R2ManagementService:
                     error = str(exc) if isinstance(exc, R2ManagementError) else cloud_error(exc) if isinstance(exc, (CloudflareAPIError, R2Error)) else "R2 维护失败"
                     image_storage_service.update_r2_usage(account["id"], {"maintenance_error": error})
                     result["accounts"].append({"id": account["id"], "ok": False, "error": error})
-            result["cleanup"] = self.cleanup()
-            return result
+        result["cleanup"] = self.cleanup()
+        return result
 
 
 r2_management_service = R2ManagementService()
