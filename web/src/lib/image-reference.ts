@@ -4,6 +4,12 @@ export function isR2Image(image?: ImageReference): boolean {
   return Boolean(image && (image.image_id || image.storage === "r2"));
 }
 
+export function mergeResolvedImageReference(image: ImageReference | undefined, resolved?: ImageReference & { url: string }) {
+  return resolved
+    ? { ...image, ...resolved, expired: Boolean(resolved.expired), unavailable: Boolean(resolved.unavailable) }
+    : { ...image, url: "", unavailable: true };
+}
+
 export function isImageExpired(image?: ImageReference, now = Date.now()): boolean {
   if (!image) return false;
   if (image.expired) return true;

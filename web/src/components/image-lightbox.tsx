@@ -8,7 +8,7 @@ import { useCachedImageSource } from "@/hooks/use-cached-image-source";
 import { downloadImageSource } from "@/lib/image-cache";
 import { toast } from "sonner";
 import type { ImageReference } from "@/lib/api";
-import { isImageExpired, isImageUnavailable, isR2Image } from "@/lib/image-reference";
+import { isImageExpired, isImageUnavailable, isR2Image, mergeResolvedImageReference } from "@/lib/image-reference";
 import { resolveImageReferences } from "@/lib/image-storage";
 import { cn } from "@/lib/utils";
 
@@ -125,9 +125,8 @@ export function ImageLightbox({
     return () => { active = false; };
   }, [open, imageId, accountId, original, expiresAt]);
   const reference = isR2Image(current)
-    ? resolved && resolved.id === imageId && resolved.original === original
-      ? { ...current, ...resolved.image, expired: Boolean(current?.expired || resolved.image.expired), unavailable: Boolean(current?.unavailable || resolved.image.unavailable) }
-      : { ...current, url: "", unavailable: true }
+    ? mergeResolvedImageReference(current,
+      resolved && resolved.id === imageId && resolved.original === original ? resolved.image : undefined)
     : current;
   const source = isR2Image(current) ? (reference as (ImageReference & { url?: string }))?.url || "" : original;
   const currentImageSrc = useCachedImageSource(source, open && Boolean(current), reference);

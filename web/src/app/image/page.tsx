@@ -30,8 +30,8 @@ import {
   type ImageTask,
 } from "@/lib/api";
 import { clearCachedImages, deleteCachedImageSources, readImageBlob } from "@/lib/image-cache";
-import { imageReference, isImageUnavailable, isR2Image } from "@/lib/image-reference";
-import { applyResolvedReferences, refreshConversationReferences } from "@/lib/image-history";
+import { imageReference, isImageUnavailable, isR2Image, mergeResolvedImageReference } from "@/lib/image-reference";
+import { applyResolvedReferences, getConversationReferences, refreshConversationReferences, resolveHistoryReferences, type ResolvedReference } from "@/lib/image-history";
 import { IMAGE_STORAGE_CHANGED, resolveImageReferences } from "@/lib/image-storage";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { useSettingsStore } from "@/app/settings/store";
@@ -198,17 +198,10 @@ async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: 
   if (isR2Image(image)) {
     const current = (await resolveImageReferences([image])).items[0];
     if (!current?.url || isImageUnavailable(current)) throw new Error("图片已过期或暂不可访问");
-    const blob = await readImageBlob(current.url, current);
-    const file = new File([blob], fileName, { type: blob.type || "image/png" });
-    return { referenceImage: { ...imageReference(current), name: fileName, type: file.type, dataUrl: current.url }, file };
+    return { ...imageReference(current), name: fileName, type: "image/png", dataUrl: current.url };
   }
   const direct = buildReferenceImageFromResult(image, fileName);
-  if (direct) {
-    return {
-      referenceImage: direct,
-      file: dataUrlToFile(direct.dataUrl, direct.name, direct.type),
-    };
-  }
+  if (direct) return direct;
 
   if (!image.url) {
     return null;
@@ -216,13 +209,18 @@ async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: 
   const blob = await readImageBlob(image.url, image);
   const file = new File([blob], fileName, { type: blob.type || "image/png" });
   return {
-    referenceImage: {
-      name: file.name,
-      type: file.type || "image/png",
-      dataUrl: await readFileAsDataUrl(file),
-    },
-    file,
+    name: file.name,
+    type: file.type || "image/png",
+    dataUrl: await readFileAsDataUrl(file),
   };
+}
+
+async function saveRecoveredImageHistory(conversations: ImageConversation[]) {
+  try {
+    await saveImageConversations(conversations);
+  } catch {
+    toast.error("保存本地图片历史失败；当前图片状态仍保留，请检查浏览器存储空间");
+  }
 }
 
 function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage {
@@ -415,7 +413,7 @@ async function syncConversationImageTasks(items: ImageConversation[]) {
   });
 
   if (changed) {
-    await saveImageConversations(normalized);
+    await saveRecoveredImageHistory(normalized);
   }
   return normalized;
 }
@@ -465,7 +463,7 @@ async function recoverConversationHistory(items: ImageConversation[]) {
   });
 
   if (changed) {
-    await saveImageConversations(normalized);
+    await saveRecoveredImageHistory(normalized);
   }
 
   const synced = await syncConversationImageTasks(normalized);
@@ -473,14 +471,16 @@ async function recoverConversationHistory(items: ImageConversation[]) {
   await deleteCachedImageSources(synced.flatMap((conversation) => conversation.turns.flatMap((turn) =>
     [...turn.images.filter(isR2Image).map((image) => image.url), ...turn.referenceImages.filter(isR2Image).map((image) => image.dataUrl)],
   )));
+  let refreshed: ImageConversation[];
   try {
-    const refreshed = await refreshConversationReferences(synced);
-    await saveImageConversations(refreshed);
-    return refreshed;
+    refreshed = await refreshConversationReferences(synced);
   } catch {
     toast.error("R2 历史地址解析失败，暂不加载旧链接；可点击刷新图片链接重试");
-    return applyResolvedReferences(synced, []);
+    const requestedIds = new Set(getConversationReferences(synced).map((image) => image.image_id));
+    return applyResolvedReferences(synced, [], requestedIds);
   }
+  await saveRecoveredImageHistory(refreshed);
+  return refreshed;
 }
 
 
@@ -513,7 +513,6 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [globalImageModel, setGlobalImageModel] = useState<ImageModel>("gpt-image-2");
   const [imageModels, setImageModels] = useState<ImageModel[]>(FALLBACK_IMAGE_MODELS);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
-  const [referenceImageFiles, setReferenceImageFiles] = useState<File[]>([]);
   const [referenceImages, setReferenceImages] = useState<StoredReferenceImage[]>([]);
   const [maskImages, setMaskImages] = useState<StoredReferenceImage[]>([]);
   const [conversations, setConversations] = useState<ImageConversation[]>([]);
@@ -586,47 +585,43 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     if (refreshingReferences.current) return;
     refreshingReferences.current = true;
     setIsRefreshingReferences(true);
-    const snapshot = conversationsRef.current;
-    const requestedIds = new Set(snapshot.flatMap((conversation) => conversation.turns.flatMap((turn) =>
-      [...turn.images, ...turn.referenceImages].filter(isR2Image).map((image) => image.image_id),
-    )));
+    const requested = getConversationReferences(conversationsRef.current, [
+      ...referenceImages,
+      ...(drawingDialog?.mode === "annotate" ? [drawingDialog.image] : []),
+      ...(lightboxOpen ? lightboxImages : []),
+    ]);
+    const requestedIds = new Set(requested.map((image) => image.image_id));
     try {
-      const refreshed = await refreshConversationReferences(snapshot);
-      const references = refreshed.flatMap((conversation) => conversation.turns.flatMap((turn) => [
-        ...turn.images.filter(isR2Image).map((image) => ({ ...imageReference(image), url: image.url || "" })),
-        ...turn.referenceImages.filter(isR2Image).map((image) => ({ ...imageReference(image), url: image.dataUrl })),
-      ]));
-      // 与最新任务状态合并，避免在解析期间覆盖正在完成的任务或删除操作。
-      const next = applyResolvedReferences(conversationsRef.current, references, requestedIds);
+      let references: ResolvedReference[] | undefined;
+      try {
+        references = await resolveHistoryReferences(requested);
+      } catch {
+        toast.error("刷新 R2 图片地址失败，已停止加载旧链接，请重试");
+      }
+      const byId = new Map((references || []).map((image) => [image.image_id, image]));
+      // 与最新任务状态合并，仅更新本次请求的 ID，不覆盖解析期间的新引用或删除操作。
+      const next = applyResolvedReferences(conversationsRef.current, references || [], requestedIds);
       conversationsRef.current = next; setConversations(next);
-      await saveImageConversations(next);
       setReferenceImages((current) => current.map((image) => {
-        const resolved = references.find((item) => item.image_id && item.image_id === image.image_id);
-        return resolved ? { ...image, ...resolved, dataUrl: resolved.url } : image;
+        if (!isR2Image(image) || !requestedIds.has(image.image_id)) return image;
+        const resolved = mergeResolvedImageReference(image, byId.get(image.image_id));
+        return { ...image, ...resolved, dataUrl: resolved.url };
       }));
       setDrawingDialog((current) => {
-        if (current?.mode !== "annotate" || !isR2Image(current.image)) return current;
-        const imageId = current.image.image_id;
-        const resolved = references.find((image) => image.image_id === imageId);
-        return resolved ? { ...current, image: { ...current.image, ...resolved }, source: resolved.url } : current;
+        if (current?.mode !== "annotate" || !isR2Image(current.image) || !requestedIds.has(current.image.image_id)) return current;
+        const resolved = mergeResolvedImageReference(current.image, byId.get(current.image.image_id));
+        return { ...current, image: { ...current.image, ...resolved }, source: resolved.url };
       });
       setLightboxImages((current) => current.map((image) => {
-        if (!image.image_id) return image;
-        const resolved = references.find((item) => item.image_id === image.image_id);
-        return resolved ? { ...image, ...resolved, src: resolved.url } : { ...image, src: "", unavailable: true };
+        if (!isR2Image(image) || !requestedIds.has(image.image_id)) return image;
+        const resolved = mergeResolvedImageReference(image, byId.get(image.image_id));
+        return { ...image, ...resolved, src: resolved.url };
       }));
-    } catch {
-      const next = applyResolvedReferences(conversationsRef.current, [], requestedIds);
-      conversationsRef.current = next; setConversations(next);
-      setLightboxImages((current) => current.map((image) => isR2Image(image) && requestedIds.has(image.image_id) ? { ...image, src: "", unavailable: true } : image));
-      setReferenceImages((current) => current.map((image) => isR2Image(image) ? { ...image, dataUrl: "", unavailable: true } : image));
-      setDrawingDialog((current) => current?.mode === "annotate" && isR2Image(current.image)
-        ? { ...current, source: "", image: { ...current.image, unavailable: true } } : current);
-      toast.error("刷新 R2 图片地址失败，已停止加载旧链接，请重试");
+      if (references) await saveRecoveredImageHistory(next);
     } finally {
       refreshingReferences.current = false; setIsRefreshingReferences(false);
     }
-  }, []);
+  }, [referenceImages, drawingDialog, lightboxOpen, lightboxImages]);
 
   useEffect(() => {
     if (isLoadingHistory) return;
@@ -1047,7 +1042,6 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   const clearComposerInputs = useCallback(() => {
     setImagePrompt("");
-    setReferenceImageFiles([]);
     setReferenceImages([]);
     setMaskImages([]);
     if (fileInputRef.current) {
@@ -1222,7 +1216,6 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         })),
       );
 
-      setReferenceImageFiles((prev) => [...prev, ...files]);
       setReferenceImages((prev) => [...prev, ...previews]);
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
@@ -1245,13 +1238,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   );
 
   const handleRemoveReferenceImage = useCallback((index: number) => {
-    setReferenceImageFiles((prev) => {
-      const next = prev.filter((_, currentIndex) => currentIndex !== index);
-      if (next.length === 0 && fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
-      return next;
-    });
+    if (fileInputRef.current) fileInputRef.current.value = "";
     setReferenceImages((prev) => prev.filter((_, currentIndex) => currentIndex !== index));
     setMaskImages([]);
   }, []);
@@ -1263,7 +1250,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
           "dataUrl" in image
             ? isR2Image(image)
               ? await buildReferenceImageFromStoredImage({ ...image, id: image.image_id || "", url: image.dataUrl }, image.name)
-              : { referenceImage: image, file: await referenceImageToFile(image) }
+              : image
             : await buildReferenceImageFromStoredImage(image, `conversation-${conversationId}-${Date.now()}.png`);
         if (!nextReference) {
           return;
@@ -1271,8 +1258,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
         setSelectedConversationId(conversationId);
 
-        setReferenceImages((prev) => [...prev, nextReference.referenceImage]);
-        setReferenceImageFiles((prev) => [...prev, nextReference.file]);
+        setReferenceImages((prev) => [...prev, nextReference]);
         setMaskImages([]);
         setImagePrompt("");
         textareaRef.current?.focus();
@@ -1307,7 +1293,6 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       const storedDrawing: StoredReferenceImage = { name: file.name, type: file.type || "image/png", dataUrl };
 
       if (drawingDialog.mode === "sketch") {
-        setReferenceImageFiles((current) => [...current, file]);
         setReferenceImages((current) => [...current, storedDrawing]);
         setImagePrompt("");
         textareaRef.current?.focus();
@@ -1323,8 +1308,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         throw new Error("无法读取要标注编辑的图片");
       }
       setSelectedConversationId(drawingDialog.conversationId);
-      setReferenceImageFiles([source.file]);
-      setReferenceImages([source.referenceImage]);
+      setReferenceImages([source]);
       setMaskImages([storedDrawing]);
       setImagePrompt("");
       textareaRef.current?.focus();
@@ -1352,13 +1336,6 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     setImageModel(turn.model);
     setReferenceImages(turn.referenceImages);
     setMaskImages(turn.maskImages);
-    try {
-      setReferenceImageFiles(await Promise.all(turn.referenceImages.map(referenceImageToFile)));
-    } catch (error) {
-      setReferenceImageFiles([]); setReferenceImages([]); setMaskImages([]);
-      toast.error(error instanceof Error ? error.message : "读取参考图失败");
-      return;
-    }
     await updateConversation(conversationId, (current) => ({
       ...(current ?? conversation),
       model: turn.model,
@@ -1772,7 +1749,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       toast.error("参考图已过期或暂不可访问，请刷新链接或移除后重新选择");
       return;
     }
-    const effectiveImageMode: ImageConversationMode = referenceImageFiles.length > 0 ? "edit" : "generate";
+    const effectiveImageMode: ImageConversationMode = referenceImages.length > 0 ? "edit" : "generate";
 
     const targetConversation = selectedConversationId
       ? conversationsRef.current.find((conversation) => conversation.id === selectedConversationId) ?? null
