@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import copy
+import ipaddress
 import json
 import os
+import re
 import sys
 from pathlib import Path
+from threading import RLock
 import time
+from urllib.parse import urlsplit
+from uuid import UUID
 
 from services.storage.base import StorageBackend
 
@@ -14,6 +19,7 @@ DATA_DIR = BASE_DIR / "data"
 CONFIG_FILE = BASE_DIR / "config.json"
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
+IMAGE_STORAGE_LOCK = RLock()
 
 DEFAULT_BACKUP_INCLUDE = {
     "config": True,
@@ -34,7 +40,16 @@ DEFAULT_IMAGE_STORAGE = {
     "webdav_password": "",
     "webdav_root_path": "chatgpt2api/images",
     "public_base_url": "",
+    "retention_minutes": 60,
+    "cleanup_interval_seconds": 60,
+    "usage_refresh_seconds": 300,
+    "usage_max_age_seconds": 900,
+    "cache_ttl_seconds": 60,
+    "cors_origins": ["*"],
+    "r2_accounts": [],
 }
+
+R2_SECRET_FIELDS = ("access_key_id", "secret_access_key", "api_token")
 
 DEFAULT_CHAT_COMPLETION_CACHE = {
     "enabled": True,
@@ -182,14 +197,116 @@ def _normalize_backup_state(value: object) -> dict[str, object]:
     }
 
 
+def _image_storage_int(
+    source: dict, field: str, default: int, *, minimum: int = 1, maximum: int | None = None,
+) -> int:
+    value = source.get(field, default)
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"图片存储 {field} 必须是整数")
+    try:
+        number = int(value)
+    except ValueError:
+        raise ValueError(f"图片存储 {field} 必须是整数") from None
+    if number < minimum or (maximum is not None and number > maximum):
+        raise ValueError(f"图片存储 {field} 超出允许范围")
+    return number
+
+
+def _r2_text(source: dict, field: str, default: str = "") -> str:
+    value = source.get(field, default)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"R2 {field} 必须是字符串")
+    return value.strip()
+
+
+def _r2_bool(source: dict, field: str, default: bool) -> bool:
+    value = source.get(field, default)
+    if isinstance(value, bool) or (isinstance(value, int) and value in {0, 1}):
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in {"1", "0", "true", "false", "yes", "no", "on", "off"}:
+        return _normalize_bool(value)
+    raise ValueError(f"R2 {field} 必须是布尔值")
+
+
+def _normalize_r2_account(source: object) -> dict[str, object]:
+    if not isinstance(source, dict):
+        raise ValueError("R2 账号必须是对象")
+    domains = source.get("domains", [])
+    if not isinstance(domains, list):
+        raise ValueError("R2 domains 必须是列表")
+    normalized_domains = []
+    for domain in domains:
+        if not isinstance(domain, dict):
+            raise ValueError("R2 域名必须是对象")
+        hostname = _r2_text(domain, "domain").lower()
+        normalized_domains.append({
+            "id": _r2_text(domain, "id", hostname).lower(),
+            "domain": hostname,
+            "zone_id": _r2_text(domain, "zone_id").lower(),
+            "enabled": _r2_bool(domain, "enabled", False),
+        })
+    return {
+        "id": _r2_text(source, "id").lower(),
+        "name": _r2_text(source, "name"),
+        "enabled": _r2_bool(source, "enabled", True),
+        "account_id": _r2_text(source, "account_id").lower(),
+        "bucket": _r2_text(source, "bucket"),
+        **{field: _r2_text(source, field) for field in R2_SECRET_FIELDS},
+        "capacity_bytes": _image_storage_int(source, "capacity_bytes", 8_000_000_000),
+        "a_budget": _image_storage_int(source, "a_budget", 800_000),
+        "b_warn": _image_storage_int(source, "b_warn", 7_000_000, minimum=0),
+        "b_budget": _image_storage_int(source, "b_budget", 8_000_000),
+        "billing_cycle_day": _image_storage_int(source, "billing_cycle_day", 1, maximum=28),
+        "billing_cycle_confirmed": _r2_bool(source, "billing_cycle_confirmed", False),
+        "active_domain_id": _r2_text(source, "active_domain_id").lower(),
+        "domains": normalized_domains,
+        "rate_limit_requests": _image_storage_int(source, "rate_limit_requests", 120),
+        "restrict_methods": _r2_bool(source, "restrict_methods", True),
+    }
+
+
+def _normalize_image_cors_origins(value: object) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError("图片存储 cors_origins 必须是列表")
+    origins = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError("图片存储 CORS 必须是 HTTP/HTTPS Origin 或 *")
+        origin = item.strip()
+        if origin != "*":
+            try:
+                parsed = urlsplit(origin)
+                valid = (
+                    parsed.scheme in {"http", "https"} and parsed.hostname
+                    and parsed.username is None and parsed.password is None
+                    and parsed.path in {"", "/"} and not parsed.query and not parsed.fragment
+                    and (parsed.port is None or 1 <= parsed.port <= 65535)
+                    and "\\" not in origin and not any(char.isspace() for char in origin)
+                )
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError("图片存储 CORS 必须是 HTTP/HTTPS Origin 或 *") from None
+            origin = f"{parsed.scheme}://{parsed.netloc.lower()}"
+        if origin not in origins:
+            origins.append(origin)
+    return origins
+
+
 def _normalize_image_storage_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
     mode = str(source.get("mode") or "local").strip().lower()
-    if mode not in {"local", "webdav", "both"}:
+    if mode not in {"local", "webdav", "both", "r2"}:
         mode = "local"
     enabled = _normalize_bool(source.get("enabled"), False)
-    if not enabled:
+    # Never silently turn a misconfigured R2 mode into local persistence.
+    if not enabled and mode != "r2":
         mode = "local"
+    accounts = source.get("r2_accounts", [])
+    if not isinstance(accounts, list):
+        raise ValueError("图片存储 r2_accounts 必须是列表")
     root_path = str(source.get("webdav_root_path") or DEFAULT_IMAGE_STORAGE["webdav_root_path"]).strip().strip("/")
     return {
         "enabled": enabled,
@@ -199,7 +316,36 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         "webdav_password": str(source.get("webdav_password") or "").strip(),
         "webdav_root_path": root_path or str(DEFAULT_IMAGE_STORAGE["webdav_root_path"]),
         "public_base_url": str(source.get("public_base_url") or "").strip().rstrip("/"),
+        **{
+            field: _image_storage_int(source, field, DEFAULT_IMAGE_STORAGE[field])
+            for field in ("retention_minutes", "cleanup_interval_seconds", "usage_refresh_seconds", "usage_max_age_seconds")
+        },
+        "cache_ttl_seconds": _image_storage_int(source, "cache_ttl_seconds", 60, minimum=0),
+        "cors_origins": _normalize_image_cors_origins(source.get("cors_origins", ["*"])),
+        "r2_accounts": [_normalize_r2_account(account) for account in accounts],
     }
+
+
+def _merge_image_storage_settings(previous: dict, incoming: object) -> dict[str, object]:
+    if not isinstance(incoming, dict):
+        raise ValueError("image_storage 必须是对象")
+    merged = {**previous, **incoming}
+    if "r2_accounts" in incoming:
+        if not isinstance(incoming["r2_accounts"], list):
+            raise ValueError("图片存储 r2_accounts 必须是列表")
+        old_accounts = {account["id"]: account for account in previous["r2_accounts"]}
+        accounts = []
+        for account in incoming["r2_accounts"]:
+            if not isinstance(account, dict):
+                raise ValueError("R2 账号必须是对象")
+            old = old_accounts.get(_r2_text(account, "id").lower(), {})
+            updated = {**old, **account}
+            for field in R2_SECRET_FIELDS:
+                if not _r2_text(account, field):
+                    updated[field] = old.get(field, "")
+            accounts.append(updated)
+        merged["r2_accounts"] = accounts
+    return _normalize_image_storage_settings(merged)
 
 
 def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object]:
@@ -328,13 +474,80 @@ def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
     }
 
 
+def _validate_r2_hostname(hostname: str) -> None:
+    labels = hostname.split(".")
+    valid = (
+        len(hostname) <= 253 and len(labels) >= 2
+        and not labels[-1].isdigit()
+        and all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels)
+    )
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        valid = False
+    if not valid:
+        raise ValueError("R2 domain 必须是 HTTPS 主机名，不能包含协议、路径、端口或 IP 地址")
+
+
 def _validate_image_storage_settings(settings: dict[str, object]) -> None:
-    if not _normalize_bool(settings.get("enabled"), False):
-        return
-    if not str(settings.get("webdav_url") or "").strip():
-        raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV URL")
-    if not str(settings.get("webdav_password") or "").strip():
-        raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV 密码")
+    if settings["mode"] == "r2" and not settings["enabled"]:
+        raise ValueError("R2 图片存储必须设置 enabled=true")
+    if settings["enabled"] and settings["mode"] in {"webdav", "both"}:
+        if not settings["webdav_url"]:
+            raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV URL")
+        if not settings["webdav_password"]:
+            raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV 密码")
+
+    internal_ids: set[str] = set()
+    cf_ids: set[str] = set()
+    all_domains: set[str] = set()
+    for account in settings["r2_accounts"]:
+        internal_id = account["id"]
+        try:
+            valid_id = str(UUID(internal_id)) == internal_id
+        except ValueError:
+            valid_id = False
+        if not valid_id:
+            raise ValueError("R2 账号 id 必须是稳定的 UUID")
+        if internal_id in internal_ids:
+            raise ValueError("R2 账号 id 不得重复")
+        internal_ids.add(internal_id)
+        cf_id = account["account_id"]
+        if cf_id and not re.fullmatch(r"[a-f0-9]{32}", cf_id):
+            raise ValueError("R2 account_id 必须是 32 位十六进制 CF Account ID")
+        if cf_id:
+            if cf_id in cf_ids:
+                raise ValueError("R2 CF Account ID 不得重复")
+            cf_ids.add(cf_id)
+        if account["bucket"] and not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", account["bucket"]):
+            raise ValueError("R2 bucket 必须是 3～63 位小写字母、数字或连字符，首尾不能是连字符")
+        for field in R2_SECRET_FIELDS:
+            if account[field] and not account[field].strip("*"):
+                raise ValueError(f"R2 {field} 不能使用密钥掩码；留空以保留已有凭据")
+        if account["enabled"]:
+            for field in ("account_id", "bucket", *R2_SECRET_FIELDS):
+                if not account[field]:
+                    raise ValueError(f"启用 R2 账号前必须填写 {field}；未配置完成可保存为禁用草稿")
+        if account["b_warn"] > account["b_budget"]:
+            raise ValueError("R2 b_warn 不能超过 b_budget")
+        if len(account["domains"]) > 100:
+            raise ValueError("每个 R2 桶最多配置 100 个自定义域名")
+        domain_ids: set[str] = set()
+        for domain in account["domains"]:
+            hostname = domain["domain"]
+            _validate_r2_hostname(hostname)
+            if domain["id"] != hostname:
+                raise ValueError("R2 domain id 必须与域名相同")
+            if not re.fullmatch(r"[a-f0-9]{32}", domain["zone_id"]):
+                raise ValueError("R2 zone_id 必须是 32 位十六进制 Zone ID")
+            if hostname in all_domains:
+                raise ValueError("R2 domain 不得重复")
+            all_domains.add(hostname)
+            domain_ids.add(hostname)
+        if account["active_domain_id"] and account["active_domain_id"] not in domain_ids:
+            raise ValueError("R2 active_domain_id 必须引用已配置的域名")
 
 
 def _normalize_auth_key(value: object) -> str:
@@ -666,7 +879,7 @@ class ConfigStore:
         data["default_upstream_model_name"] = self.default_upstream_model_name
         data["default_thinking_effort"] = self.default_thinking_effort
         data["backup"] = self.get_backup_settings()
-        data["image_storage"] = self.get_image_storage_settings()
+        data["image_storage"] = self.get_public_image_storage_settings()
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
         data["third_party_apps"] = self.get_third_party_apps_settings()
@@ -695,6 +908,12 @@ class ConfigStore:
         return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
 
     def update(self, data: dict[str, object]) -> dict[str, object]:
+        # Share the uploader's reservation lock: validation and publishing a new
+        # bucket/account configuration must be atomic with creating pending items.
+        with IMAGE_STORAGE_LOCK:
+            return self._update(data)
+
+    def _update(self, data: dict[str, object]) -> dict[str, object]:
         incoming = dict(data or {})
         next_data = dict(self.data)
         next_data.update(incoming)
@@ -713,9 +932,16 @@ class ConfigStore:
         )
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
-        if "image_storage" in next_data:
-            next_data["image_storage"] = _normalize_image_storage_settings(next_data.get("image_storage"))
+        if "image_storage" in incoming:
+            next_data["image_storage"] = _merge_image_storage_settings(
+                self.get_image_storage_settings(), incoming["image_storage"],
+            )
             _validate_image_storage_settings(next_data["image_storage"])
+            # Import only on an explicit edit, after config's singleton is initialized.
+            # The storage service owns the outstanding (including pending) object index.
+            from services.image_storage_service import image_storage_service
+
+            image_storage_service.validate_settings_change(next_data["image_storage"])
         if "chat_completion_cache" in next_data:
             next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
                 next_data.get("chat_completion_cache")
@@ -740,7 +966,16 @@ class ConfigStore:
         return _normalize_backup_settings(self.data.get("backup"))
 
     def get_image_storage_settings(self) -> dict[str, object]:
+        """Private settings for storage clients; never return this from an API."""
         return _normalize_image_storage_settings(self.data.get("image_storage"))
+
+    def get_public_image_storage_settings(self) -> dict[str, object]:
+        settings = self.get_image_storage_settings()
+        for account in settings["r2_accounts"]:
+            for field in R2_SECRET_FIELDS:
+                account[f"has_{field}"] = bool(account[field])
+                account[field] = ""
+        return settings
 
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
         return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,9 +12,9 @@ from services.image_storage_service import ImageStorageService
 
 
 def png_bytes() -> bytes:
-    path = Path(tempfile.gettempdir()) / "chatgpt2api-test-image.png"
-    Image.new("RGB", (2, 2), color=(255, 0, 0)).save(path, format="PNG")
-    return path.read_bytes()
+    output = io.BytesIO()
+    Image.new("RGB", (2, 2), color=(255, 0, 0)).save(output, format="PNG")
+    return output.getvalue()
 
 
 class FakeWebDAVClient:
@@ -47,6 +48,9 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.data_dir = Path(self.tmp.name)
         self.images_dir = self.data_dir / "images"
+        data_patcher = mock.patch("services.image_storage_service.DATA_DIR", self.data_dir)
+        data_patcher.start()
+        self.addCleanup(data_patcher.stop)
         self.settings = {
             "enabled": False,
             "mode": "local",
