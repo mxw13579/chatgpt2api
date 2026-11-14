@@ -103,6 +103,10 @@ docker compose logs --tail=100 app
 
 此流程只更新主应用容器，不重新部署数据库。生产环境也可以将 `latest` 换成版本标签，或 Actions Summary 中的 `ghcr.io/mxw13579/chatgpt2api@sha256:...` 引用，以固定版本和便于回滚。
 
+### 1.9.7 升级注意
+
+保留现有存储配置，不会自动启用 R2、迁移或删除旧图片。Images 默认及 `b64_json`、Chat/Responses 图片不再保存；需要持久化链接时显式使用 `response_format=url`，网页图片任务继续保存。R2 需要在「设置 → 图片存储」中配置，先完成测试桶权限、统计、域名、防护及缓存验收，再启用分配，详见 [R2 图片存储](r2-image-storage.md)。升级前备份配置、数据库、图片索引及任务记录；应用更新无需重建 PostgreSQL。
+
 ### 1.9.6 升级注意
 
 账号热路径改为按键增量持久化，无需数据库 schema 迁移。业务日志开始分片轮转，完成的账号刷新/重登进度增加 TTL 与容量限制。默认仍按单进程运行；升级前备份需要长期保留的日志，并为 Docker stdout 设置独立轮转。详细默认值、兼容边界及回滚说明见[存储、日志与进度保留](performance-and-retention.md)。
