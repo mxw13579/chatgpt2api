@@ -141,6 +141,24 @@ class ChatImageCompatTests(unittest.TestCase):
                 self.assertEqual(choice["finish_reason"], "stop")
         self.assert_no_text_path()
 
+    def test_chat_base64_pipeline_never_calls_image_storage(self) -> None:
+        from services.protocol import conversation
+
+        def generate(request):
+            yield image_output(data=conversation._format_image_bytes(
+                IMAGE_BYTES[:1], request.prompt, request.response_format, request.base_url,
+            ))
+
+        self.pool.side_effect = generate
+        with mock.patch.object(conversation.image_storage_service, "save") as save:
+            for stream in (False, True):
+                with self.subTest(stream=stream):
+                    result = chat.handle({"model": MODEL, "prompt": PROMPT, "stream": stream})
+                    content = collect_chat_content(result) if stream else result["choices"][0]["message"]["content"]
+                    self.assertIn(IMAGE_URLS[0], content)
+            save.assert_not_called()
+        self.assert_no_text_path()
+
     def test_prompt_and_responses_input_are_accepted_on_chat_image_path(self) -> None:
         payloads = [
             {"prompt": PROMPT},

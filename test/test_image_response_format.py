@@ -53,4 +53,7 @@ def test_images_return_only_the_selected_format(monkeypatch, path, handler, resp
         data = response.json()["data"]
     expected = {"url": IMAGE_URL} if response_format == "url" else {"b64_json": PNG_B64}
     assert data == [{**expected, "revised_prompt": "draw"}]
-    save.assert_called_once()
+    if response_format == "url":
+        save.assert_called_once()
+    else:
+        save.assert_not_called()

@@ -83,6 +83,28 @@ class ResponsesImageCompatTests(unittest.TestCase):
         self.text_backend.assert_not_called()
         self.cache.get_or_compute_stream.assert_not_called()
 
+    def test_responses_base64_pipeline_never_calls_image_storage(self) -> None:
+        from services.protocol import conversation
+
+        def generate(request):
+            yield ImageOutput(
+                kind="result", model=request.model, index=1, total=1,
+                data=conversation.format_image_result(
+                    [{"b64_json": PNG_FIRST}], request.prompt, request.response_format, request.base_url,
+                )["data"],
+            )
+
+        self.pool.side_effect = generate
+        with mock.patch.object(conversation.image_storage_service, "save") as save:
+            for stream in (False, True):
+                with self.subTest(stream=stream):
+                    response = responses.handle({"model": MODEL, "input": PROMPT, "stream": stream})
+                    if stream:
+                        response = list(response)[-1]["response"]
+                    self.assertEqual(response["output"][0]["result"], PNG_FIRST)
+            save.assert_not_called()
+        self.text_backend.assert_not_called()
+
     def test_routing_delegates_to_shared_image_classifier(self) -> None:
         body = {"model": MODEL, "input": PROMPT}
         for is_image in (False, True):

@@ -558,7 +558,7 @@ class ImageCompatTests(unittest.TestCase):
         self.assertEqual(outputs[1].data, [{"b64_json": PNG_B64, "revised_prompt": "synthetic"}])
         self.assertEqual(result, before)
 
-    def test_upstream_base64_is_validated_once_when_saved(self) -> None:
+    def test_upstream_base64_is_validated_once_and_only_url_is_saved(self) -> None:
         for response_format in ("b64_json", "url"):
             with self.subTest(response_format=response_format), mock.patch.object(
                 conversation, "save_image_bytes", return_value="https://synthetic.invalid/image.png",
@@ -575,7 +575,10 @@ class ImageCompatTests(unittest.TestCase):
                 else:
                     self.assertEqual(data, [{"url": "https://synthetic.invalid/image.png", "revised_prompt": "draw"}])
                 decode.assert_called_once_with(PNG_B64, validate=True)
-                save.assert_called_once_with(PNG_BYTES, None)
+                if response_format == "url":
+                    save.assert_called_once_with(PNG_BYTES, None)
+                else:
+                    save.assert_not_called()
 
     def test_formatted_images_keep_item_prompts_and_result_metadata(self) -> None:
         items = [
@@ -596,7 +599,7 @@ class ImageCompatTests(unittest.TestCase):
                 {response_format: value, "revised_prompt": prompt}
                 for value, prompt in zip(values, ("first", "second", " draw "))
             ]})
-            self.assertEqual(save.call_args_list, [mock.call(PNG_BYTES, "https://synthetic.invalid")] * 3)
+            self.assertEqual(save.call_args_list, [mock.call(PNG_BYTES, "https://synthetic.invalid")] * 3 if response_format == "url" else [])
             self.assertEqual(items, before)
             self.assertEqual(
                 conversation.format_image_result([], "draw", response_format, created=123, message="no image"),
@@ -620,7 +623,10 @@ class ImageCompatTests(unittest.TestCase):
                         [{"b64_json": PNG_B64}, {"b64_json": "invalid!"}], "draw", response_format,
                     )
                 self.assertEqual(caught.exception.code, "no_image_generated")
-                save.assert_called_once_with(PNG_BYTES, None)
+                if response_format == "url":
+                    save.assert_called_once_with(PNG_BYTES, None)
+                else:
+                    save.assert_not_called()
 
     def test_blank_upstream_images_cannot_become_successful_results(self) -> None:
         for encoded in ("", " "):

@@ -10,6 +10,7 @@ from typing import Any
 
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
+from services.image_storage_service import image_storage_service
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 
@@ -61,6 +62,23 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
     return urls
 
 
+def _stored_image_data(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """New task results contain references, never embedded image payloads."""
+    stored = []
+    for item in data:
+        if not isinstance(item, dict) or "b64_json" in item:
+            raise ValueError("image tasks require URL results, not embedded image payloads")
+        url = _clean(item.get("url"))
+        if not url or url.lower().startswith("data:"):
+            raise ValueError("image tasks require URL results, not embedded image payloads")
+        reference = image_storage_service.reference_for_url(url)
+        result = dict(reference) if reference is not None else {"url": url}
+        if "revised_prompt" in item:
+            result["revised_prompt"] = item["revised_prompt"]
+        stored.append(result)
+    return stored
+
+
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     item = {
         "id": task.get("id"),
@@ -75,7 +93,11 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     if task.get("conversation_id"):
         item["conversation_id"] = task.get("conversation_id")
     if task.get("data") is not None:
-        item["data"] = task.get("data")
+        item["data"] = [
+            {**image, **image_storage_service.resolve_reference(image)}
+            if isinstance(image, dict) and image.get("image_id") else image
+            for image in task["data"]
+        ]
     if task.get("usage") is not None:
         item["usage"] = task.get("usage")
     if task.get("error"):
@@ -351,10 +373,40 @@ class ImageTaskService:
             task = self._tasks.get(key)
             if task is None:
                 return
+            if "data" in updates:
+                updates["data"] = _stored_image_data(updates["data"])
             task.update(updates)
             task["updated_at"] = _now_iso()
             task["updated_ts"] = time.time()
             self._save_locked()
+
+    def clear_legacy_image_payloads(self) -> dict[str, int]:
+        """Explicit administrator cleanup only; ordinary reads/writes keep old data."""
+        changed_tasks = removed_payloads = 0
+        with self._lock:
+            for task in self._tasks.values():
+                changed = False
+                data = []
+                for image in task.get("data", []):
+                    if not isinstance(image, dict):
+                        data.append(image)
+                        continue
+                    cleaned = dict(image)
+                    removed = "b64_json" in cleaned
+                    cleaned.pop("b64_json", None)
+                    if _clean(cleaned.get("url")).lower().startswith("data:"):
+                        cleaned.pop("url")
+                        removed = True
+                    if removed:
+                        removed_payloads += 1
+                        changed = True
+                    data.append(cleaned)
+                if changed:
+                    task["data"] = data
+                    changed_tasks += 1
+            if changed_tasks:
+                self._save_locked()
+        return {"tasks": changed_tasks, "payloads": removed_payloads}
 
     def _load_locked(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
@@ -485,7 +537,7 @@ class ImageTaskService:
         backend = None
         try:
             from services.openai_backend_api import OpenAIBackendAPI
-            from services.protocol.conversation import format_image_result
+            from services.protocol.conversation import _format_image_bytes
 
             backend = OpenAIBackendAPI(proxy_url=config.proxy_url or None)
             file_ids, sediment_ids = backend._poll_image_results(
@@ -503,22 +555,13 @@ class ImageTaskService:
             if not image_urls:
                 raise RuntimeError("图片 URL 解析失败")
 
-            image_items = [
-                {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
-                for image_data in backend.download_image_bytes(image_urls)
-            ]
-            # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
-            with self._lock:
-                task = self._tasks.get(key)
-                quality = _clean(task.get("quality"), "auto") if task else "auto"
-                size = _clean(task.get("size")) if task else None
-            data = format_image_result(
-                image_items,
-                "",  # prompt 已不重要，结果已经拿到了
-                "b64_json",
+            data = _format_image_bytes(
+                backend.download_image_bytes(image_urls),
                 "",
-                int(time.time()),
-            )["data"]
+                "url",
+            )
+            if not data:
+                raise RuntimeError("图片下载结果为空")
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
             self._log_call(
                 identity,

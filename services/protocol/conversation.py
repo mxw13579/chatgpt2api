@@ -328,12 +328,11 @@ def _format_image_result_item(
     base_url: str | None,
     b64_json: str = "",
 ) -> dict[str, Any]:
-    image_url = save_image_bytes(image_data, base_url)
     result_item = {"revised_prompt": revised_prompt}
     if response_format == "b64_json":
         result_item["b64_json"] = b64_json or base64.b64encode(image_data).decode("ascii")
     else:
-        result_item["url"] = image_url
+        result_item["url"] = save_image_bytes(image_data, base_url)
     return result_item
 
 
@@ -363,7 +362,7 @@ def format_image_result(
         b64_json = str(item.get("b64_json") or "").strip()
         if not b64_json:
             continue
-        # Decode upstream data once, at the same boundary that saves the image.
+        # Validate upstream data once; only URL responses persist the decoded bytes.
         try:
             image_data = base64.b64decode(b64_json, validate=True)
         except (ValueError, binascii.Error):
@@ -1932,6 +1931,11 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
     if not is_supported_image_model(request.model):
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(supported_image_models())))
+
+    if request.response_format == "url":
+        # Avoid spending an upstream generation when storage is already unavailable.
+        # The actual byte-size reservation is still made immediately before PUT.
+        image_storage_service.require_upload_available()
 
     if request.n <= 1:
         # 单张图片，直接执行（无需线程池开销）

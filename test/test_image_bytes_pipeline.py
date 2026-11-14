@@ -78,7 +78,7 @@ class ImageBytesOutputTests(unittest.TestCase):
                         ("result", "gpt-image-2", 2, 3, 123, "synthetic-conversation"),
                     )
                     self.assertEqual(output.to_chunk()["_conversation_id"], "synthetic-conversation")
-                    self.assertEqual(self.save.call_args_list, [mock.call(data, BASE_URL) for data in IMAGE_BYTES])
+                    self.assertEqual(self.save.call_args_list, [mock.call(data, BASE_URL) for data in IMAGE_BYTES] if key == "url" else [])
                     self.assertEqual(encode.call_args_list, [] if key == "url" else [mock.call(data) for data in IMAGE_BYTES])
                     self.backend.download_image_bytes.assert_called_once_with(IMAGE_URLS)
                     self.assertEqual(self.backend._poll_image_results.call_count, int(branch != "direct"))
@@ -105,10 +105,16 @@ class ImageBytesOutputTests(unittest.TestCase):
                     self.save.side_effect = [IMAGE_URLS[0], failure]
                     request = conversation.ConversationRequest(prompt="draw", response_format=response_format)
                     outputs = conversation.stream_image_outputs(self.backend, request)
-                    with self.assertRaises(RuntimeError) as caught:
-                        next(outputs)
-                    self.assertIs(caught.exception, failure)
-                    self.assertEqual(self.save.call_count, 0 if stage == "download" else 2)
+                    if stage == "storage" and response_format == "b64_json":
+                        self.assertEqual(list(outputs)[0].data, [
+                            {"b64_json": value, "revised_prompt": "draw"} for value in IMAGE_B64
+                        ])
+                        self.save.assert_not_called()
+                    else:
+                        with self.assertRaises(RuntimeError) as caught:
+                            next(outputs)
+                        self.assertIs(caught.exception, failure)
+                        self.assertEqual(self.save.call_count, 0 if stage == "download" else 2)
 
     def test_codex_still_decodes_at_boundary_without_reencoding(self) -> None:
         for response_format in (None, "b64_json", "url"):
@@ -133,7 +139,10 @@ class ImageBytesOutputTests(unittest.TestCase):
                 self.assertEqual(outputs[0].data, [{request.response_format: value, "revised_prompt": "draw"}])
                 self.assertEqual((outputs[0].model, outputs[0].index, outputs[0].total), (request.model, 2, 3))
                 decode.assert_called_once_with(IMAGE_B64[0], validate=True)
-                self.save.assert_called_once_with(IMAGE_BYTES[0], BASE_URL)
+                if request.response_format == "url":
+                    self.save.assert_called_once_with(IMAGE_BYTES[0], BASE_URL)
+                else:
+                    self.save.assert_not_called()
 
 
 class ImageBytesUploadTests(unittest.TestCase):
