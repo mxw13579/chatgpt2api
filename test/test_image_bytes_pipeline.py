@@ -142,7 +142,7 @@ class ImageBytesOutputTests(unittest.TestCase):
                 self.assertEqual((outputs[0].model, outputs[0].index, outputs[0].total), (request.model, 2, 3))
                 decode.assert_called_once_with(IMAGE_B64[0], validate=True)
                 if request.response_format == "url":
-                    self.save.assert_called_once_with(IMAGE_BYTES[0], BASE_URL)
+                    self.save.assert_called_once_with(IMAGE_BYTES[0])
                 else:
                     self.save.assert_not_called()
 
