@@ -9,13 +9,9 @@ import { useAuthGuard } from "@/lib/use-auth-guard";
 import { BackupSettingsCard } from "./components/backup-settings-card";
 import { ApiDocsCard } from "./components/api-docs-card";
 import { ConfigCard } from "./components/config-card";
-import { CPAPoolDialog } from "./components/cpa-pool-dialog";
-import { CPAPoolsCard } from "./components/cpa-pools-card";
-import { ImportBrowserDialog } from "./components/import-browser-dialog";
 import { ImageStorageCard } from "./components/image-storage-card";
 import { ProxyRuntimeCard } from "./components/proxy-runtime-card";
 import { SettingsHeader } from "./components/settings-header";
-import { Sub2APIConnections } from "./components/sub2api-connections";
 import { ThirdPartyAppsCard } from "./components/third-party-apps-card";
 import { UserKeysCard } from "./components/user-keys-card";
 import { useSettingsStore } from "./store";
@@ -28,16 +24,12 @@ const settingsTabs = [
   { value: "api-docs", title: "接口接入" },
   { value: "canvas", title: "画布入口" },
   { value: "proxy", title: "FlareSolverr" },
-  { value: "cpa", title: "CPA" },
-  { value: "sub2api", title: "Sub2API" },
 ];
 
 function SettingsDataController() {
   const didLoadRef = useRef(false);
   const initialize = useSettingsStore((state) => state.initialize);
-  const loadPools = useSettingsStore((state) => state.loadPools);
   const loadBackups = useSettingsStore((state) => state.loadBackups);
-  const pools = useSettingsStore((state) => state.pools);
   const backupState = useSettingsStore((state) => state.backupState);
 
   useEffect(() => {
@@ -47,21 +39,6 @@ function SettingsDataController() {
     didLoadRef.current = true;
     void initialize();
   }, [initialize]);
-
-  useEffect(() => {
-    const hasRunningJobs = pools.some((pool) => {
-      const status = pool.import_job?.status;
-      return status === "pending" || status === "running";
-    });
-    if (!hasRunningJobs) {
-      return;
-    }
-
-    const timer = window.setInterval(() => {
-      void loadPools(true);
-    }, 1500);
-    return () => window.clearInterval(timer);
-  }, [loadPools, pools]);
 
   useEffect(() => {
     if (!backupState?.running) {
@@ -112,15 +89,7 @@ function SettingsPageContent() {
         <TabsContent value="api-docs">
           <ApiDocsCard />
         </TabsContent>
-        <TabsContent value="cpa">
-          <CPAPoolsCard />
-        </TabsContent>
-        <TabsContent value="sub2api">
-          <Sub2APIConnections />
-        </TabsContent>
       </Tabs>
-      <CPAPoolDialog />
-      <ImportBrowserDialog />
     </>
   );
 }

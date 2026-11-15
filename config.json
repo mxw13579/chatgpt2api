@@ -1,6 +1,6 @@
 {
   "auth-key": "chatgpt2api",
-  "refresh_account_interval_minute": 5,
+  "refresh_account_interval_minute": 30,
   "image_poll_timeout_secs": 120,
   "auto_remove_rate_limited_accounts": false,
   "auto_remove_invalid_accounts": true,
@@ -41,13 +41,6 @@
   "strip_ui_markup": true,
   "stream_variant_policy": "extend",
   "upstream_variant_purpose": "comparison_implicit",
-  "ai_review": {
-    "enabled": false,
-    "base_url": "",
-    "api_key": "",
-    "model": "",
-    "prompt": ""
-  },
   "backup": {
     "enabled": false,
     "provider": "cloudflare_r2",
@@ -62,8 +55,6 @@
     "passphrase": "",
     "include": {
       "config": true,
-      "cpa": true,
-      "sub2api": true,
       "logs": true,
       "accounts_snapshot": true,
       "auth_keys_snapshot": true

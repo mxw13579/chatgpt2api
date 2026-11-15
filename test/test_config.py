@@ -26,7 +26,7 @@ class ConfigLoadingTests(unittest.TestCase):
                 store = config_module.ConfigStore(config_dir)
 
                 self.assertEqual(store.auth_key, os_auth_key)
-                self.assertEqual(store.refresh_account_interval_minute, 5)
+                self.assertEqual(store.refresh_account_interval_minute, 30)
                 self.assertTrue(data_dir.is_dir())
 
     def test_config_store_auth_key_precedence_and_validation(self) -> None:

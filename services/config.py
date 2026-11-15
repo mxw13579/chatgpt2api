@@ -21,8 +21,6 @@ IMAGE_STORAGE_LOCK = RLock()
 
 DEFAULT_BACKUP_INCLUDE = {
     "config": True,
-    "cpa": True,
-    "sub2api": True,
     "logs": True,
     "accounts_snapshot": True,
     "auth_keys_snapshot": True,
@@ -490,9 +488,9 @@ class ConfigStore:
     @property
     def refresh_account_interval_minute(self) -> int:
         try:
-            return int(self.data.get("refresh_account_interval_minute", 5))
+            return int(self.data.get("refresh_account_interval_minute", 30))
         except (TypeError, ValueError):
-            return 5
+            return 30
 
     @property
     def image_poll_timeout_secs(self) -> int:
@@ -669,11 +667,6 @@ class ConfigStore:
         return [word for item in words if (word := str(item or "").strip())] if isinstance(words, list) else []
 
     @property
-    def ai_review(self) -> dict[str, object]:
-        value = self.data.get("ai_review")
-        return value if isinstance(value, dict) else {}
-
-    @property
     def global_system_prompt(self) -> str:
         return str(self.data.get("global_system_prompt") or "").strip()
 
@@ -723,7 +716,6 @@ class ConfigStore:
         data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh
         data["log_levels"] = self.log_levels
         data["sensitive_words"] = self.sensitive_words
-        data["ai_review"] = self.ai_review
         data["global_system_prompt"] = self.global_system_prompt
         data["default_upstream_model_name"] = self.default_upstream_model_name
         data["default_thinking_effort"] = self.default_thinking_effort

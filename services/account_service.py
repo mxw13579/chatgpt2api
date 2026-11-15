@@ -1392,7 +1392,7 @@ class AccountService:
             "last_invalid_at": None,
             "last_refresh_error": None,
             "last_refresh_error_at": None,
-        })
+        }, quiet=True)
 
     # ---- 有界进度缓存（两个任务类型共用实例锁与容量） ----
 

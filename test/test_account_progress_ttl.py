@@ -534,7 +534,7 @@ class ProgressAPIRaceTests(unittest.TestCase):
                 response = asyncio.run(self.post(path)(body, "fixture-admin"))
                 self.assertEqual(response, {"progress_id": "fixture-job"})
                 poll = self.routes[("GET", f"/api/accounts/{path}/progress/{{progress_id}}")]
-                progress = asyncio.run(poll("fixture-job", "fixture-admin"))
+                progress = poll("fixture-job", "fixture-admin")
                 self.assertEqual(progress["total"], 1)
                 self.assertEqual(progress["processed"], 0)
                 self.assertFalse(progress["done"])
@@ -568,7 +568,7 @@ class ProgressAPIRaceTests(unittest.TestCase):
         for path in ("refresh", "re-login"):
             poll = self.routes[("GET", f"/api/accounts/{path}/progress/{{progress_id}}")]
             with self.assertRaises(HTTPException) as caught:
-                asyncio.run(poll("expired", "fixture-admin"))
+                poll("expired", "fixture-admin")
             self.assertEqual(caught.exception.status_code, 404)
 
     def test_background_failure_is_recorded_without_exception_credentials(self):

@@ -103,6 +103,11 @@ docker compose logs --tail=100 app
 
 此流程只更新主应用容器，不重新部署数据库。生产环境也可以将 `latest` 换成版本标签，或 Actions Summary 中的 `ghcr.io/mxw13579/chatgpt2api@sha256:...` 引用，以固定版本和便于回滚。
 
+### 1.9.12 升级注意
+
+- sub2api、远程 CPA 服务器导入和 AI 审核已移除；`config.json` 中的相关配置以及 `data/` 下的 CPA、sub2api 配置文件不再读取，无需手动删除。
+- 账号刷新间隔默认值改为 30 分钟。已有部署的 `refresh_account_interval_minute` 保存在 `config.json` 中，不会自动变化，需要时在「设置」中修改，重启后生效。
+
 ### 1.9.11 升级注意
 
 移除本地和 WebDAV 图片存储、网页画图页面和图片管理页面，R2 成为唯一的图片存储方式：

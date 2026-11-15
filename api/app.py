@@ -5,6 +5,7 @@ from threading import Event
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 
 from api import accounts, ai, image_storage, system
@@ -41,6 +42,7 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
     app.include_router(ai.create_router())
     app.include_router(accounts.create_router())
     app.include_router(image_storage.create_router())
@@ -50,7 +52,9 @@ def create_app() -> FastAPI:
     async def serve_web(full_path: str):
         asset = resolve_web_asset(full_path)
         if asset is not None:
-            return FileResponse(asset)
+            # Next.js puts a content hash in every file name under _next/static.
+            headers = {"Cache-Control": "public, max-age=31536000, immutable"} if "_next/static/" in full_path else None
+            return FileResponse(asset, headers=headers)
         if full_path.strip("/").startswith("_next/"):
             raise HTTPException(status_code=404, detail="Not Found")
         fallback = resolve_web_asset("")
