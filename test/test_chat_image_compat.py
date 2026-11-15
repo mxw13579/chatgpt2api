@@ -130,7 +130,7 @@ class ChatImageCompatTests(unittest.TestCase):
                 request = self.pool.call_args.args[0]
                 self.assertEqual((request.model, request.prompt, request.n), (model, PROMPT, 1))
                 self.assertEqual(request.response_format, "b64_json")
-                self.assertTrue(request.message_as_error)
+                self.assertFalse(request.message_as_error)
                 self.assertEqual(response["object"], "chat.completion")
                 self.assertEqual(response["model"], model)
                 self.assertEqual(response["created"], 123)
@@ -210,7 +210,7 @@ class ChatImageCompatTests(unittest.TestCase):
                 self.assertEqual(request.quality, "high")
                 self.assertEqual(request.images, IMAGE_BASE64)
                 self.assertEqual(request.response_format, "b64_json")
-                self.assertTrue(request.message_as_error)
+                self.assertFalse(request.message_as_error)
                 for url in IMAGE_URLS:
                     self.assertIn(url, content)
                 if not stream:
@@ -223,7 +223,7 @@ class ChatImageCompatTests(unittest.TestCase):
         request = ConversationRequest(
             model=MODEL, prompt="Normalized synthetic prompt.", n=2,
             size="1536x1024", quality="high", images=list(IMAGE_BASE64),
-            response_format="b64_json", message_as_error=True,
+            response_format="b64_json",
         )
         normalized = SimpleNamespace(request=request, images=raw_images)
         body = {"model": MODEL, "prompt": "Unnormalized prompt.", "n": 1, "size": "auto", "quality": "low"}
@@ -255,7 +255,7 @@ class ChatImageCompatTests(unittest.TestCase):
     def test_stream_passes_normalized_request_unchanged_and_checks_normalized_count(self) -> None:
         request = ConversationRequest(
             model=MODEL, prompt=PROMPT, n=2, size="1536x1024", quality="high",
-            images=list(IMAGE_BASE64), response_format="b64_json", message_as_error=True,
+            images=list(IMAGE_BASE64), response_format="b64_json",
         )
         normalized = SimpleNamespace(request=request, images=[])
         body = {"model": MODEL, "input": PROMPT, "n": 1, "stream": True}
@@ -288,13 +288,10 @@ class ChatImageCompatTests(unittest.TestCase):
         cases = [
             ("empty", 1, []),
             ("progress_only", 1, [image_output("progress", text="Working on synthetic image.")]),
-            ("message_only", 1, [image_output("message", text="No synthetic image generated.")]),
             ("empty_result", 1, [image_output(data=[])]),
             ("empty_base64", 1, [image_output(data=[{"b64_json": ""}])]),
             ("url_only", 1, [image_output(data=[{"url": "https://example.test/synthetic.png"}])]),
             ("partial_count", 2, [image_output(total=2)]),
-            ("partial_message", 2, [image_output(total=2), image_output("message", text="Synthetic failure.")]),
-            ("message_after_required_image", 1, [image_output(), image_output("message", text="Synthetic failure.")]),
             ("mixed_inline_and_url", 2, [image_output(data=[
                 {"b64_json": IMAGE_BASE64[0]}, {"url": "https://example.test/synthetic.png"},
             ], total=2)]),
@@ -305,6 +302,18 @@ class ChatImageCompatTests(unittest.TestCase):
                     self.pool.return_value = iter(outputs)
                     self.assert_image_failure({"model": MODEL, "prompt": PROMPT, "stream": stream, "n": n})
         self.assert_no_text_path()
+
+    def test_text_reply_is_returned_as_the_answer(self) -> None:
+        reply = "Synthetic text reply."
+        outputs = [image_output("progress", text="Synthetic "), image_output("message", text=reply)]
+        self.pool.return_value = iter(outputs)
+        response = chat.handle({"model": MODEL, "prompt": PROMPT})
+        self.assertEqual(response["choices"][0]["message"]["content"], reply)
+
+        self.pool.return_value = iter(outputs)
+        chunks = list(chat.handle({"model": MODEL, "prompt": PROMPT, "stream": True}))
+        self.assertEqual("".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks), reply)
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
 
     def test_upstream_failure_after_image_is_not_converted_to_stop(self) -> None:
         for stream in (False, True):
@@ -347,7 +356,7 @@ class ChatImageCompatTests(unittest.TestCase):
         self.assert_no_text_path()
 
     def test_direct_image_stream_also_rejects_missing_images(self) -> None:
-        for outputs in ([], [image_output("progress", text="Working.")], [image_output("message", text="No image.")]):
+        for outputs in ([], [image_output("progress", text="Working.")]):
             with self.subTest(kinds=[output.kind for output in outputs]):
                 chunks = []
                 with self.assertRaises(ImageGenerationError):

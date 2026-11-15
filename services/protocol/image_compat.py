@@ -138,7 +138,8 @@ def image_request_prompt(body: dict, *, protocol: str) -> str:
         raise _bad_request("prompt must be a string")
     prompt = (direct_prompt or "").strip()
     if not prompt:
-        prompt = "\n".join(filter(None, (extract_prompt_from_message_content(content) for content in contents))).strip()
+        # Only the latest user turn: agent clients put context and history in earlier ones.
+        prompt = next(filter(None, (extract_prompt_from_message_content(content) for content in reversed(contents))), "")
     if not prompt:
         raise _bad_request("prompt is required")
     instructions = body.get("instructions")
@@ -273,7 +274,6 @@ def normalize_image_request(body: dict, *, protocol: str) -> NormalizedImageRequ
             size=size,
             quality=quality,
             response_format="b64_json",
-            message_as_error=True,
             strict_image_results=True,
         ),
         images=images,
@@ -283,19 +283,22 @@ def normalize_image_request(body: dict, *, protocol: str) -> NormalizedImageRequ
 def require_image_outputs(
     outputs: Iterable[ImageOutput], *, expected_count: int = 1,
 ) -> Iterator[ImageOutput]:
-    """Check inline results and completion; bytes were validated upstream."""
+    """Check inline results and completion; a text reply is passed through as the answer."""
     count = 0
+    replied_text = False
     for output in outputs:
         if output.kind == "message":
-            # Do not surface untrusted upstream text or account metadata in errors.
-            raise ImageGenerationError("Image generation returned text instead of an image.", code="no_image_generated")
-        if output.kind == "progress":
+            replied_text = replied_text or bool(output.text)
+            yield output
+        elif output.kind == "progress":
             yield output
         elif output.kind == "result":
             if not output.data or any(not item.get("b64_json") for item in output.data):
                 raise ImageGenerationError("Image generation returned no inline image data.", code="no_image_generated")
             count += len(output.data)
             yield output
+    if replied_text:
+        return
     if not count:
         raise ImageGenerationError("Image generation returned no images.", code="no_image_generated")
     if count < expected_count:

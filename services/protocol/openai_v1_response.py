@@ -375,6 +375,15 @@ def stream_image_response(
     output_tokens = 0
     yield response_created(response_id, model, created)
     for output in require_image_outputs(image_outputs, expected_count=expected_count):
+        if output.kind == "message" and output.text:
+            # The model answered in text instead of drawing; return it as a normal message.
+            item = text_output_item(output.text)
+            output_index = len(items)
+            yield {"type": "response.output_item.added", "output_index": output_index, "item": text_output_item("", item["id"], "in_progress")}
+            yield {"type": "response.output_text.delta", "item_id": item["id"], "output_index": output_index, "content_index": 0, "delta": output.text}
+            yield {"type": "response.output_text.done", "item_id": item["id"], "output_index": output_index, "content_index": 0, "text": output.text}
+            items.append(item)
+            yield {"type": "response.output_item.done", "output_index": output_index, "item": item}
         if output.kind != "result":
             continue
         batch = image_output_items(prompt, output.data)

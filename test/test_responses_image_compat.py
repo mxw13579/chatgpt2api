@@ -76,7 +76,7 @@ class ResponsesImageCompatTests(unittest.TestCase):
         request = self.pool.call_args.args[0]
         self.assertEqual(request.model, MODEL)
         self.assertEqual(request.prompt, PROMPT)
-        self.assertTrue(request.message_as_error)
+        self.assertFalse(request.message_as_error)
         self.assertEqual(request.response_format, "b64_json")
         self.assertEqual(response["status"], "completed")
         self.assertEqual([item["result"] for item in response["output"]], [PNG_FIRST])
@@ -163,7 +163,7 @@ class ResponsesImageCompatTests(unittest.TestCase):
                     request = self.pool.call_args.args[0]
 
                     self.assertEqual(request.images, [PNG_FIRST, PNG_SECOND])
-                    self.assertTrue(request.message_as_error)
+                    self.assertFalse(request.message_as_error)
                     raw_images, model = self.input_tokens.call_args.args
                     self.assertEqual(model, request.model)
                     self.assertEqual([image[0] for image in raw_images], [
@@ -174,7 +174,7 @@ class ResponsesImageCompatTests(unittest.TestCase):
     def test_normalized_conversation_request_is_passed_to_pool_unchanged(self) -> None:
         request = ConversationRequest(
             model=MODEL, prompt=PROMPT, n=2, size="1536x1024", quality="high",
-            images=[PNG_FIRST, PNG_SECOND], response_format="b64_json", message_as_error=True,
+            images=[PNG_FIRST, PNG_SECOND], response_format="b64_json",
         )
         raw_images = [
             (base64.b64decode(PNG_FIRST), "synthetic-first.png", "image/png"),
@@ -206,7 +206,7 @@ class ResponsesImageCompatTests(unittest.TestCase):
 
                 self.assertEqual((request.n, request.size, request.quality), (2, "1536x1024", "high"))
                 self.assertEqual(request.response_format, "b64_json")
-                self.assertTrue(request.message_as_error)
+                self.assertFalse(request.message_as_error)
                 self.assertEqual([item["result"] for item in response["output"]], [PNG_FIRST, PNG_SECOND])
                 self.assertEqual(self.validator.call_args.kwargs, {"expected_count": 2})
 
@@ -298,7 +298,6 @@ class ResponsesImageCompatTests(unittest.TestCase):
         cases = [
             ("empty", [], 1),
             ("empty_result", [image_result()], 1),
-            ("message_only", [text_only_output()], 1),
             ("short", [image_result(PNG_FIRST)], 2),
         ]
         for label, outputs, count in cases:
@@ -309,16 +308,30 @@ class ResponsesImageCompatTests(unittest.TestCase):
                 if count == 1:
                     self.assertEqual(caught.exception.code, "no_image_generated")
 
+    def test_text_reply_is_returned_as_a_message_item(self) -> None:
+        reply = text_only_output().text
+        self.outputs = [text_only_output()]
+        response = responses.handle({"model": MODEL, "input": PROMPT})
+        self.assertEqual(response["status"], "completed")
+        self.assertEqual(response["output"][0]["content"][0]["text"], reply)
+
+        self.outputs = [text_only_output()]
+        events = list(responses.handle({"model": MODEL, "input": PROMPT, "stream": True}))
+        self.assertEqual([event["type"] for event in events], [
+            "response.created", "response.output_item.added", "response.output_text.delta",
+            "response.output_text.done", "response.output_item.done", "response.completed",
+        ])
+        self.assertEqual(events[2]["delta"], reply)
+
     def test_collect_response_propagates_image_failure_instead_of_returning_failed_object(self) -> None:
         with self.assertRaises(ImageGenerationError) as caught:
-            responses.collect_response(responses.stream_image_response([text_only_output()], PROMPT, MODEL))
+            responses.collect_response(responses.stream_image_response([], PROMPT, MODEL))
 
         self.assertEqual(caught.exception.code, "no_image_generated")
 
     def test_empty_message_only_and_short_streams_fail_without_completed(self) -> None:
         for label, outputs, count in [
             ("empty", [], 1),
-            ("message_only", [text_only_output()], 1),
             ("short", [image_result(PNG_FIRST)], 2),
         ]:
             with self.subTest(case=label):

@@ -13,12 +13,18 @@ from services.account_service import account_service
 from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol.conversation import (
     ConversationRequest,
+    collect_image_outputs,
     collect_text,
     count_message_tokens,
     count_text_tokens,
     normalize_messages,
+    stream_image_outputs_with_pool,
     stream_text_deltas,
 )
+from services.protocol.image_compat import normalize_image_request, require_image_outputs
+from services.protocol.openai_v1_chat_complete import image_text_deltas
+from utils.helper import build_chat_image_markdown_content, is_explicit_image_model
+from utils.image_tokens import count_image_output_items_tokens
 
 XML_TOOL_RULE = """Tool output adapter: when calling tools, output ONLY this XML and no prose/markdown:
 <tool_calls><tool_call><tool_name>TOOL_NAME</tool_name><parameters><PARAM><![CDATA[value]]></PARAM></parameters></tool_call></tool_calls>"""
@@ -288,7 +294,38 @@ def _stream_buffered_blocks(content: list[dict[str, object]], start_index: int =
         yield {"type": "content_block_stop", "index": index}
 
 
+def image_handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    """Image models draw from the latest user turn; the image comes back as Markdown in a text block."""
+    request = normalize_image_request({"model": body.get("model"), "messages": body.get("messages")}, protocol="chat").request
+    outputs = require_image_outputs(stream_image_outputs_with_pool(request), expected_count=request.n)
+    input_tokens = count_text_tokens(request.prompt, request.model)
+    if body.get("stream"):
+        images: list[dict[str, Any]] = []
+
+        def tap() -> Iterator[Any]:
+            for output in outputs:
+                if output.kind == "result":
+                    images.extend(output.data)
+                yield output
+
+        return stream_events(
+            image_text_deltas(tap()),
+            request.model,
+            input_tokens,
+            lambda _text: count_image_output_items_tokens(images, request.size, request.quality),
+        )
+    result = collect_image_outputs(outputs)
+    return message_response(
+        request.model,
+        build_chat_image_markdown_content(result) if result["data"] else result["message"],
+        input_tokens,
+        count_image_output_items_tokens(result["data"], request.size, request.quality),
+    )
+
+
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    if is_explicit_image_model(body.get("model")):
+        return image_handle(body)
     request = message_request(body)
     conversation_request = ConversationRequest(model=request.model, messages=request.messages)
     if body.get("stream"):

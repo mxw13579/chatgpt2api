@@ -1,6 +1,6 @@
-# 图片模型的 Chat / Responses 兼容调用
+# 图片模型的 Chat / Responses / Messages 兼容调用
 
-明确指定图片模型时，`/v1/chat/completions` 和 `/v1/responses` 会自动调用同一套绘图后端，不再要求客户端选择 Images 接口或额外声明 `image_generation` 工具。接口路径决定返回格式，不会做 HTTP 重定向。
+明确指定图片模型时，`/v1/chat/completions`、`/v1/responses` 和 `/v1/messages` 会自动调用同一套绘图后端，不再要求客户端选择 Images 接口或额外声明 `image_generation` 工具。接口路径决定返回格式，不会做 HTTP 重定向。
 
 ## 最小请求
 
@@ -42,6 +42,10 @@ Content-Type: application/json
 
 不需要 `tools`。返回 `response`，图片在 `output` 中的 `image_generation_call.result` 字段，是 Base64 字符串，不是 `output_text`。
 
+### Messages
+
+`/v1/messages` 仅在 `model` 是明确图片模型时进入画图流程，提示词和参考图取自 `messages`，`system` 和 `tools` 不参与。返回 Anthropic `message`，图片在 `content` 的文本块中，以 Markdown 内嵌 Base64 data URI 表达；流式时按 Anthropic 事件格式输出。
+
 ## 自动路由范围
 
 - `gpt-image-*`、`chatgpt-image-*`、`codex-gpt-image-2` 和 `plus/team/pro-codex-gpt-image-2` 视为明确图片模型。模型还必须在当前支持目录中，否则返回参数错误，不会静默换模型。
@@ -57,7 +61,7 @@ Content-Type: application/json
 1. 非空字符串 `prompt` 优先。
 2. 未提供直接提示词时，Chat 优先读 `messages`，Responses 优先读 `input`。
 3. 原生字段缺失或为 `null` 时，允许读取另一个接口的字段。明确传入空数组/空字符串不会偷偷改读另一套内容。
-4. 不合并 `messages` 和 `input`。选中来源中的用户文本按顺序组成提示词；`instructions` 作为前缀加入。`system/developer/assistant` 消息不会被当作用户画图提示词。
+4. 不合并 `messages` 和 `input`。提示词只取选中来源中最后一条含文本的用户消息，更早的用户消息不参与；`instructions` 作为前缀加入。`system/developer/assistant` 消息不会被当作用户画图提示词。
 5. 参考图从选中来源中最近一条含图的用户消息提取，并保留该消息的全部图片；直接的 Responses 内容块数组视为同一条消息。直接 `prompt` 可以搭配这些参考图。
 6. 内容过滤检查最终规范化的提示词，使用备用字段不会绕过过滤。
 
@@ -92,7 +96,7 @@ Content-Type: application/json
 - Chat：`chat.completion.chunk`，最终图片仍为消息内容中的 Markdown data URI。
 - Responses：`response.created` → 每张图片的 `response.output_item.added/done` → `response.completed`。多个生成结果会完整累计，不再只返回第一批。
 
-流式格式不代表上游能实时提供图片预览。只有拿到足够的有效图片结果、且生成任务未失败时才会成功结束；纯文字、空结果、图片数量不足或中途异常不会被包装成成功。并行任务中一项失败时，也不会用另一项偶然多出的图片掩盖该失败。
+流式格式不代表上游能实时提供图片预览。模型没有画图而是回复了文字时（例如被问到与画图无关的问题，或上游说明拒绝原因），这段文字作为正常回答返回：Chat 和 Messages 放在消息内容中，Responses 放在 `output` 的 `message` 项中。除此之外，只有拿到足够的有效图片结果、且生成任务未失败时才会成功结束；空结果、图片数量不足或中途异常不会被包装成成功。并行任务中一项失败时，也不会用另一项偶然多出的图片掩盖该失败。
 
 非流式错误返回错误 HTTP 状态。已开始的流无法更改 HTTP 状态码：Chat 输出错误数据，Responses 输出 `response.failed`，不会继续发送成功的 `stop/completed` 或 `[DONE]`。客户端必须检查终止事件，不能只判断 HTTP 200。失败的 Responses 流也会按失败记录日志。
 

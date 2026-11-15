@@ -186,7 +186,7 @@ class ImageCompatTests(unittest.TestCase):
         ]
         for protocol, field in (("chat", "messages"), ("responses", "input")):
             body = {"model": "gpt-image-2", field: messages, "instructions": "  style guide  "}
-            self.assertEqual(self.normalize(body, protocol).request.prompt, "style guide\n\nfirst\nsecond")
+            self.assertEqual(self.normalize(body, protocol).request.prompt, "style guide\n\nsecond")
 
     def test_direct_prompt_has_priority_but_keeps_selected_reference_images(self) -> None:
         body = {
@@ -225,7 +225,7 @@ class ImageCompatTests(unittest.TestCase):
                     {"role": "user", "content": "first"},
                     {"role": "assistant", "content": "ignored assistant"},
                     {"role": "user", "content": [{"type": "input_text", "text": "second"}]},
-                ], "instructions": " prefix "}, "prefix\n\nfirst\nsecond"),
+                ], "instructions": " prefix "}, "prefix\n\nsecond"),
                 ({native: [{"type": "input_text", "input_text": "bare blocks"}]}, "bare blocks"),
             ):
                 with self.subTest(protocol=protocol, expected=expected, fields=fields):
@@ -486,7 +486,7 @@ class ImageCompatTests(unittest.TestCase):
             self.assertIsInstance(request, self.conversation.ConversationRequest)
             self.assertEqual((request.n, request.size, request.quality), (1, None, "auto"))
             self.assertEqual(request.response_format, "b64_json")
-            self.assertTrue(request.message_as_error)
+            self.assertFalse(request.message_as_error)
 
     def test_n_is_strict_integer_one_through_four(self) -> None:
         for value in (1, 2, 3, 4):
@@ -650,13 +650,11 @@ class ImageCompatTests(unittest.TestCase):
         ):
             self.assert_output_error(outputs, "no_image_generated")
 
-    def test_message_always_fails_without_exposing_upstream_text(self) -> None:
-        message = self.output("message", text="synthetic-private-upstream-text")
+    def test_text_reply_passes_through_without_count_checks(self) -> None:
+        message = self.output("message", text="synthetic text reply")
         for prefix in ([], [self.output(data=[{"b64_json": PNG_B64}])]):
-            with self.assertRaises(self.conversation.ImageGenerationError) as caught:
-                list(self.compat.require_image_outputs([*prefix, message]))
-            self.assertEqual(caught.exception.code, "no_image_generated")
-            self.assertNotIn(message.text, str(caught.exception))
+            outputs = list(self.compat.require_image_outputs([*prefix, message], expected_count=2))
+            self.assertIs(outputs[-1], message)
 
     def test_total_count_spans_result_events_and_items(self) -> None:
         first = self.output(data=[{"b64_json": PNG_B64}, {"b64_json": PNG_B64}])

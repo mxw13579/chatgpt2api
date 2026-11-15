@@ -231,7 +231,7 @@ class ImageCompatHTTPFixture(unittest.TestCase):
         request = self.pools[path].call_args.args[0]
         self.assertIsInstance(request, conversation.ConversationRequest)
         self.assertEqual(request.response_format, "b64_json")
-        self.assertTrue(request.message_as_error)
+        self.assertFalse(request.message_as_error)
         self.assert_no_text_backend()
         return request
 
@@ -467,10 +467,8 @@ class ImageFailureHTTPTests(ImageCompatHTTPFixture):
     def test_missing_text_only_and_short_image_results_fail_closed_over_http(self) -> None:
         cases = [
             ("empty", [], 1, "no_image_generated"),
-            ("text_only", [text_only_output()], 1, "no_image_generated"),
             ("empty_result", [image_result()], 1, "no_image_generated"),
             ("progress_only", [progress_output()], 1, "no_image_generated"),
-            ("progress_then_text", [progress_output(), text_only_output()], 1, "no_image_generated"),
             ("short_count", [image_result(PNG_BASE64[0], total=2)], 2, "incomplete_image_generation"),
         ]
         for path in PROTOCOLS:
@@ -552,7 +550,7 @@ class ImageFilteringAndLoggingHTTPTests(ImageCompatHTTPFixture):
                     {"role": "user", "content": "Synthetic first user turn."},
                     {"role": "assistant", "content": "Synthetic unselected assistant text."},
                     {"role": "user", "content": [{"type": "input_text", "text": "Synthetic second user turn."}]},
-                ]}, "Synthetic first user turn.\nSynthetic second user turn."),
+                ]}, "Synthetic second user turn."),
             ]
             for label, source, selected in cases:
                 with self.subTest(path=path, case=label):
@@ -610,7 +608,7 @@ class ImageFilteringAndLoggingHTTPTests(ImageCompatHTTPFixture):
 
     def test_responses_failure_after_created_records_failed_not_success(self) -> None:
         # Keep LoggedCall.log real here: only the persistent log sink is mocked.
-        self.outputs = [text_only_output()]
+        self.outputs = []
         response = self.client.post(RESPONSES_PATH, json={
             "model": MODEL, "input": PROMPT, "stream": True,
         })

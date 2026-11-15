@@ -211,7 +211,8 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         stream_image_outputs_with_pool(request),
         expected_count=request.n,
     ))
-    response = completion_response(request.model, build_chat_image_markdown_content(result), int(result.get("created") or 0) or None)
+    content = build_chat_image_markdown_content(result) if result["data"] else result["message"]
+    response = completion_response(request.model, content, int(result.get("created") or 0) or None)
     usage = image_usage(
         input_text_tokens=count_text_tokens(request.prompt, request.model),
         input_image_tokens=count_image_inputs_tokens(normalized.images, request.model),
@@ -228,6 +229,21 @@ def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     yield from stream_image_chat_completion(image_outputs, request.model, expected_count=request.n)
 
 
+def image_text_deltas(image_outputs: Iterable[ImageOutput]) -> Iterator[str]:
+    """Images as Markdown data URIs; a text reply as plain text without repeating streamed progress."""
+    sent_text = ""
+    for output in image_outputs:
+        if output.kind == "progress":
+            content = output.text
+            sent_text += content
+        elif output.kind == "result":
+            content = build_chat_image_markdown_content({"data": output.data})
+        else:
+            content = output.text[len(sent_text):] if output.text.startswith(sent_text) else output.text
+        if content:
+            yield content
+
+
 def stream_image_chat_completion(
     image_outputs: Iterable[ImageOutput],
     model: str,
@@ -237,14 +253,7 @@ def stream_image_chat_completion(
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     sent_role = False
-    for output in require_image_outputs(image_outputs, expected_count=expected_count):
-        content = ""
-        if output.kind == "progress":
-            content = output.text
-        elif output.kind == "result":
-            content = build_chat_image_markdown_content({"data": output.data})
-        if not content:
-            continue
+    for content in image_text_deltas(require_image_outputs(image_outputs, expected_count=expected_count)):
         if not sent_role:
             sent_role = True
             yield completion_chunk(model, {"role": "assistant", "content": content}, None, completion_id, created)

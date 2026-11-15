@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.9.13 - 2026-11-15
+
++ [修复] 图片模型在 Chat / Responses 中回复文字时，文字作为正常回答返回，不再报 `Image generation returned text instead of an image.`。
++ [调整] Chat / Responses 画图的提示词只取最后一条含文本的用户消息，不再拼接全部历史用户消息；参考图规则不变。
++ [新增] `/v1/messages` 支持图片模型：图片以 Markdown 内嵌 Base64 放在文本块中返回，支持流式。
+
+升级无需修改配置。详见[图片模型兼容调用](docs/image-api-compatibility.md)。
+
 ## 1.9.12 - 2026-11-15
 
 + [移除] 移除 sub2api 连接、远程 CPA 服务器导入和 AI 审核及其设置项与接口。本地 JSON 文件导入账号（兼容 CPA 格式）、敏感词过滤和全局系统提示词保留。
