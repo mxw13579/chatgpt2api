@@ -180,7 +180,9 @@ class R2ProvisionTests(unittest.TestCase):
         cf_id = "a" * 32
         zone = {"id": "zone-1", "name": "example.test", "account": {"id": cf_id}}
         result, calls = self.run_provision({
-            ("GET", "/user/tokens/verify"): (200, {"id": "token-id"}),
+            # Account-owned token: rejected by the user endpoint, verified under the account.
+            ("GET", "/user/tokens/verify"): (401, None),
+            ("GET", f"/accounts/{cf_id}/tokens/verify"): (200, {"id": "token-id"}),
             ("GET", "/zones"): (200, [zone]),
             # Bucket left over from an earlier attempt is reused.
             ("POST", f"/accounts/{cf_id}/r2/buckets"): (409, None),
@@ -196,10 +198,10 @@ class R2ProvisionTests(unittest.TestCase):
             {"r2_accounts": [{"id": account(1)["id"], **result}]}))
 
     def test_cloudflare_error_and_unknown_zone_are_reported(self):
-        with self.assertRaisesRegex(ImageStorageError, "10000 synthetic"):
-            self.run_provision({("GET", "/user/tokens/verify"): (403, None)})
+        with self.assertRaisesRegex(ImageStorageError, "查询站点失败.*10000 synthetic"):
+            self.run_provision({("GET", "/zones"): (403, None)})
         with self.assertRaisesRegex(ImageStorageError, "站点"):
-            self.run_provision({("GET", "/user/tokens/verify"): (200, {"id": "token-id"})})
+            self.run_provision({})
         with self.assertRaises(ValueError):
             r2_provision.provision("token", "not a domain")
 

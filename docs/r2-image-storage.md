@@ -23,7 +23,7 @@ R2 免费额度按 Cloudflare 账号计算：每月 100 万次 A 类操作、100
 每个 Cloudflare 账号只需在后台做一次准备：
 
 1. 开通 R2（需绑定支付方式，免费额度内不扣费），并把图片域名所在站点接入该账号。
-2. 在 **My Profile → API Tokens** 创建自定义 Token，权限：Account · Workers R2 Storage · Edit，Zone · Zone · Read，Zone · DNS · Edit。
+2. 在 **My Profile → API Tokens**（用户 Token）或 **Manage Account → Account API Tokens**（账号 Token）创建自定义 Token，权限：Account · Workers R2 Storage · Edit，Zone · Zone · Read，Zone · DNS · Edit。
 
 然后在 **设置 → 图片存储 → 一键开通** 填入该 Token 和图片域名（如 `img.example.com`）。项目会自动建桶（桶名取自域名，如 `img-example-com`）、绑定自定义域名（DNS 记录由 Cloudflare 自动创建），并添加已启用的账号。新桶的 `r2.dev` 公开访问默认关闭。
 
