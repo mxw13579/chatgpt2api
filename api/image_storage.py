@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.concurrency import run_in_threadpool
+from uuid import uuid4
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.support import require_admin, require_identity
@@ -9,6 +11,7 @@ from services.config import config
 from services.image_service import cleanup_legacy_images, legacy_storage_stats
 from services.image_storage_service import ImageStorageError, image_storage_service
 from services.r2_client import R2Error
+from services.r2_provision import provision
 
 
 class SettingsRequest(BaseModel):
@@ -17,6 +20,11 @@ class SettingsRequest(BaseModel):
 
 class ConfirmRequest(BaseModel):
     confirm: bool = Field(default=False, strict=True)
+
+
+class ProvisionRequest(BaseModel):
+    api_token: str = Field(min_length=1, max_length=512)
+    domain: str = Field(min_length=1, max_length=253)
 
 
 class ImageReference(BaseModel):
@@ -59,6 +67,12 @@ def _save(settings: dict) -> dict:
     return _overview()
 
 
+def _provision(api_token: str, domain: str) -> dict:
+    account = {"id": str(uuid4()), **provision(api_token, domain)}
+    accounts = config.get_image_storage_settings()["r2_accounts"]
+    return _save({"r2_accounts": [*accounts, account]})
+
+
 def _resolve(images: list[dict]) -> list[dict]:
     fields = {"image_id", "account_id", "expires_at", "url", "expired", "unavailable"}
     return [{key: value for key, value in image_storage_service.resolve_reference(ref).items() if key in fields}
@@ -81,6 +95,10 @@ def create_router() -> APIRouter:
     @admin.put("")
     async def save_settings(body: SettingsRequest):
         return await _call(_save, body.model_dump(mode="python"))
+
+    @admin.post("/accounts/provision")
+    async def provision_account(body: ProvisionRequest):
+        return await _call(_provision, body.api_token, body.domain)
 
     @admin.post("/accounts/{account_id}/test")
     async def test_connection(account_id: str):

@@ -1,6 +1,7 @@
 """Synthetic/mocked R2 storage tests; run only through test/run_isolated.py."""
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import tempfile
@@ -14,6 +15,7 @@ from PIL import Image
 
 from services import config as config_module
 from services import image_storage_service as storage
+from services import r2_provision
 from services.image_storage_service import ImageStorageError, ImageStorageService
 from services.r2_client import R2Error
 
@@ -157,6 +159,49 @@ class R2ConfigTests(unittest.TestCase):
             previous, {"r2_accounts": [{**account(1), "access_key_id": "", "secret_access_key": ""}]},
         )
         self.assertEqual(merged["r2_accounts"][0]["secret_access_key"], "synthetic-secret")
+
+
+class R2ProvisionTests(unittest.TestCase):
+    def run_provision(self, responses: dict):
+        calls = []
+
+        def request(method, url, **kwargs):
+            path = url.removeprefix(r2_provision._BASE_URL)
+            calls.append((method, path, kwargs.get("json") or kwargs.get("params")))
+            status, result = responses.get((method, path), (200, []))
+            return mock.Mock(status_code=status, json=lambda: {
+                "success": status < 300, "result": result, "errors": [{"code": 10000, "message": "synthetic"}]})
+
+        with mock.patch.object(r2_provision.requests, "Session") as session:
+            session.return_value.request.side_effect = request
+            return r2_provision.provision(" synthetic-token ", "Img.Example.Test"), calls
+
+    def test_creates_bucket_binds_domain_and_derives_s3_credentials(self):
+        cf_id = "a" * 32
+        zone = {"id": "zone-1", "name": "example.test", "account": {"id": cf_id}}
+        result, calls = self.run_provision({
+            ("GET", "/user/tokens/verify"): (200, {"id": "token-id"}),
+            ("GET", "/zones"): (200, [zone]),
+            # Bucket left over from an earlier attempt is reused.
+            ("POST", f"/accounts/{cf_id}/r2/buckets"): (409, None),
+        })
+        self.assertEqual(result, {
+            "name": "img.example.test", "enabled": True, "account_id": cf_id, "bucket": "img-example-test",
+            "access_key_id": "token-id", "secret_access_key": hashlib.sha256(b"synthetic-token").hexdigest(),
+            "public_base_url": "https://img.example.test",
+        })
+        self.assertEqual(calls[-1], ("POST", f"/accounts/{cf_id}/r2/buckets/img-example-test/domains/custom",
+                                     {"domain": "img.example.test", "zoneId": "zone-1", "enabled": True}))
+        config_module._validate_image_storage_settings(config_module._normalize_image_storage_settings(
+            {"r2_accounts": [{"id": account(1)["id"], **result}]}))
+
+    def test_cloudflare_error_and_unknown_zone_are_reported(self):
+        with self.assertRaisesRegex(ImageStorageError, "10000 synthetic"):
+            self.run_provision({("GET", "/user/tokens/verify"): (403, None)})
+        with self.assertRaisesRegex(ImageStorageError, "站点"):
+            self.run_provision({("GET", "/user/tokens/verify"): (200, {"id": "token-id"})})
+        with self.assertRaises(ValueError):
+            r2_provision.provision("token", "not a domain")
 
 
 if __name__ == "__main__":

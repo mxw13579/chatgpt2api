@@ -136,6 +136,8 @@ test("storage management request wrappers", async () => {
   await api.cleanupExpiredImages();
   await api.cleanupLegacyImages();
   await api.resolveImageReferences([{ ...reference, url: "https://old.example.test/image.png" }]);
+  await api.provisionR2Account("fixture-token", "img.example.test");
+  assert.deepEqual(calls.pop(), { url: "/api/image-storage/accounts/provision", method: "POST", body: { api_token: "fixture-token", domain: "img.example.test" } });
   assert.deepEqual(calls.map(({ url, method }) => [method, url]), [
     ["GET", "/api/image-storage"], ["POST", `/api/image-storage/accounts/${id}/test`],
     ["POST", "/api/image-storage/cleanup"], ["POST", "/api/image-storage/legacy/cleanup"],

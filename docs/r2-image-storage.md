@@ -18,14 +18,25 @@ R2 免费额度按 Cloudflare 账号计算：每月 100 万次 A 类操作、100
 
 ## 接入步骤
 
-每个账号：
+### 一键开通（推荐）
 
-1. 在 Cloudflare 创建一个专用图片桶（不要与备份共用）。
-2. 在桶设置中绑定一个自定义域名，并关闭 `r2.dev` 公开访问。
-3. （建议）在该域名所在 Zone 添加一条免费的 Rate Limiting 规则，例如对 `/images/` 路径每 IP 10 秒 120 次。
-4. 创建一个仅限该桶对象读写的 R2 API Token，记下 Access Key ID / Secret Access Key。
-5. 在 **设置 → 图片存储** 添加账号，填写 CF Account ID、桶名、S3 凭据、公开访问地址（如 `https://img.example.com`），勾选启用并保存。
-6. 点击「测试连接」，然后把存储模式切换为 R2 并保存。
+每个 Cloudflare 账号只需在后台做一次准备：
+
+1. 开通 R2（需绑定支付方式，免费额度内不扣费），并把图片域名所在站点接入该账号。
+2. 在 **My Profile → API Tokens** 创建自定义 Token，权限：Account · Workers R2 Storage · Edit，Zone · Zone · Read，Zone · DNS · Edit。
+
+然后在 **设置 → 图片存储 → 一键开通** 填入该 Token 和图片域名（如 `img.example.com`）。项目会自动建桶（桶名取自域名，如 `img-example-com`）、绑定自定义域名（DNS 记录由 Cloudflare 自动创建），并添加已启用的账号。新桶的 `r2.dev` 公开访问默认关闭。
+
+Token 原文不保存：配置中只保存由它推导出的 S3 凭据（Access Key ID 为 Token ID，Secret 为 Token 值的 SHA-256），该凭据可读写此账号下所有 R2 桶，但不能修改 DNS。在 Cloudflare 删除该 Token 会使凭据失效。
+
+域名证书生效需几分钟，之后点击「测试连接」，再把存储模式切换为 R2 并保存。限速规则不自动创建，需要时在该域名的 Zone 手动添加（例如对 `/images/` 路径每 IP 10 秒 120 次）。
+
+### 手动填写
+
+1. 在 Cloudflare 创建一个专用图片桶（不要与备份共用），绑定自定义域名并关闭 `r2.dev` 公开访问。
+2. 创建一个仅限该桶对象读写的 R2 API Token，记下 Access Key ID / Secret Access Key。
+3. 在 **设置 → 图片存储** 添加账号，填写 CF Account ID、桶名、S3 凭据、公开访问地址（如 `https://img.example.com`），勾选启用并保存。
+4. 点击「测试连接」，然后把存储模式切换为 R2 并保存。
 
 ## 账号变更
 

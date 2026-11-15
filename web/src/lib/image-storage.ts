@@ -43,6 +43,8 @@ export const saveImageStorageSettings = (body: ImageStorageSettings) =>
   httpRequest<ImageStorageOverview>(root, { method: "PUT", body: { ...body, enabled: body.mode === "r2" || body.enabled } });
 export const testR2Account = (id: string) =>
   httpRequest<{ result: StorageActionResult }>(`${accountPath(id)}/test`, { method: "POST", body: {} });
+export const provisionR2Account = (api_token: string, domain: string) =>
+  httpRequest<ImageStorageOverview>(`${root}/accounts/provision`, { method: "POST", body: { api_token, domain } });
 export const cleanupExpiredImages = () => httpRequest<{ result: CleanupResult }>(`${root}/cleanup`, { method: "POST", body: {} });
 export const cleanupLegacyImages = () => httpRequest<{ result: CleanupResult }>(`${root}/legacy/cleanup`, { method: "POST", body: { confirm: true } });
 export const resolveImageReferences = (images: ImageReference[]) =>

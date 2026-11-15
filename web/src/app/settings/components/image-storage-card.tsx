@@ -11,7 +11,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { syncImageStorage, testImageStorageConnection, type ImageStorageMode, type ImageStorageSettings, type R2Account } from "@/lib/api";
 import {
   DEFAULT_IMAGE_STORAGE, cleanupExpiredImages, cleanupLegacyImages, getImageStorageOverview,
-  imageStorageSettingsAffectImages, newR2Account, notifyImageStorageChanged, saveImageStorageSettings, testR2Account,
+  imageStorageSettingsAffectImages, newR2Account, notifyImageStorageChanged, provisionR2Account, saveImageStorageSettings, testR2Account,
   type CleanupResult, type ImageStorageOverview, type StorageActionResult,
 } from "@/lib/image-storage";
 import { useSettingsStore } from "../store";
@@ -43,6 +43,8 @@ export function ImageStorageCard() {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [result, setResult] = useState("");
+  const [cfToken, setCfToken] = useState("");
+  const [cfDomain, setCfDomain] = useState("");
   const formRef = useRef<HTMLFormElement>(null);
 
   const accept = useCallback((data: ImageStorageOverview) => {
@@ -130,7 +132,7 @@ export function ImageStorageCard() {
             <NumberField label="R2 过期清理间隔（秒）" value={settings.cleanup_interval_seconds} onChange={(cleanup_interval_seconds) => patch({ cleanup_interval_seconds })} />
             <NumberField label="对象 CDN 缓存 TTL（秒）" min={0} value={settings.cache_ttl_seconds} onChange={(cache_ttl_seconds) => patch({ cache_ttl_seconds })} hint="写入对象的 Cache-Control s-maxage。" />
           </div>
-          <p className="rounded-xl border border-stone-200 bg-stone-50 p-3 text-xs leading-6 text-stone-600">Base64 请求不保存到服务器、不上传 R2。R2 模式按「本月已用比例最低」选择启用的账号，每张图计 1 次上传（A 类操作）；全部账号达到上限时新请求失败，不回退本地/WebDAV。自定义域名、关闭 r2.dev、限速规则请在 Cloudflare 后台配置。</p>
+          <p className="rounded-xl border border-stone-200 bg-stone-50 p-3 text-xs leading-6 text-stone-600">Base64 请求不保存到服务器、不上传 R2。R2 模式按「本月已用比例最低」选择启用的账号，每张图计 1 次上传（A 类操作）；全部账号达到上限时新请求失败，不回退本地/WebDAV。限速规则请在 Cloudflare 后台配置。</p>
           {settings.mode === "webdav" || settings.mode === "both" ? <div className="space-y-3 rounded-xl border border-stone-200 p-4">
             <h3 className="font-medium">WebDAV</h3><div className="grid gap-4 md:grid-cols-2">
               {([ ["webdav_url", "WebDAV URL"], ["webdav_username", "用户名"], ["webdav_password", "密码"], ["webdav_root_path", "远端目录"], ["public_base_url", "公开访问前缀（可留空）"] ] as const).map(([key, label]) => <Field key={key} label={label}><Input className={inputClass} type={key === "webdav_password" ? "password" : "text"} value={settings[key]} onChange={(event) => patch({ [key]: event.target.value })} autoComplete="off" /></Field>)}
@@ -140,6 +142,14 @@ export function ImageStorageCard() {
           </div> : null}
           <div className="flex flex-wrap items-center justify-between gap-3"><h3 className="font-medium">R2 账号 · {settings.r2_accounts.length} 个</h3>
             <Button type="button" variant="outline" onClick={() => patch({ r2_accounts: [...settings.r2_accounts, newR2Account()] })}><Plus className="size-4" />添加账号</Button></div>
+          <div className="space-y-3 rounded-xl border border-stone-200 p-4">
+            <h4 className="text-sm font-medium">一键开通</h4>
+            <div className="grid gap-4 md:grid-cols-2">
+              <Field label="Cloudflare API Token" hint="权限：Workers R2 Storage 编辑、Zone 读取、DNS 编辑。仅本次使用，不保存原文。"><Input type="password" autoComplete="new-password" className={inputClass} value={cfToken} onChange={(event) => setCfToken(event.target.value)} /></Field>
+              <Field label="图片域名" hint="域名所在站点需已接入该 Cloudflare 账号；自动建桶并绑定域名。"><Input className={inputClass} value={cfDomain} onChange={(event) => setCfDomain(event.target.value.trim())} placeholder="img.example.com" /></Field>
+            </div>
+            <Button type="button" variant="outline" disabled={locked || !cfToken || !cfDomain} onClick={() => void run("一键开通", async () => { await provisionR2Account(cfToken, cfDomain); setCfToken(""); setCfDomain(""); return "已建桶、绑定域名并添加账号；域名证书生效需几分钟，之后可测试连接"; }, true)}>一键开通</Button>
+          </div>
           {settings.r2_accounts.map((account) => {
             const runtime = overview?.accounts.find((item) => item.id === account.id);
             const hasObjects = (runtime?.image_count || 0) > 0;
