@@ -184,7 +184,6 @@ class OpenAIBackendAPI:
         self.session_id = self.fp["oai-session-id"]
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
-        self.progress_callback: Callable[[str], None] | None = None
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
             account=self.account,
             impersonate=self.fp["impersonate"],
@@ -2757,14 +2756,6 @@ class OpenAIBackendAPI:
             finally:
                 self._close_stream_response(response)
 
-    def _report_progress(self, step: str) -> None:
-        """Report progress step to the callback if set."""
-        if self.progress_callback:
-            try:
-                self.progress_callback(step)
-            except Exception:
-                pass
-
     def _stream_picture_conversation(
             self,
             prompt: str,
@@ -2773,17 +2764,11 @@ class OpenAIBackendAPI:
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
-        self._report_progress("uploading")
         references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
-        self._report_progress("bootstrapping")
         self._bootstrap()
-        self._report_progress("getting_token")
         requirements = self._get_chat_requirements()
-        self._report_progress("preparing_conversation")
         conduit_token = self._prepare_image_conversation(prompt, requirements, model)
-        self._report_progress("starting_generation")
         response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
-        self._report_progress("generating")
         yield from self._iter_sse_payloads_capped(response, self._image_stream_hard_cap_secs())
 
     def _iter_sse_payloads_capped(self, response: Any, hard_cap_secs: float) -> Iterator[str]:

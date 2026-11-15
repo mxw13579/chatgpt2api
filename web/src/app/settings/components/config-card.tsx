@@ -30,7 +30,6 @@ export function ConfigCard() {
   const isLoadingConfig = useSettingsStore((state) => state.isLoadingConfig);
   const isSavingConfig = useSettingsStore((state) => state.isSavingConfig);
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
-  const setImageRetentionDays = useSettingsStore((state) => state.setImageRetentionDays);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
   const setDefaultImageModel = useSettingsStore((state) => state.setDefaultImageModel);
@@ -203,16 +202,6 @@ export function ConfigCard() {
               </SelectContent>
             </Select>
             <p className="text-xs text-stone-500">模型名称以 -standard、-extended 或 -max 结尾时，模型后缀优先。</p>
-          </div>
-          <div className="space-y-2">
-            <label className="text-sm text-stone-700">图片自动清理</label>
-            <Input
-              value={String(config?.image_retention_days || "")}
-              onChange={(event) => setImageRetentionDays(event.target.value)}
-              placeholder="30"
-              className="h-10 rounded-xl border-stone-200 bg-white"
-            />
-            <p className="text-xs text-stone-500">仅用于非 R2 模式的本地图片。R2 分钟级保留及旧图显式清理请到「图片存储」。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">图片轮询超时</label>
@@ -412,7 +401,7 @@ export function ConfigCard() {
             />
             <p className="text-xs text-stone-500">只要用户请求包含任意敏感词，就直接返回拒绝。</p>
           </div>
-          <p className="text-xs text-stone-500 md:col-span-2">本地 / WebDAV / 多账号 R2 已移至「图片存储」页签独立保存；这里保存基础设置不会修改图片存储配置。</p>
+          <p className="text-xs text-stone-500 md:col-span-2">R2 图片存储在「图片存储」页签独立保存；这里保存基础设置不会修改图片存储配置。</p>
           <div className="space-y-4 rounded-xl border border-stone-200 bg-white px-4 py-3 md:col-span-2">
             <label className="flex items-center gap-3 text-sm text-stone-700">
               <Checkbox

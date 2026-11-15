@@ -8,7 +8,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from api.support import require_admin, require_identity
 from services.config import config
-from services.image_service import cleanup_legacy_images, legacy_storage_stats
 from services.image_storage_service import ImageStorageError, image_storage_service
 from services.r2_client import R2Error
 from services.r2_provision import provision
@@ -16,10 +15,6 @@ from services.r2_provision import provision
 
 class SettingsRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
-
-
-class ConfirmRequest(BaseModel):
-    confirm: bool = Field(default=False, strict=True)
 
 
 class ProvisionRequest(BaseModel):
@@ -58,7 +53,6 @@ def _overview() -> dict:
     return {
         "settings": config.get_public_image_storage_settings(),
         "accounts": image_storage_service.account_summaries(),
-        "legacy": legacy_storage_stats(),
     }
 
 
@@ -107,12 +101,6 @@ def create_router() -> APIRouter:
     @admin.post("/cleanup")
     async def cleanup():
         return {"result": await _call(image_storage_service.cleanup_expired)}
-
-    @admin.post("/legacy/cleanup")
-    async def cleanup_legacy(body: ConfirmRequest):
-        if body.confirm is not True:
-            raise HTTPException(status_code=400, detail={"error": "清理旧图片必须显式确认"})
-        return {"result": await _call(cleanup_legacy_images)}
 
     router.include_router(admin)
     return router

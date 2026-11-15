@@ -31,10 +31,3 @@ export function r2ReferenceFromUrl(value: string): ImageReference | undefined {
   if (!/^\/images\/\d{4}\/\d{2}\/\d{2}\/[a-f0-9-]{32,36}\.[a-z0-9]+$/i.test(path)) return undefined;
   return { image_id: path.slice(1), storage: "r2" };
 }
-
-export function imageReference(image: ImageReference): ImageReference {
-  return {
-    image_id: image.image_id, account_id: image.account_id, expires_at: image.expires_at,
-    expired: image.expired, unavailable: image.unavailable, storage: image.storage,
-  };
-}

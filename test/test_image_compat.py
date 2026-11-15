@@ -578,7 +578,7 @@ class ImageCompatTests(unittest.TestCase):
                     self.assertEqual(data, [{"url": "https://synthetic.invalid/image.png", "revised_prompt": "draw"}])
                 decode.assert_called_once_with(PNG_B64, validate=True)
                 if response_format == "url":
-                    save.assert_called_once_with(PNG_BYTES, None)
+                    save.assert_called_once_with(PNG_BYTES)
                 else:
                     save.assert_not_called()
 
@@ -604,7 +604,7 @@ class ImageCompatTests(unittest.TestCase):
                 {response_format: value, "revised_prompt": prompt}
                 for value, prompt in zip(values, ("first", "second", " draw "))
             ]})
-            self.assertEqual(save.call_args_list, [mock.call(PNG_BYTES, "https://synthetic.invalid")] * 3 if response_format == "url" else [])
+            self.assertEqual(save.call_args_list, [mock.call(PNG_BYTES)] * 3 if response_format == "url" else [])
             self.assertEqual(items, before)
             self.assertEqual(
                 conversation.format_image_result([], "draw", response_format, created=123, message="no image"),
@@ -631,7 +631,7 @@ class ImageCompatTests(unittest.TestCase):
                     )
                 self.assertEqual(caught.exception.code, "no_image_generated")
                 if response_format == "url":
-                    save.assert_called_once_with(PNG_BYTES, None)
+                    save.assert_called_once_with(PNG_BYTES)
                 else:
                     save.assert_not_called()
 

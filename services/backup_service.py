@@ -12,8 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from services.config import BASE_DIR, CONFIG_FILE, DATA_DIR, config, load_backup_state, save_backup_state
-from services.image_storage_service import IMAGE_INDEX_FILE
-from services.image_tags_service import TAGS_FILE
+from services.image_storage_service import IMAGE_INDEX_FILE, R2_USAGE_FILE
 from services.r2_client import CloudflareR2Client, R2Error as BackupError
 
 
@@ -435,9 +434,8 @@ class BackupService:
                 self._add_file_to_archive(archive, DATA_DIR / "sub2api_config.json", "data/sub2api_config.json")
             if include.get("logs"):
                 self._add_file_to_archive(archive, DATA_DIR / "logs.jsonl", "data/logs.jsonl")
-            if include.get("image_tasks"):
-                self._add_file_to_archive(archive, DATA_DIR / "image_tasks.json", "data/image_tasks.json")
-                self._add_file_to_archive(archive, IMAGE_INDEX_FILE, "data/image_index.json")
+            self._add_file_to_archive(archive, IMAGE_INDEX_FILE, "data/image_index.json")
+            self._add_file_to_archive(archive, R2_USAGE_FILE, "data/r2_usage.json")
             if include.get("accounts_snapshot"):
                 self._add_bytes_to_archive(
                     archive,
@@ -450,9 +448,6 @@ class BackupService:
                     "snapshots/auth_keys.json",
                     _json_bytes(config.get_storage_backend().load_auth_keys()),
                 )
-            if include.get("images"):
-                self._add_file_to_archive(archive, TAGS_FILE, "data/image_tags.json")
-                self._add_directory_to_archive(archive, config.images_dir, "data/images")
         return buffer.getvalue()
 
     def _add_bytes_to_archive(self, archive: tarfile.TarFile, name: str, payload: bytes) -> None:
@@ -465,14 +460,6 @@ class BackupService:
         if not source.exists() or not source.is_file():
             return
         archive.add(source, arcname=arcname)
-
-    def _add_directory_to_archive(self, archive: tarfile.TarFile, source_dir: Path, arcname_root: str) -> None:
-        if not source_dir.exists() or not source_dir.is_dir():
-            return
-        for path in sorted(source_dir.rglob("*")):
-            if path.is_file():
-                relative = path.relative_to(source_dir).as_posix()
-                archive.add(path, arcname=f"{arcname_root}/{relative}")
 
 
 backup_service = BackupService()

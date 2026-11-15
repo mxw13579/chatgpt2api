@@ -1,7 +1,7 @@
 <h1 align="center">ChatGPT2API</h1>
 
 
-<p align="center">ChatGPT2API 主要是对 ChatGPT 官网相关能力进行逆向整理与封装，提供面向 ChatGPT 图片生成、图片编辑、多图组图编辑场景的 OpenAI 兼容图片 API / 代理，并集成在线画图、号池管理、多种账号导入方式与 Docker 自托管部署能力。</p>
+<p align="center">ChatGPT2API 主要是对 ChatGPT 官网相关能力进行逆向整理与封装，提供面向 ChatGPT 图片生成、图片编辑、多图组图编辑场景的 OpenAI 兼容图片 API / 代理，并集成号池管理、多种账号导入方式与 Docker 自托管部署能力。</p>
 
 > [!WARNING]
 > 免责声明：
@@ -129,12 +129,12 @@ environment:
 
 ## 功能
 
-### 图片存储与多账号 R2
+### 图片存储（Cloudflare R2）
 
-- 默认 / `b64_json` 图片直接返回，不上传、不写本地；只有 `url` 及网页图片任务使用配置的图片存储。
-- 在「设置 → 图片存储」选择 R2，可配置多个 Cloudflare 账号分摊免费额度：按本月上传次数自动选择用量最低的账号，图片分钟级过期清理，无需 Worker。
-- R2 模式只在服务器保留元数据，无本地原图或缩略图；无可用额度时不回退本地。旧图片须显式清理，不自动迁移或删除。
-- 自定义域名、关闭 r2.dev 和限速规则在 Cloudflare 后台配置；接入步骤及额度说明见 [R2 图片存储使用说明](docs/r2-image-storage.md)。
+- 默认 / `b64_json` 图片直接返回，不上传、不保存；只有 `response_format=url` 会把图片上传到 R2 并返回链接。
+- R2 是唯一的图片存储方式。在「设置 → 图片存储」可添加多个 Cloudflare 账号分摊免费额度：按本月上传次数自动选择用量最低的账号，图片分钟级过期清理，无需 Worker。
+- 服务器只保留图片索引和用量计数。没有可用 R2 账号时，`url` 请求在生图前直接失败。
+- 支持一键开通（填入 Cloudflare API Token 和域名，自动建桶并绑定域名）；额度说明和接入步骤见 [R2 图片存储使用说明](docs/r2-image-storage.md)。
 
 ### API 兼容能力
 
@@ -150,17 +150,6 @@ environment:
 - 支持生成可编辑 PSD 文件
 - 支持 Codex 中的画图接口逆向，仅 `Plus` / `Team` / `Pro` 订阅可用，模型别名为 `codex-gpt-image-2`，如有需要可自行在其他场景映射回
   `gpt-image-2`，用于和官网画图区分；也就意味着同一账号会同时有官网和 Codex 两份生图额度
-
-### 在线画图功能
-
-- 内置在线画图工作台，支持生成、图片编辑与多图组图编辑
-- 支持 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、`gpt-5-mini` 模型选择
-- 编辑模式支持参考图上传
-- 前端支持多图生成交互
-- 本地保存图片会话历史，支持回看、删除和清空
-- 支持服务端缓存图片URL
-- 图片生成进度追踪，超时后可继续等待
-- 图片懒加载与滚动位置记忆，优化大量图片场景性能
 
 ### 号池管理功能
 
@@ -182,10 +171,6 @@ environment:
 ## 效果展示
 
 <table width="100%">
-  <tr>
-    <td width="50%"><img src="https://i.ibb.co/Jj8nfwwP/image.png" alt="image" border="0"></td>
-    <td width="50%"><img src="https://i.ibb.co/pqf235v/image-edit.png" alt="image edit" border="0"></td>
-  </tr>
   <tr>
     <td width="50%"><img src="https://i.ibb.co/tPcqtVfd/chery-studio.png" alt="chery studio" border="0"></td>
     <td width="50%"><img src="https://i.ibb.co/PsT9YHBV/account-pool.png" alt="account pool" border="0"></td>

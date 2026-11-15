@@ -7,7 +7,6 @@ import re
 import sys
 from pathlib import Path
 from threading import RLock
-import time
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -25,20 +24,11 @@ DEFAULT_BACKUP_INCLUDE = {
     "cpa": True,
     "sub2api": True,
     "logs": True,
-    "image_tasks": True,
     "accounts_snapshot": True,
     "auth_keys_snapshot": True,
-    "images": False,
 }
 
 DEFAULT_IMAGE_STORAGE = {
-    "enabled": False,
-    "mode": "local",
-    "webdav_url": "",
-    "webdav_username": "",
-    "webdav_password": "",
-    "webdav_root_path": "chatgpt2api/images",
-    "public_base_url": "",
     "retention_minutes": 60,
     "cleanup_interval_seconds": 60,
     "cache_ttl_seconds": 60,
@@ -243,30 +233,17 @@ def _normalize_r2_account(source: object) -> dict[str, object]:
 
 def _normalize_image_storage_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
-    mode = str(source.get("mode") or "local").strip().lower()
-    if mode not in {"local", "webdav", "both", "r2"}:
-        mode = "local"
-    enabled = _normalize_bool(source.get("enabled"), False)
-    # Never silently turn a misconfigured R2 mode into local persistence.
-    if not enabled and mode != "r2":
-        mode = "local"
     accounts = source.get("r2_accounts", [])
     if not isinstance(accounts, list):
         raise ValueError("图片存储 r2_accounts 必须是列表")
-    root_path = str(source.get("webdav_root_path") or DEFAULT_IMAGE_STORAGE["webdav_root_path"]).strip().strip("/")
     return {
-        "enabled": enabled,
-        "mode": mode,
-        "webdav_url": str(source.get("webdav_url") or "").strip().rstrip("/"),
-        "webdav_username": str(source.get("webdav_username") or "").strip(),
-        "webdav_password": str(source.get("webdav_password") or "").strip(),
-        "webdav_root_path": root_path or str(DEFAULT_IMAGE_STORAGE["webdav_root_path"]),
-        "public_base_url": str(source.get("public_base_url") or "").strip().rstrip("/"),
         **{
             field: _image_storage_int(source, field, DEFAULT_IMAGE_STORAGE[field])
             for field in ("retention_minutes", "cleanup_interval_seconds")
         },
-        "cache_ttl_seconds": _image_storage_int(source, "cache_ttl_seconds", 60, minimum=0),
+        "cache_ttl_seconds": _image_storage_int(
+            source, "cache_ttl_seconds", DEFAULT_IMAGE_STORAGE["cache_ttl_seconds"], minimum=0,
+        ),
         "r2_accounts": [_normalize_r2_account(account) for account in accounts],
     }
 
@@ -420,14 +397,6 @@ def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
 
 
 def _validate_image_storage_settings(settings: dict[str, object]) -> None:
-    if settings["mode"] == "r2" and not settings["enabled"]:
-        raise ValueError("R2 图片存储必须设置 enabled=true")
-    if settings["enabled"] and settings["mode"] in {"webdav", "both"}:
-        if not settings["webdav_url"]:
-            raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV URL")
-        if not settings["webdav_password"]:
-            raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV 密码")
-
     internal_ids: set[str] = set()
     cf_ids: set[str] = set()
     for account in settings["r2_accounts"]:
@@ -524,13 +493,6 @@ class ConfigStore:
             return int(self.data.get("refresh_account_interval_minute", 5))
         except (TypeError, ValueError):
             return 5
-
-    @property
-    def image_retention_days(self) -> int:
-        try:
-            return max(1, int(self.data.get("image_retention_days", 30)))
-        except (TypeError, ValueError):
-            return 30
 
     @property
     def image_poll_timeout_secs(self) -> int:
@@ -725,32 +687,6 @@ class ConfigStore:
         return value if value in {"auto", "standard", "extended", "max"} else "auto"
 
     @property
-    def images_dir(self) -> Path:
-        path = DATA_DIR / "images"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    @property
-    def image_thumbnails_dir(self) -> Path:
-        path = DATA_DIR / "image_thumbnails"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def cleanup_old_images(self) -> int:
-        cutoff = time.time() - self.image_retention_days * 86400
-        removed = 0
-        for path in self.images_dir.rglob("*"):
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                path.unlink()
-                removed += 1
-        for path in sorted((p for p in self.images_dir.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
-            try:
-                path.rmdir()
-            except OSError:
-                pass
-        return removed
-
-    @property
     def base_url(self) -> str:
         return str(
             os.getenv("CHATGPT2API_BASE_URL")
@@ -769,7 +705,6 @@ class ConfigStore:
     def get(self) -> dict[str, object]:
         data = dict(self.data)
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
-        data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs

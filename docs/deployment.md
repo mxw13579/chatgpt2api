@@ -103,6 +103,27 @@ docker compose logs --tail=100 app
 
 此流程只更新主应用容器，不重新部署数据库。生产环境也可以将 `latest` 换成版本标签，或 Actions Summary 中的 `ghcr.io/mxw13579/chatgpt2api@sha256:...` 引用，以固定版本和便于回滚。
 
+### 1.9.11 升级注意
+
+移除本地和 WebDAV 图片存储、网页画图页面和图片管理页面，R2 成为唯一的图片存储方式：
+
+- `response_format=url` 需要至少一个已启用且未达上限的 R2 账号，否则在生图前直接失败；默认及 `b64_json` 不受影响。升级前仍在使用本地或 WebDAV 存储的部署，请先在「设置 → 图片存储」配置好 R2。
+- `config.json` 中 `image_storage` 的 `mode`、`enabled`、`webdav_*`、`public_base_url` 以及 `image_retention_days` 不再读取，无需手动删除。
+- 升级时在停止旧容器后清除图片索引中的非 R2 条目（未使用过本地或 WebDAV 存储的部署可跳过）：
+
+  ```bash
+  python3 - <<'EOF'
+  import json
+  path = "data/image_index.json"
+  doc = json.load(open(path))
+  doc["items"] = {k: v for k, v in doc["items"].items() if v.get("storage") == "r2"}
+  json.dump(doc, open(path, "w"), ensure_ascii=False)
+  EOF
+  ```
+
+- 旧的本地图片目录 `data/images/`、`data/image_thumbnails/` 以及 `data/image_tasks.json`、`data/image_tags.json` 不再使用，确认无需保留后可手动删除。旧日志中指向本机 `/images/...` 的图片链接将失效。
+- 非管理员用户登录网页后只显示 API 使用提示。
+
 ### 1.9.9 升级注意
 
 R2 图片存储精简为按每月上传次数分配，不迁移旧 R2 配置：旧账号的域名、预算、计费周期和防护字段在读取时被忽略。已启用的 R2 账号需在「设置 → 图片存储」补填公开访问地址（桶绑定的自定义域名）并保存，再点击测试连接。自定义域名、关闭 r2.dev 和限速规则请在 Cloudflare 后台配置，详见 [R2 图片存储](r2-image-storage.md)。

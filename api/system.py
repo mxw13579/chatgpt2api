@@ -2,28 +2,16 @@ from __future__ import annotations
 
 from urllib.parse import quote
 
-from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, ConfigDict
 
-from api.support import require_admin, require_identity, resolve_image_base_url
+from api.support import require_admin, require_identity
 from services.backup_service import BackupError, backup_service
 from services.config import config
-from services.image_service import (
-    compress_images,
-    delete_images,
-    delete_to_target,
-    download_images_zip,
-    get_image_download_response,
-    get_image_response,
-    get_thumbnail_response,
-    list_images,
-    storage_stats,
-)
-from services.image_model_service import get_image_model_catalog, refresh_image_model_catalog
-from services.image_storage_service import ImageStorageError, image_storage_service
-from services.image_tags_service import delete_tag, get_all_tags, set_tags
+from services.image_service import get_image_response
+from services.image_model_service import refresh_image_model_catalog
 from services.log_service import log_service
 from services.proxy_service import proxy_settings, test_clearance, test_proxy
 
@@ -39,19 +27,6 @@ class ProxyTestRequest(BaseModel):
 class ClearanceTestRequest(BaseModel):
     target_url: str = "https://chatgpt.com"
 
-
-class ImageDeleteRequest(BaseModel):
-    paths: list[str] = []
-    start_date: str = ""
-    end_date: str = ""
-    all_matching: bool = False
-
-class ImageDownloadRequest(BaseModel):
-    paths: list[str]
-
-class ImageTagsRequest(BaseModel):
-    path: str
-    tags: list[str]
 
 class LogDeleteRequest(BaseModel):
     ids: list[str] = []
@@ -95,48 +70,14 @@ def create_router(app_version: str) -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
-    @router.get("/api/image-models")
-    async def get_image_models(authorization: str | None = Header(default=None)):
-        require_identity(authorization)
-        return get_image_model_catalog()
-
     @router.post("/api/image-models/refresh")
     async def refresh_image_models(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return await run_in_threadpool(refresh_image_model_catalog)
 
-    @router.get("/api/images")
-    async def get_images(request: Request, start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return await run_in_threadpool(list_images, resolve_image_base_url(request), start_date=start_date.strip(), end_date=end_date.strip())
-
     @router.get("/images/{image_path:path}", include_in_schema=False)
     async def get_image(image_path: str):
         return await run_in_threadpool(get_image_response, image_path)
-
-    @router.get("/image-thumbnails/{image_path:path}", include_in_schema=False)
-    async def get_image_thumbnail(image_path: str):
-        return await run_in_threadpool(get_thumbnail_response, image_path)
-
-    @router.post("/api/images/delete")
-    async def delete_images_endpoint(body: ImageDeleteRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return await run_in_threadpool(delete_images, body.paths, start_date=body.start_date.strip(), end_date=body.end_date.strip(), all_matching=body.all_matching)
-
-    @router.post("/api/images/download")
-    async def download_images_endpoint(body: ImageDownloadRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        buf = await run_in_threadpool(download_images_zip, body.paths)
-        return StreamingResponse(
-            buf,
-            media_type="application/zip",
-            headers={"Content-Disposition": 'attachment; filename="images.zip"'},
-        )
-
-    @router.get("/api/images/download/{image_path:path}")
-    async def download_single_image_endpoint(image_path: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return await run_in_threadpool(get_image_download_response, image_path)
 
     @router.get("/api/logs")
     async def get_logs(type: str = "", start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
@@ -198,19 +139,6 @@ def create_router(app_version: str) -> APIRouter:
         except BackupError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
-    @router.post("/api/image-storage/test")
-    async def test_image_storage_endpoint(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {"result": await run_in_threadpool(image_storage_service.test_webdav)}
-
-    @router.post("/api/image-storage/sync")
-    async def sync_image_storage_endpoint(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        try:
-            return {"result": await run_in_threadpool(image_storage_service.sync_all)}
-        except ImageStorageError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-
     @router.get("/api/backups")
     async def get_backups(authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -266,46 +194,6 @@ def create_router(app_version: str) -> APIRouter:
             media_type=str(item.get("content_type") or "application/octet-stream"),
             headers=headers,
         )
-
-
-    @router.get("/api/images/tags")
-    async def list_image_tags(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {"tags": get_all_tags()}
-
-    @router.post("/api/images/tags")
-    async def update_image_tags(body: ImageTagsRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        rel = body.path.strip().lstrip("/")
-        if not rel:
-            raise HTTPException(status_code=400, detail={"error": "path is required"})
-        tags = set_tags(rel, body.tags)
-        return {"ok": True, "tags": tags}
-
-    @router.delete("/api/images/tags/{tag}")
-    async def delete_image_tag(tag: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        count = delete_tag(tag)
-        return {"ok": True, "removed_from": count}
-
-    @router.get("/api/images/storage")
-    async def get_image_storage(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return await run_in_threadpool(storage_stats)
-
-    @router.post("/api/images/storage/compress")
-    async def compress_all_images(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return await run_in_threadpool(compress_images)
-
-    @router.post("/api/images/storage/cleanup-to-target")
-    async def cleanup_to_target(
-        target_free_mb: int = 500,
-        dry_run: bool = False,
-        authorization: str | None = Header(default=None),
-    ):
-        require_admin(authorization)
-        return await run_in_threadpool(delete_to_target, target_free_mb, dry_run)
 
     @router.get("/health", response_model=None)
     async def health_dashboard(format: str = Query(default="html")):

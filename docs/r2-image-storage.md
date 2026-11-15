@@ -3,9 +3,9 @@
 ## 行为
 
 - Images 默认或 `response_format=b64_json`：只返回 Base64，不上传、不保存。Chat/Responses 图片同样不保存。
-- Images `response_format=url` 及网页图片任务：按当前存储模式保存。R2 模式下每张图上传一次，返回 `公开访问地址/images/...`。
-- 服务器只保存图片索引（`data/image_index.json`）和每账号本月上传次数（`data/r2_usage.json`），不保存原图或缩略图。
-- 没有可用账号或上传失败时直接报错，不回退本地/WebDAV。
+- Images `response_format=url`：每张图上传到 R2 一次，返回 `公开访问地址/images/...`。R2 是唯一的图片存储方式。
+- 服务器只保存图片索引（`data/image_index.json`）和每账号本月上传次数（`data/r2_usage.json`），不保存原图。
+- 没有可用账号时，`url` 请求在生图前直接报错；上传失败也直接报错。
 
 ## 多账号分摊免费额度
 
@@ -29,14 +29,14 @@ R2 免费额度按 Cloudflare 账号计算：每月 100 万次 A 类操作、100
 
 Token 原文不保存：配置中只保存由它推导出的 S3 凭据（Access Key ID 为 Token ID，Secret 为 Token 值的 SHA-256），该凭据可读写此账号下所有 R2 桶，但不能修改 DNS。在 Cloudflare 删除该 Token 会使凭据失效。
 
-域名证书生效需几分钟，之后点击「测试连接」，再把存储模式切换为 R2 并保存。限速规则不自动创建，需要时在该域名的 Zone 手动添加（例如对 `/images/` 路径每 IP 10 秒 120 次）。
+域名证书生效需几分钟，之后点击「测试连接」。限速规则不自动创建，需要时在该域名的 Zone 手动添加（例如对 `/images/` 路径每 IP 10 秒 120 次）。
 
 ### 手动填写
 
 1. 在 Cloudflare 创建一个专用图片桶（不要与备份共用），绑定自定义域名并关闭 `r2.dev` 公开访问。
 2. 创建一个仅限该桶对象读写的 R2 API Token，记下 Access Key ID / Secret Access Key。
 3. 在 **设置 → 图片存储** 添加账号，填写 CF Account ID、桶名、S3 凭据、公开访问地址（如 `https://img.example.com`），勾选启用并保存。
-4. 点击「测试连接」，然后把存储模式切换为 R2 并保存。
+4. 点击「测试连接」。
 
 ## 账号变更
 
@@ -56,4 +56,4 @@ Cache-Control: public, max-age=0, s-maxage=60, must-revalidate
 
 ## 旧数据
 
-切换到 R2 不会迁移或删除本地/WebDAV 旧图片。需要清理时在设置页执行「显式清理旧本地图」，该操作不删除 R2 对象和 WebDAV 远端文件。
+1.9.11 起不再支持本地和 WebDAV 图片存储。升级前留下的本地图片（`data/images/`、`data/image_thumbnails/`）、`data/image_tasks.json` 和 `data/image_tags.json` 不再被读取，可手动删除；`data/image_index.json` 中的非 R2 条目需在升级时清除，见[部署与升级指南](deployment.md)。

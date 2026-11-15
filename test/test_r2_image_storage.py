@@ -50,7 +50,7 @@ class R2ImageStorageTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.now = datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc)
-        self.settings = {"mode": "r2", "enabled": True, "retention_minutes": 60, "cache_ttl_seconds": 60,
+        self.settings = {"retention_minutes": 60, "cleanup_interval_seconds": 60, "cache_ttl_seconds": 60,
                          "r2_accounts": [account(1), account(2, limit=20)]}
         for name, value in (("DATA_DIR", self.root), ("config", SyntheticConfig(self.settings))):
             patcher = mock.patch.object(storage, name, value)
@@ -90,6 +90,12 @@ class R2ImageStorageTests(unittest.TestCase):
         self.settings["r2_accounts"][0]["enabled"] = False
         with self.assertRaises(ImageStorageError):
             self.service.save(image_bytes())
+        with self.assertRaises(ImageStorageError):
+            self.service.require_upload_available()
+
+    def test_require_upload_available_raises_without_usable_account(self):
+        self.service.require_upload_available()
+        self.settings["r2_accounts"] = []
         with self.assertRaises(ImageStorageError):
             self.service.require_upload_available()
 
@@ -135,7 +141,7 @@ class R2ImageStorageTests(unittest.TestCase):
 
 class R2ConfigTests(unittest.TestCase):
     def normalize(self, accounts: list[dict]) -> dict:
-        settings = config_module._normalize_image_storage_settings({"enabled": True, "mode": "r2", "r2_accounts": accounts})
+        settings = config_module._normalize_image_storage_settings({"r2_accounts": accounts})
         config_module._validate_image_storage_settings(settings)
         return settings
 
@@ -145,6 +151,10 @@ class R2ConfigTests(unittest.TestCase):
         normalized = self.normalize([source])["r2_accounts"][0]
         self.assertEqual(normalized["monthly_upload_limit"], 900_000)
         self.assertEqual(normalized["public_base_url"], "https://img1.example.test")
+
+    def test_settings_have_exactly_the_contract_keys(self):
+        old = {"mode": "webdav", "enabled": True, "webdav_url": "https://dav.example.test", "public_base_url": "x"}
+        self.assertEqual(config_module._normalize_image_storage_settings(old), config_module.DEFAULT_IMAGE_STORAGE)
 
     def test_enabled_account_requires_public_base_url(self):
         with self.assertRaisesRegex(ValueError, "public_base_url"):

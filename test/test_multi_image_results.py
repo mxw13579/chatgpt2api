@@ -432,7 +432,6 @@ class MultiImageResultTests(unittest.TestCase):
         backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
         backend.access_token = "token"
         backend.image_request_deadline = 100.25
-        backend.progress_callback = None
         backend._upload_image = mock.Mock()
         backend._bootstrap = mock.Mock()
         backend._get_chat_requirements = mock.Mock(return_value=mock.Mock(token="token", proof_token="", turnstile_token="", so_token=""))

@@ -328,14 +328,7 @@ def _format_image_result_item(
     if response_format == "b64_json":
         result_item["b64_json"] = b64_json or base64.b64encode(image_data).decode("ascii")
     else:
-        stored = image_storage_service.save(image_data, base_url)
-        result_item["url"] = stored.url
-        if stored.storage == "r2":
-            result_item["_storage_reference"] = {
-                "image_id": stored.image_id,
-                "account_id": stored.account_id,
-                "expires_at": stored.expires_at,
-            }
+        result_item["url"] = image_storage_service.save(image_data).url
     return result_item
 
 
@@ -392,7 +385,6 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     strict_image_results: bool = False
-    progress_callback: Any = None  # Callable[[str], None] | None
 
 
 @dataclass
@@ -466,10 +458,7 @@ class ImageOutput:
         elif self.kind == "result":
             chunk.update({
                 "object": "image.generation.result",
-                "data": [
-                    {key: value for key, value in item.items() if key != "_storage_reference"}
-                    for item in self.data
-                ],
+                "data": self.data,
             })
             chunk.pop("progress_text", None)
             chunk.pop("upstream_event_type", None)
@@ -1268,8 +1257,6 @@ def stream_image_outputs(
         "tool_invoked": last.get("tool_invoked"),
         "turn_use_case": last.get("turn_use_case"),
     })
-    if request.progress_callback:
-        request.progress_callback("image_stream_resolve_start")
     if message and not file_ids and not sediment_ids and last.get("blocked"):
         # 尝试从 /backend-api/tasks/ 获取详细错误信息
         detailed_error = _get_detailed_error_from_tasks(backend, conversation_id)
@@ -1378,8 +1365,6 @@ def stream_image_outputs(
             raise
 
     if image_urls:
-        if request.progress_callback:
-            request.progress_callback("receiving_image")
         data = _format_image_bytes(
             backend.download_image_bytes(image_urls),
             request.prompt,
@@ -1472,8 +1457,6 @@ def stream_image_outputs(
                     conversation_id, file_ids, sediment_ids, poll=False,
                 )
                 if image_urls:
-                    if request.progress_callback:
-                        request.progress_callback("receiving_image")
                     data = _format_image_bytes(
                         backend.download_image_bytes(image_urls),
                         request.prompt,
@@ -1581,8 +1564,6 @@ def stream_image_outputs(
                 conversation_id, file_ids, sediment_ids, poll=False,
             )
             if image_urls:
-                if request.progress_callback:
-                    request.progress_callback("receiving_image")
                 data = _format_image_bytes(
                     backend.download_image_bytes(image_urls),
                     request.prompt,
@@ -1693,8 +1674,6 @@ def _generate_single_image(
                 f"也可能是账号被限流或生图队列拥堵导致。"
             )
         try:
-            if request.progress_callback:
-                request.progress_callback("getting_account")
             plan_type, _ = split_image_model(request.model)
             codex_model = is_codex_image_model(request.model)
             token = account_service.get_available_access_token(
@@ -1721,8 +1700,6 @@ def _generate_single_image(
         try:
             backend = OpenAIBackendAPI(access_token=token)
             backend.image_request_deadline = request_deadline
-            if request.progress_callback:
-                backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
             outputs: list[ImageOutput] = []
             last_conversation_id = ""
@@ -2036,9 +2013,7 @@ def stream_image_chunks(outputs: Iterable[ImageOutput]) -> Iterator[dict[str, An
         yield output.to_chunk()
 
 
-def collect_image_outputs(
-    outputs: Iterable[ImageOutput], *, include_storage_reference: bool = False,
-) -> dict[str, Any]:
+def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
     created = None
     data: list[dict[str, Any]] = []
     message = ""
@@ -2053,11 +2028,7 @@ def collect_image_outputs(
         elif output.kind == "message":
             message = output.text
         elif output.kind == "result":
-            data.extend(
-                dict(item) if include_storage_reference else
-                {key: value for key, value in item.items() if key != "_storage_reference"}
-                for item in output.data
-            )
+            data.extend(output.data)
 
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if not data:

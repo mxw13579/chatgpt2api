@@ -63,7 +63,7 @@ class ImageBytesOutputTests(unittest.TestCase):
                     self.save.reset_mock()
                     self.save.side_effect = STORED_IMAGES
                     request = conversation.ConversationRequest(
-                        model="gpt-image-2", prompt=" draw ", base_url=BASE_URL, progress_callback=mock.Mock(),
+                        model="gpt-image-2", prompt=" draw ", base_url=BASE_URL,
                     )
                     if response_format is not None:
                         request.response_format = response_format
@@ -83,13 +83,10 @@ class ImageBytesOutputTests(unittest.TestCase):
                         ("result", "gpt-image-2", 2, 3, 123, "synthetic-conversation"),
                     )
                     self.assertEqual(output.to_chunk()["_conversation_id"], "synthetic-conversation")
-                    self.assertEqual(self.save.call_args_list, [mock.call(data, BASE_URL) for data in IMAGE_BYTES] if key == "url" else [])
+                    self.assertEqual(self.save.call_args_list, [mock.call(data) for data in IMAGE_BYTES] if key == "url" else [])
                     self.assertEqual(encode.call_args_list, [] if key == "url" else [mock.call(data) for data in IMAGE_BYTES])
                     self.backend.download_image_bytes.assert_called_once_with(IMAGE_URLS)
                     self.assertEqual(self.backend._poll_image_results.call_count, int(branch != "direct"))
-                    self.assertEqual(request.progress_callback.call_args_list, [
-                        mock.call("image_stream_resolve_start"), mock.call("receiving_image"),
-                    ])
 
     def test_empty_downloads_do_not_emit_success(self) -> None:
         for response_format in ("b64_json", "url"):

@@ -49,9 +49,7 @@ def _composite_mask(
     return result
 
 
-def handle(
-    body: dict[str, Any], *, include_storage_reference: bool = False,
-) -> dict[str, Any] | Iterator[dict[str, Any]]:
+def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     prompt = str(body.get("prompt") or "")
     images = body.get("images") or []
     masks = body.get("mask") or []
@@ -62,7 +60,6 @@ def handle(
     quality = str(body.get("quality") or "auto")
     response_format = str(body.get("response_format") or "b64_json")
     base_url = str(body.get("base_url") or "") or None
-    progress_callback = body.get("progress_callback")
     encoded_images = encode_images(images)
     if not encoded_images:
         raise ImageGenerationError("image is required")
@@ -76,11 +73,10 @@ def handle(
         base_url=base_url,
         images=encoded_images,
         message_as_error=True,
-        progress_callback=progress_callback,
     ))
     if body.get("stream"):
         return stream_image_chunks(outputs)
-    result = collect_image_outputs(outputs, include_storage_reference=include_storage_reference)
+    result = collect_image_outputs(outputs)
     result["usage"] = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
         input_image_tokens=count_image_inputs_tokens(images, model),

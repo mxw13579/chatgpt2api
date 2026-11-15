@@ -42,7 +42,6 @@ def test_images_return_only_the_selected_format(monkeypatch, path, handler, resp
     app.include_router(ai.create_router())
     payload = {
         "model": "gpt-image-2", "prompt": "draw", "stream": stream,
-        "include_storage_reference": True,  # Untrusted body flags must never expose internal references.
     }
     if response_format is not None:
         payload["response_format"] = response_format

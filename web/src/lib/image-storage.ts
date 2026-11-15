@@ -2,17 +2,13 @@ import { httpRequest } from "@/lib/request";
 import type { ImageReference, ImageStorageSettings, R2Account } from "@/lib/api";
 
 export const DEFAULT_IMAGE_STORAGE: ImageStorageSettings = {
-  enabled: false, mode: "local", webdav_url: "", webdav_username: "", webdav_password: "",
-  webdav_root_path: "chatgpt2api/images", public_base_url: "",
   retention_minutes: 60, cleanup_interval_seconds: 60, cache_ttl_seconds: 60, r2_accounts: [],
 };
 
-// 保留期和上传上限不改变现有图片 URL；R2 访问地址变更在比较账号列表时处理。旧 WebDAV 图片仍依赖连接配置。
+// 保留期、启用状态和上传上限不改变现有图片 URL；只有账号及其公开访问地址变化才影响已有图片。
 export function imageStorageSettingsAffectImages(previous: ImageStorageSettings, next: ImageStorageSettings): boolean {
-  return (["mode", "enabled", "public_base_url", "webdav_url", "webdav_username", "webdav_password", "webdav_root_path"] as const)
-    .some((key) => previous[key] !== next[key])
-    || JSON.stringify(previous.r2_accounts.map((item) => [item.id, item.public_base_url]))
-      !== JSON.stringify(next.r2_accounts.map((item) => [item.id, item.public_base_url]));
+  return JSON.stringify(previous.r2_accounts.map((item) => [item.id, item.public_base_url]))
+    !== JSON.stringify(next.r2_accounts.map((item) => [item.id, item.public_base_url]));
 }
 
 export function newR2Account(): R2Account {
@@ -29,10 +25,7 @@ export function newR2Account(): R2Account {
 }
 
 export type R2AccountSummary = { id: string; month: string; monthly_uploads: number; image_count: number };
-export type ImageStorageOverview = {
-  settings: ImageStorageSettings; accounts: R2AccountSummary[];
-  legacy?: Record<string, unknown>;
-};
+export type ImageStorageOverview = { settings: ImageStorageSettings; accounts: R2AccountSummary[] };
 export type StorageActionResult = { ok: boolean; error?: string; status?: number };
 export type CleanupResult = { removed?: number; failed?: number; pending?: number; [key: string]: unknown };
 const root = "/api/image-storage";
@@ -40,13 +33,12 @@ const accountPath = (id: string) => `${root}/accounts/${encodeURIComponent(id)}`
 
 export const getImageStorageOverview = () => httpRequest<ImageStorageOverview>(root);
 export const saveImageStorageSettings = (body: ImageStorageSettings) =>
-  httpRequest<ImageStorageOverview>(root, { method: "PUT", body: { ...body, enabled: body.mode === "r2" || body.enabled } });
+  httpRequest<ImageStorageOverview>(root, { method: "PUT", body });
 export const testR2Account = (id: string) =>
   httpRequest<{ result: StorageActionResult }>(`${accountPath(id)}/test`, { method: "POST", body: {} });
 export const provisionR2Account = (api_token: string, domain: string) =>
   httpRequest<ImageStorageOverview>(`${root}/accounts/provision`, { method: "POST", body: { api_token, domain } });
 export const cleanupExpiredImages = () => httpRequest<{ result: CleanupResult }>(`${root}/cleanup`, { method: "POST", body: {} });
-export const cleanupLegacyImages = () => httpRequest<{ result: CleanupResult }>(`${root}/legacy/cleanup`, { method: "POST", body: { confirm: true } });
 export const resolveImageReferences = (images: ImageReference[]) =>
   httpRequest<{ items: Array<ImageReference & { url: string }> }>(`${root}/resolve`, {
     method: "POST", body: { images: images.map(({ image_id, account_id }) => ({ image_id, account_id })) },

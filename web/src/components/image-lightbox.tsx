@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { ChevronLeft, ChevronRight, Download, X } from "lucide-react";
 
-import { useCachedImageSource } from "@/hooks/use-cached-image-source";
+import { useImageExpiry } from "@/hooks/use-image-expiry";
 import { downloadImageSource } from "@/lib/image-cache";
 import { toast } from "sonner";
 import type { ImageReference } from "@/lib/api";
@@ -129,8 +129,9 @@ export function ImageLightbox({
       resolved && resolved.id === imageId && resolved.original === original ? resolved.image : undefined)
     : current;
   const source = isR2Image(current) ? (reference as (ImageReference & { url?: string }))?.url || "" : original;
-  const currentImageSrc = useCachedImageSource(source, open && Boolean(current), reference);
-  const blocked = isImageUnavailable(reference);
+  const now = useImageExpiry(reference ? [reference] : []);
+  const blocked = isImageUnavailable(reference, now);
+  const currentImageSrc = open && !blocked && source ? source : null;
   const hasPrev = currentIndex > 0;
   const hasNext = currentIndex < images.length - 1;
 

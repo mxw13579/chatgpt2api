@@ -1,10 +1,9 @@
-import { httpRequest, request } from "@/lib/request";
+import { httpRequest } from "@/lib/request";
 
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
 export type ImageModel = string;
 export type AuthRole = "admin" | "user";
-export type ImageStorageMode = "local" | "webdav" | "both" | "r2";
 
 export type ImageReference = {
   image_id?: string;
@@ -30,13 +29,6 @@ export type R2Account = {
 };
 
 export type ImageStorageSettings = {
-  enabled: boolean;
-  mode: ImageStorageMode;
-  webdav_url: string;
-  webdav_username: string;
-  webdav_password: string;
-  webdav_root_path: string;
-  public_base_url: string;
   retention_minutes: number;
   cleanup_interval_seconds: number;
   cache_ttl_seconds: number;
@@ -194,7 +186,6 @@ export type SettingsConfig = {
     prompt?: string;
   };
   refresh_account_interval_minute?: number | string;
-  image_retention_days?: number | string;
   image_poll_timeout_secs?: number | string;
   image_account_concurrency?: number | string;
   default_image_model?: string;
@@ -226,10 +217,8 @@ export type BackupInclude = {
   cpa: boolean;
   sub2api: boolean;
   logs: boolean;
-  image_tasks: boolean;
   accounts_snapshot: boolean;
   auth_keys_snapshot: boolean;
-  images: boolean;
 };
 
 export type BackupSettings = {
@@ -285,20 +274,6 @@ export type BackupDetail = {
   }>;
 };
 
-export type ManagedImage = ImageReference & {
-  rel: string;
-  path?: string;
-  name: string;
-  date: string;
-  size: number;
-  url: string;
-  thumbnail_url?: string;
-  created_at: string;
-  width?: number;
-  height?: number;
-  tags?: string[];
-};
-
 export type SystemLog = {
   id: string;
   time: string;
@@ -306,28 +281,6 @@ export type SystemLog = {
   summary?: string;
   detail?: Record<string, unknown>;
   [key: string]: unknown;
-};
-
-export type ImageTask = {
-  id: string;
-  status: "queued" | "running" | "success" | "error";
-  mode: "generate" | "edit";
-  model?: ImageModel;
-  size?: string;
-  quality?: string;
-  created_at: string;
-  updated_at: string;
-  conversation_id?: string;
-  data?: Array<ImageReference & { b64_json?: string; url?: string; revised_prompt?: string }>;
-  error?: string;
-  progress?: string;
-  elapsed_secs?: number;
-  duration_ms?: number;
-};
-
-type ImageTaskListResponse = {
-  items: ImageTask[];
-  missing_ids: string[];
 };
 
 export type LoginResponse = {
@@ -442,70 +395,6 @@ export async function updateAccount(
   });
 }
 
-export async function createImageGenerationTask(clientTaskId: string, prompt: string, model?: ImageModel, size?: string, quality = "auto") {
-  return httpRequest<ImageTask>("/api/image-tasks/generations", {
-    method: "POST",
-    body: {
-      client_task_id: clientTaskId,
-      prompt,
-      ...(model ? { model } : {}),
-      ...(size ? { size } : {}),
-      quality,
-    },
-  });
-}
-
-export async function createImageEditTask(
-  clientTaskId: string,
-  files: File | File[],
-  prompt: string,
-  model?: ImageModel,
-  size?: string,
-  quality = "auto",
-  masks?: File | File[],
-) {
-  const formData = new FormData();
-  const uploadFiles = Array.isArray(files) ? files : [files];
-
-  uploadFiles.forEach((file) => {
-    formData.append("image", file);
-  });
-  const maskFiles = masks ? (Array.isArray(masks) ? masks : [masks]) : [];
-  maskFiles.forEach((file) => {
-    formData.append("mask", file);
-  });
-  formData.append("client_task_id", clientTaskId);
-  formData.append("prompt", prompt);
-  if (model) {
-    formData.append("model", model);
-  }
-  if (size) {
-    formData.append("size", size);
-  }
-  formData.append("quality", quality);
-
-  return httpRequest<ImageTask>("/api/image-tasks/edits", {
-    method: "POST",
-    body: formData,
-  });
-}
-
-export async function fetchImageTasks(ids: string[]) {
-  const params = new URLSearchParams();
-  if (ids.length > 0) {
-    params.set("ids", ids.join(","));
-  }
-  params.set("_t", String(Date.now()));
-  return httpRequest<ImageTaskListResponse>(`/api/image-tasks?${params.toString()}`);
-}
-
-export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30) {
-  return httpRequest<ImageTask>(`/api/image-tasks/${encodeURIComponent(taskId)}/resume-poll`, {
-    method: "POST",
-    body: { extra_timeout_secs: extraTimeoutSecs },
-  });
-}
-
 export async function fetchSettingsConfig() {
   return httpRequest<{ config: SettingsConfig }>("/api/settings");
 }
@@ -529,10 +418,6 @@ export type ImageModelCatalog = {
   error?: string;
 };
 
-export async function fetchImageModelCatalog() {
-  return httpRequest<ImageModelCatalog>("/api/image-models");
-}
-
 export async function refreshImageModelCatalog() {
   return httpRequest<ImageModelCatalog>("/api/image-models/refresh", {
     method: "POST",
@@ -546,20 +431,6 @@ export async function fetchThirdPartyApps() {
 
 export async function testBackupConnection() {
   return httpRequest<{ result: { ok: boolean; status: number } }>("/api/backup/test", {
-    method: "POST",
-    body: {},
-  });
-}
-
-export async function testImageStorageConnection() {
-  return httpRequest<{ result: { ok: boolean; status: number; error?: string } }>("/api/image-storage/test", {
-    method: "POST",
-    body: {},
-  });
-}
-
-export async function syncImageStorage() {
-  return httpRequest<{ result: { uploaded: number; skipped: number; failed: number } }>("/api/image-storage/sync", {
     method: "POST",
     body: {},
   });
@@ -593,84 +464,6 @@ export function getBackupDownloadUrl(key: string) {
   const params = new URLSearchParams();
   params.set("key", key);
   return `/api/backups/download?${params.toString()}`;
-}
-
-export async function fetchManagedImages(filters: { start_date?: string; end_date?: string }) {
-  const params = new URLSearchParams();
-  if (filters.start_date) params.set("start_date", filters.start_date);
-  if (filters.end_date) params.set("end_date", filters.end_date);
-  return httpRequest<{ items: ManagedImage[]; groups: Array<{ date: string; items: ManagedImage[] }> }>(
-    `/api/images${params.toString() ? `?${params.toString()}` : ""}`,
-  );
-}
-
-export async function deleteManagedImages(body: { paths?: string[]; start_date?: string; end_date?: string; all_matching?: boolean }) {
-  return httpRequest<{ removed: number }>("/api/images/delete", { method: "POST", body });
-}
-
-export async function downloadImages(paths: string[]) {
-  const response = await request.post("/api/images/download", { paths }, { responseType: "blob" });
-  const blob = response.data as Blob;
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "images.zip";
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
-export async function downloadSingleImage(path: string) {
-  const response = await request.get(`/api/images/download/${path}`, { responseType: "blob" });
-  const blob = response.data as Blob;
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = path.split("/").pop() || "image.png";
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
-export async function fetchImageTags() {
-  return httpRequest<{ tags: string[] }>("/api/images/tags");
-}
-
-export async function setImageTags(path: string, tags: string[]) {
-  return httpRequest<{ ok: boolean; tags: string[] }>("/api/images/tags", {
-    method: "POST",
-    body: { path, tags },
-  });
-}
-
-export async function deleteImageTag(tag: string) {
-  return httpRequest<{ ok: boolean; removed_from: number }>(`/api/images/tags/${encodeURIComponent(tag)}`, {
-    method: "DELETE",
-  });
-}
-
-export type ImageStorageStats = {
-  mode?: ImageStorageMode;
-  legacy_size_bytes?: number;
-  disk_total_mb: number; disk_used_mb: number; disk_free_mb: number;
-  image_count: number; image_size_mb: number; image_size_bytes: number;
-};
-
-export async function fetchImageStorage() {
-  return httpRequest<ImageStorageStats>("/api/images/storage");
-}
-
-export async function compressAllImages() {
-  return httpRequest<{ compressed: number; saved_bytes: number; saved_mb: number }>("/api/images/storage/compress", { method: "POST" });
-}
-
-export async function deleteToTarget(targetFreeMb: number) {
-  return httpRequest<{ removed: number; freed_mb: number; done: boolean }>(
-    `/api/images/storage/cleanup-to-target?target_free_mb=${targetFreeMb}&dry_run=false`,
-    { method: "POST" },
-  );
 }
 
 export async function fetchSystemLogs(filters: { type?: string; start_date?: string; end_date?: string }) {
