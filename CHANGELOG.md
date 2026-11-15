@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.9.10 - 2026-11-14
+
++ [新增] R2 图片存储一键开通：在「设置 → 图片存储」填入 Cloudflare API Token 和图片域名，自动建桶、绑定自定义域名（DNS 记录由 Cloudflare 创建）并添加已启用的账号。Token 原文不保存，只保存由它推导出的 S3 凭据；限速规则不自动创建。手动填写方式保留。
+
+本功能的 Cloudflare 接口尚未用真实 Token 验证。升级无需修改配置。详见 [R2 图片存储说明](docs/r2-image-storage.md)。
+
 ## 1.9.9 - 2026-11-14
 
 + [调整] 精简 R2 图片存储：账号只需填写 CF Account ID、桶、S3 凭据、公开访问地址和每月上传上限；按本月已用比例最低的账号分配，用量按 UTC 自然月本地计数，不再查询 Cloudflare Analytics。
