@@ -11,8 +11,8 @@ export type StoredAuthSession = {
   name: string;
 };
 
-export const AUTH_KEY_STORAGE_KEY = "chatgpt2api_auth_key";
-export const AUTH_SESSION_STORAGE_KEY = "chatgpt2api_auth_session";
+const AUTH_KEY_STORAGE_KEY = "chatgpt2api_auth_key";
+const AUTH_SESSION_STORAGE_KEY = "chatgpt2api_auth_session";
 
 const authStorage = localforage.createInstance({
   name: "chatgpt2api",
@@ -88,15 +88,6 @@ export async function setStoredAuthSession(session: StoredAuthSession) {
   ]);
 }
 
-export async function setStoredAuthKey(authKey: string) {
-  const normalizedAuthKey = String(authKey || "").trim();
-  if (!normalizedAuthKey) {
-    await clearStoredAuthSession();
-    return;
-  }
-  await authStorage.setItem(AUTH_KEY_STORAGE_KEY, normalizedAuthKey);
-}
-
 export async function clearStoredAuthSession() {
   if (typeof window === "undefined") {
     return;
@@ -105,8 +96,4 @@ export async function clearStoredAuthSession() {
     authStorage.removeItem(AUTH_KEY_STORAGE_KEY),
     authStorage.removeItem(AUTH_SESSION_STORAGE_KEY),
   ]);
-}
-
-export async function clearStoredAuthKey() {
-  await clearStoredAuthSession();
 }

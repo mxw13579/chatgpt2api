@@ -11,7 +11,7 @@ import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
-from services.config import BASE_DIR, CONFIG_FILE, DATA_DIR, config, load_backup_state, save_backup_state
+from services.config import CONFIG_FILE, DATA_DIR, config, load_backup_state, save_backup_state
 from services.image_storage_service import IMAGE_INDEX_FILE, R2_USAGE_FILE
 from services.r2_client import CloudflareR2Client, R2Error as BackupError
 

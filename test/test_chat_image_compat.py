@@ -80,10 +80,6 @@ class ChatImageCompatTests(unittest.TestCase):
         self.patch_chat("count_message_image_tokens", return_value=0)
         # Avoid ambient settings and shared cache state; test the adapter's own calls.
         self.patch_chat("normalize_messages", side_effect=lambda messages: messages)
-        self.patch_chat("normalize_text_messages", side_effect=lambda messages: messages)
-        self.cache = self.patch_chat("chat_completion_cache")
-        self.cache.get_or_compute_response.side_effect = lambda _key, compute: compute()
-        self.cache.get_or_compute_stream.side_effect = lambda _key, compute: compute()
         remote_get = mock.patch("utils.helper.requests.get", side_effect=AssertionError("Network is forbidden"))
         remote_get.start()
         self.addCleanup(remote_get.stop)
@@ -93,8 +89,6 @@ class ChatImageCompatTests(unittest.TestCase):
         self.text.assert_not_called()
         self.deltas.assert_not_called()
         self.search.assert_not_called()
-        self.cache.get_or_compute_response.assert_not_called()
-        self.cache.get_or_compute_stream.assert_not_called()
 
     def assert_image_failure(self, body: dict) -> None:
         chunks = []
@@ -390,21 +384,6 @@ class ChatImageCompatTests(unittest.TestCase):
         self.pool.assert_not_called()
         self.search.assert_not_called()
 
-    def test_text_cache_keys_have_chat_namespace_in_both_modes(self) -> None:
-        for stream in (False, True):
-            with self.subTest(stream=stream):
-                messages = [{"role": "user", "content": "Synthetic cache prompt."}]
-                body = {"model": "gpt-5-5", "messages": messages, "stream": stream}
-                with mock.patch.object(chat, "cache_key", return_value="shared-digest") as key:
-                    result = chat.handle(body)
-                    if stream:
-                        list(result)
-                key.assert_called_once_with(body, messages, stream=stream)
-                cache_call = self.cache.get_or_compute_stream if stream else self.cache.get_or_compute_response
-                self.assertEqual(cache_call.call_args.args[0], "chat:shared-digest")
-                self.assertNotEqual(cache_call.call_args.args[0], "responses:shared-digest")
-        self.pool.assert_not_called()
-
     def test_web_search_keeps_chat_response_and_stream_shapes(self) -> None:
         self.search.side_effect = None
         self.search.return_value = {
@@ -433,8 +412,6 @@ class ChatImageCompatTests(unittest.TestCase):
                 self.search.assert_called_once_with("Synthetic search query.")
         self.pool.assert_not_called()
         self.backend.assert_not_called()
-        self.cache.get_or_compute_response.assert_not_called()
-        self.cache.get_or_compute_stream.assert_not_called()
 
     def test_unsupported_text_tools_keep_honesty_guard(self) -> None:
         for stream in (False, True):

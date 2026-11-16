@@ -99,5 +99,3 @@ Content-Type: application/json
 流式格式不代表上游能实时提供图片预览。模型没有画图而是回复了文字时（例如被问到与画图无关的问题，或上游说明拒绝原因），这段文字作为正常回答返回：Chat 和 Messages 放在消息内容中，Responses 放在 `output` 的 `message` 项中。除此之外，只有拿到足够的有效图片结果、且生成任务未失败时才会成功结束；空结果、图片数量不足或中途异常不会被包装成成功。并行任务中一项失败时，也不会用另一项偶然多出的图片掩盖该失败。
 
 非流式错误返回错误 HTTP 状态。已开始的流无法更改 HTTP 状态码：Chat 输出错误数据，Responses 输出 `response.failed`，不会继续发送成功的 `stop/completed` 或 `[DONE]`。客户端必须检查终止事件，不能只判断 HTTP 200。失败的 Responses 流也会按失败记录日志。
-
-Chat 与 Responses 的文本缓存已按协议隔离，避免混用接口时复用错误格式的流。

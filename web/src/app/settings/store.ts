@@ -13,37 +13,11 @@ import {
   type BackupItem,
   type BackupSettings,
   type BackupState,
-  type ProxyRuntimeClearanceMode,
-  type ProxyRuntimeEgressMode,
-  type ProxyRuntimeSettings,
   type SettingsConfig,
   type ThirdPartyAppsSettings,
 } from "@/lib/api";
 
 import { DEFAULT_IMAGE_STORAGE } from "@/lib/image-storage";
-
-const DEFAULT_PROXY_RUNTIME: ProxyRuntimeSettings = {
-  enabled: false,
-  egress_mode: "direct",
-  proxy_url: "",
-  resource_proxy_url: "",
-  skip_ssl_verify: false,
-  reset_session_status_codes: [403],
-  clearance: {
-    enabled: false,
-    mode: "none",
-    cf_cookies: "",
-    cf_clearance: "",
-    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-    browser: "chrome",
-    flaresolverr_url: "",
-    timeout_sec: 60,
-    refresh_interval: 3600,
-    warm_up_on_start: false,
-    has_cf_cookies: false,
-    has_cf_clearance: false,
-  },
-};
 
 const DEFAULT_THIRD_PARTY_APPS: ThirdPartyAppsSettings = {
   infinite_canvas: {
@@ -78,48 +52,6 @@ function normalizeImageModelList(value: unknown): string[] {
     }
   }
   return models;
-}
-
-function normalizeProxyRuntime(value: unknown): ProxyRuntimeSettings {
-  const source = typeof value === "object" && value !== null ? value as Partial<ProxyRuntimeSettings> : {};
-  const clearanceSource = typeof source.clearance === "object" && source.clearance !== null
-    ? source.clearance as Partial<ProxyRuntimeSettings["clearance"]>
-    : {};
-  const egressMode = source.egress_mode === "single_proxy" ? "single_proxy" : "direct";
-  const clearanceMode: ProxyRuntimeClearanceMode = clearanceSource.mode === "manual" || clearanceSource.mode === "flaresolverr"
-    ? clearanceSource.mode
-    : "none";
-  const statusCodes = Array.isArray(source.reset_session_status_codes)
-    ? source.reset_session_status_codes
-      .map((item) => Number(item))
-      .filter((item) => Number.isInteger(item) && item >= 100 && item <= 599)
-    : [];
-  return {
-    ...DEFAULT_PROXY_RUNTIME,
-    ...source,
-    enabled: Boolean(source.enabled),
-    egress_mode: egressMode as ProxyRuntimeEgressMode,
-    proxy_url: String(source.proxy_url || ""),
-    resource_proxy_url: String(source.resource_proxy_url || ""),
-    skip_ssl_verify: Boolean(source.skip_ssl_verify),
-    reset_session_status_codes: statusCodes.length > 0 ? statusCodes : [403],
-    clearance: {
-      ...DEFAULT_PROXY_RUNTIME.clearance,
-      ...clearanceSource,
-      enabled: Boolean(clearanceSource.enabled),
-      mode: clearanceMode,
-      cf_cookies: String(clearanceSource.cf_cookies || ""),
-      cf_clearance: String(clearanceSource.cf_clearance || ""),
-      user_agent: String(clearanceSource.user_agent || DEFAULT_PROXY_RUNTIME.clearance.user_agent),
-      browser: String(clearanceSource.browser || "chrome"),
-      flaresolverr_url: String(clearanceSource.flaresolverr_url || ""),
-      timeout_sec: Number(clearanceSource.timeout_sec || 60),
-      refresh_interval: Number(clearanceSource.refresh_interval || 3600),
-      warm_up_on_start: Boolean(clearanceSource.warm_up_on_start),
-      has_cf_cookies: Boolean(clearanceSource.has_cf_cookies),
-      has_cf_clearance: Boolean(clearanceSource.has_cf_clearance),
-    },
-  };
 }
 
 function normalizeThirdPartyApps(value: unknown): ThirdPartyAppsSettings {
@@ -191,7 +123,6 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     default_thinking_effort: defaultThinkingEffort,
     sensitive_words: Array.isArray(config.sensitive_words) ? config.sensitive_words : [],
     image_storage: imageStorage,
-    proxy_runtime: normalizeProxyRuntime(config.proxy_runtime),
     third_party_apps: normalizeThirdPartyApps(config.third_party_apps),
     backup: {
       ...backup,
@@ -226,7 +157,7 @@ type SettingsStore = {
   deletingBackupKey: string | null;
   isTestingBackup: boolean;
 
-  initialize: () => Promise<void>;
+  initializeBackups: () => Promise<void>;
   loadConfig: () => Promise<void>;
   saveConfig: () => Promise<boolean>;
   loadBackups: (silent?: boolean) => Promise<void>;
@@ -253,9 +184,6 @@ type SettingsStore = {
   setDefaultUpstreamModelName: (value: string) => void;
   setDefaultThinkingEffort: (value: "auto" | "standard" | "extended" | "max") => void;
   setSensitiveWordsText: (value: string) => void;
-  setProxyRuntimeField: <K extends keyof ProxyRuntimeSettings>(key: K, value: ProxyRuntimeSettings[K]) => void;
-  setProxyRuntimeClearanceField: <K extends keyof ProxyRuntimeSettings["clearance"]>(key: K, value: ProxyRuntimeSettings["clearance"][K]) => void;
-  setProxyRuntimeStatusCodesText: (value: string) => void;
   setInfiniteCanvasField: <K extends keyof ThirdPartyAppsSettings["infinite_canvas"]>(key: K, value: ThirdPartyAppsSettings["infinite_canvas"][K]) => void;
   setBackupField: (key: keyof BackupSettings, value: string | boolean) => void;
   setBackupInclude: (key: keyof BackupSettings["include"], value: boolean) => void;
@@ -272,8 +200,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   deletingBackupKey: null,
   isTestingBackup: false,
 
-  initialize: async () => {
-    await get().loadConfig();
+  initializeBackups: async () => {
     const backup = get().config?.backup;
     const isConfigured = Boolean(
       String(backup?.account_id || "").trim()
@@ -335,26 +262,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           : "auto",
         sensitive_words: (config.sensitive_words || []).map((item) => String(item).trim()).filter(Boolean),
         // updateSettingsConfig 会移除 image_storage，不回写专用页面的旧快照。
-        proxy_runtime: {
-          ...normalizeProxyRuntime(config.proxy_runtime),
-          proxy_url: String(config.proxy_runtime?.proxy_url || "").trim(),
-          resource_proxy_url: String(config.proxy_runtime?.resource_proxy_url || "").trim(),
-          reset_session_status_codes: normalizeProxyRuntime({
-            reset_session_status_codes: (config.proxy_runtime?.reset_session_status_codes || [403])
-              .map((item) => Number(item))
-              .filter((item) => Number.isInteger(item) && item >= 100 && item <= 599),
-          }).reset_session_status_codes,
-          clearance: {
-            ...normalizeProxyRuntime(config.proxy_runtime).clearance,
-            cf_cookies: String(config.proxy_runtime?.clearance?.cf_cookies || "").trim(),
-            cf_clearance: String(config.proxy_runtime?.clearance?.cf_clearance || "").trim(),
-            user_agent: String(config.proxy_runtime?.clearance?.user_agent || DEFAULT_PROXY_RUNTIME.clearance.user_agent).trim(),
-            browser: String(config.proxy_runtime?.clearance?.browser || "chrome").trim(),
-            flaresolverr_url: String(config.proxy_runtime?.clearance?.flaresolverr_url || "").trim(),
-            timeout_sec: Math.max(1, Number(config.proxy_runtime?.clearance?.timeout_sec) || 60),
-            refresh_interval: Math.max(60, Number(config.proxy_runtime?.clearance?.refresh_interval) || 3600),
-          },
-        },
         third_party_apps: {
           infinite_canvas: {
             enabled: Boolean(config.third_party_apps?.infinite_canvas?.enabled),
@@ -501,69 +408,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setSensitiveWordsText: (value) => {
     set((state) => state.config ? { config: { ...state.config, sensitive_words: value.split("\n") } } : {});
-  },
-
-  setProxyRuntimeField: (key, value) => {
-    set((state) => {
-      if (!state.config) {
-        return {};
-      }
-      const runtime = normalizeProxyRuntime(state.config.proxy_runtime);
-      const nextRuntime = normalizeProxyRuntime({
-        ...runtime,
-        [key]: value,
-      });
-      return {
-        config: {
-          ...state.config,
-          proxy_runtime: nextRuntime,
-        },
-      };
-    });
-  },
-
-  setProxyRuntimeClearanceField: (key, value) => {
-    set((state) => {
-      if (!state.config) {
-        return {};
-      }
-      const runtime = normalizeProxyRuntime(state.config.proxy_runtime);
-      const nextRuntime = normalizeProxyRuntime({
-        ...runtime,
-        clearance: {
-          ...runtime.clearance,
-          [key]: value,
-        },
-      });
-      return {
-        config: {
-          ...state.config,
-          proxy_runtime: nextRuntime,
-        },
-      };
-    });
-  },
-
-  setProxyRuntimeStatusCodesText: (value) => {
-    const codes = value
-      .split(/[,\s]+/)
-      .map((item) => Number(item.trim()))
-      .filter((item) => Number.isInteger(item) && item >= 100 && item <= 599);
-    set((state) => {
-      if (!state.config) {
-        return {};
-      }
-      const runtime = normalizeProxyRuntime(state.config.proxy_runtime);
-      return {
-        config: {
-          ...state.config,
-          proxy_runtime: normalizeProxyRuntime({
-            ...runtime,
-            reset_session_status_codes: codes.length > 0 ? codes : [403],
-          }),
-        },
-      };
-    });
   },
 
   setInfiniteCanvasField: (key, value) => {

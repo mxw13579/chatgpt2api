@@ -117,51 +117,6 @@ export type RefreshProgressResponse = {
 
 type AccountUpdateResponse = {
   item: Account;
-  items: Account[];
-};
-
-export type ProxyRuntimeEgressMode = "direct" | "single_proxy";
-export type ProxyRuntimeClearanceMode = "none" | "manual" | "flaresolverr";
-
-export type ProxyRuntimeClearanceSettings = {
-  enabled: boolean;
-  mode: ProxyRuntimeClearanceMode;
-  cf_cookies: string;
-  cf_clearance: string;
-  user_agent: string;
-  browser: string;
-  flaresolverr_url: string;
-  timeout_sec: number | string;
-  refresh_interval: number | string;
-  warm_up_on_start: boolean;
-  has_cf_cookies?: boolean;
-  has_cf_clearance?: boolean;
-};
-
-export type ProxyRuntimeSettings = {
-  enabled: boolean;
-  egress_mode: ProxyRuntimeEgressMode;
-  proxy_url: string;
-  resource_proxy_url: string;
-  skip_ssl_verify: boolean;
-  reset_session_status_codes: number[];
-  clearance: ProxyRuntimeClearanceSettings;
-};
-
-export type ProxyRuntimeStatus = {
-  enabled: boolean;
-  egress_mode: ProxyRuntimeEgressMode | string;
-  proxy_source: string;
-  has_proxy: boolean;
-  clearance_enabled: boolean;
-  clearance_mode: ProxyRuntimeClearanceMode | string;
-  has_clearance_bundle: boolean;
-  cached_clearance_hosts: string[];
-};
-
-export type ProxyRuntimeResponse = {
-  runtime: ProxyRuntimeSettings;
-  status: ProxyRuntimeStatus;
 };
 
 export type ThirdPartyAppsSettings = {
@@ -198,7 +153,6 @@ export type SettingsConfig = {
   auto_relogin_after_refresh?: boolean;
   log_levels?: string[];
   image_storage?: ImageStorageSettings;
-  proxy_runtime?: ProxyRuntimeSettings;
   third_party_apps?: ThirdPartyAppsSettings;
   backup?: BackupSettings;
   backup_state?: BackupState;
@@ -340,7 +294,7 @@ export async function finishOAuthLogin(sessionId: string, callback: string) {
 }
 
 export async function deleteAccounts(tokens: string[]) {
-  return httpRequest<AccountMutationResponse>("/api/accounts", {
+  return httpRequest<{ removed: number }>("/api/accounts", {
     method: "DELETE",
     body: { tokens },
   });
@@ -507,37 +461,9 @@ export type ProxyTestResult = {
   has_proxy?: boolean;
 };
 
-export type ClearanceTestResult = {
-  ok: boolean;
-  status: string;
-  latency_ms: number;
-  has_cookies: boolean;
-  user_agent: string;
-  error: string | null;
-  runtime: ProxyRuntimeStatus;
-};
-
 export async function testProxy(url?: string) {
   return httpRequest<{ result: ProxyTestResult }>("/api/proxy/test", {
     method: "POST",
     body: { url: url ?? "" },
-  });
-}
-
-export async function fetchProxyRuntime() {
-  return httpRequest<ProxyRuntimeResponse>("/api/proxy/runtime");
-}
-
-export async function updateProxyRuntime(runtime: ProxyRuntimeSettings) {
-  return httpRequest<ProxyRuntimeResponse>("/api/proxy/runtime", {
-    method: "POST",
-    body: runtime,
-  });
-}
-
-export async function testProxyClearance(targetUrl?: string) {
-  return httpRequest<{ result: ClearanceTestResult }>("/api/proxy/clearance/test", {
-    method: "POST",
-    body: { target_url: targetUrl ?? "https://chatgpt.com" },
   });
 }

@@ -10,7 +10,6 @@ import { BackupSettingsCard } from "./components/backup-settings-card";
 import { ApiDocsCard } from "./components/api-docs-card";
 import { ConfigCard } from "./components/config-card";
 import { ImageStorageCard } from "./components/image-storage-card";
-import { ProxyRuntimeCard } from "./components/proxy-runtime-card";
 import { SettingsHeader } from "./components/settings-header";
 import { ThirdPartyAppsCard } from "./components/third-party-apps-card";
 import { UserKeysCard } from "./components/user-keys-card";
@@ -23,12 +22,11 @@ const settingsTabs = [
   { value: "keys", title: "用户密钥" },
   { value: "api-docs", title: "接口接入" },
   { value: "canvas", title: "画布入口" },
-  { value: "proxy", title: "FlareSolverr" },
 ];
 
 function SettingsDataController() {
   const didLoadRef = useRef(false);
-  const initialize = useSettingsStore((state) => state.initialize);
+  const loadConfig = useSettingsStore((state) => state.loadConfig);
   const loadBackups = useSettingsStore((state) => state.loadBackups);
   const backupState = useSettingsStore((state) => state.backupState);
 
@@ -37,8 +35,8 @@ function SettingsDataController() {
       return;
     }
     didLoadRef.current = true;
-    void initialize();
-  }, [initialize]);
+    void loadConfig();
+  }, [loadConfig]);
 
   useEffect(() => {
     if (!backupState?.running) {
@@ -73,9 +71,6 @@ function SettingsPageContent() {
         </TabsContent>
         <TabsContent value="image-storage">
           <ImageStorageCard />
-        </TabsContent>
-        <TabsContent value="proxy">
-          <ProxyRuntimeCard />
         </TabsContent>
         <TabsContent value="backup">
           <BackupSettingsCard />

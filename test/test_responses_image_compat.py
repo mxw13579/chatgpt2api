@@ -60,11 +60,8 @@ class ResponsesImageCompatTests(unittest.TestCase):
         self.patch_response("count_message_text_tokens", return_value=7)
         self.patch_response("count_message_image_tokens", return_value=0)
         self.patch_response("normalize_messages", side_effect=lambda messages: messages)
-        self.patch_response("normalize_text_messages", side_effect=lambda messages: messages)
         self.text_backend = self.patch_response("text_backend", side_effect=AssertionError("Unexpected text backend"))
         self.text_deltas = self.patch_response("stream_text_deltas", side_effect=AssertionError("Unexpected text stream"))
-        self.cache = self.patch_response("chat_completion_cache")
-        self.cache.get_or_compute_stream.side_effect = AssertionError("Unexpected text cache")
 
     def test_image_model_without_tools_routes_to_images(self) -> None:
         body = {"model": MODEL, "input": PROMPT}
@@ -81,7 +78,6 @@ class ResponsesImageCompatTests(unittest.TestCase):
         self.assertEqual(response["status"], "completed")
         self.assertEqual([item["result"] for item in response["output"]], [PNG_FIRST])
         self.text_backend.assert_not_called()
-        self.cache.get_or_compute_stream.assert_not_called()
 
     def test_responses_base64_pipeline_never_calls_image_storage(self) -> None:
         from services.protocol import conversation
@@ -418,26 +414,21 @@ class ResponsesImageCompatTests(unittest.TestCase):
         self.assertEqual(payloads[-1]["response"]["error"]["code"], "no_image_generated")
         logger.warning.assert_not_called()
 
-    def test_ordinary_model_without_tools_stays_text_and_uses_responses_cache_namespace(self) -> None:
+    def test_ordinary_model_without_tools_stays_text(self) -> None:
         self.text_backend.side_effect = None
         self.text_backend.return_value = object()
         self.text_deltas.side_effect = lambda _backend, _request: iter(["Synthetic text reply"])
-        self.cache.get_or_compute_stream.side_effect = lambda _key, compute: compute()
-        messages = [{"role": "user", "content": PROMPT}]
 
-        with mock.patch.object(responses, "cache_key", return_value="synthetic-cache-key") as key:
-            for stream in (False, True):
-                with self.subTest(stream=stream):
-                    body = {"model": "auto", "input": PROMPT, "stream": stream}
-                    self.assertTrue(responses.is_text_response_request(body))
-                    result = responses.handle(body)
-                    response = list(result)[-1]["response"] if stream else result
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                body = {"model": "auto", "input": PROMPT, "stream": stream}
+                self.assertTrue(responses.is_text_response_request(body))
+                result = responses.handle(body)
+                response = list(result)[-1]["response"] if stream else result
 
-                    self.assertEqual(response["status"], "completed")
-                    self.assertEqual(response["output"][0]["type"], "message")
-                    self.assertEqual(response["output"][0]["content"][0]["text"], "Synthetic text reply")
-                    key.assert_called_with(body, messages, stream=stream)
-                    self.assertEqual(self.cache.get_or_compute_stream.call_args.args[0], "responses:synthetic-cache-key")
+                self.assertEqual(response["status"], "completed")
+                self.assertEqual(response["output"][0]["type"], "message")
+                self.assertEqual(response["output"][0]["content"][0]["text"], "Synthetic text reply")
         self.normalizer.assert_not_called()
         self.pool.assert_not_called()
         self.validator.assert_not_called()
@@ -445,7 +436,6 @@ class ResponsesImageCompatTests(unittest.TestCase):
     def test_text_stream_errors_are_not_rewrapped_as_image_failures(self) -> None:
         error = RuntimeError("Synthetic text failure")
         self.text_backend.side_effect = error
-        self.cache.get_or_compute_stream.side_effect = lambda _key, compute: compute()
 
         with self.assertRaises(RuntimeError) as caught:
             list(responses.handle({"model": "auto", "input": PROMPT, "stream": True}))

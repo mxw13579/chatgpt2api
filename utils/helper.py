@@ -341,21 +341,6 @@ def iter_sse_payloads(
             yield payload
 
 
-def save_images_from_text(text: str, prefix: str) -> list[Path]:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    matches = re.findall(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+", text or "")
-    saved_paths: list[Path] = []
-    timestamp = int(time.time() * 1000)
-    for index, data_url in enumerate(matches, start=1):
-        header, encoded = data_url.split(",", 1)
-        image_type = header.split(";")[0].removeprefix("data:image/").strip() or "png"
-        extension = "jpg" if image_type == "jpeg" else image_type
-        output_path = OUTPUT_DIR / f"{prefix}_{timestamp}_{index}.{extension}"
-        output_path.write_bytes(base64.b64decode(encoded))
-        saved_paths.append(output_path)
-    return saved_paths
-
-
 def anonymize_token(token: object) -> str:
     value = str(token or "").strip()
     if not value:
@@ -514,50 +499,6 @@ def extract_image_from_message_content(content: object) -> list[tuple[bytes, str
             if image:
                 images.append(image)
     return images
-
-
-def extract_chat_image(body: dict[str, object]) -> list[tuple[bytes, str]]:
-    messages = body.get("messages")
-    if not isinstance(messages, list):
-        return []
-    for message in reversed(messages):
-        if not isinstance(message, dict):
-            continue
-        if str(message.get("role") or "").strip().lower() != "user":
-            continue
-        images = extract_image_from_message_content(message.get("content"))
-        if images:
-            return images
-    return []
-
-
-def extract_chat_prompt(body: dict[str, object]) -> str:
-    direct_prompt = str(body.get("prompt") or "").strip()
-    if direct_prompt:
-        return direct_prompt
-    messages = body.get("messages")
-    if not isinstance(messages, list):
-        return ""
-    prompt_parts: list[str] = []
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        if str(message.get("role") or "").strip().lower() != "user":
-            continue
-        prompt = extract_prompt_from_message_content(message.get("content"))
-        if prompt:
-            prompt_parts.append(prompt)
-    return "\n".join(prompt_parts).strip()
-
-
-def parse_image_count(raw_value: object) -> int:
-    try:
-        value = int(raw_value or 1)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
-    if value < 1 or value > 4:
-        raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
-    return value
 
 
 def build_chat_image_markdown_content(image_result: dict[str, object]) -> str:

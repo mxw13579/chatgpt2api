@@ -13,7 +13,7 @@ from services.config import config
 from services.image_service import get_image_response
 from services.image_model_service import refresh_image_model_catalog
 from services.log_service import log_service
-from services.proxy_service import proxy_settings, test_clearance, test_proxy
+from services.proxy_service import test_proxy
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -22,10 +22,6 @@ class SettingsUpdateRequest(BaseModel):
 
 class ProxyTestRequest(BaseModel):
     url: str = ""
-
-
-class ClearanceTestRequest(BaseModel):
-    target_url: str = "https://chatgpt.com"
 
 
 class LogDeleteRequest(BaseModel):
@@ -96,31 +92,6 @@ def create_router(app_version: str) -> APIRouter:
     async def test_proxy_endpoint(body: ProxyTestRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"result": await run_in_threadpool(test_proxy, (body.url or "").strip())}
-
-    @router.get("/api/proxy/runtime")
-    async def get_proxy_runtime_endpoint(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {
-            "runtime": config.get_public_proxy_runtime_settings(),
-            "status": proxy_settings.get_runtime_status(),
-        }
-
-    @router.post("/api/proxy/runtime")
-    async def save_proxy_runtime_endpoint(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        try:
-            config.update({"proxy_runtime": body.model_dump(mode="python")})
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-        return {
-            "runtime": config.get_public_proxy_runtime_settings(),
-            "status": proxy_settings.get_runtime_status(),
-        }
-
-    @router.post("/api/proxy/clearance/test")
-    async def test_proxy_clearance_endpoint(body: ClearanceTestRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {"result": await run_in_threadpool(test_clearance, body.target_url)}
 
     @router.get("/api/storage/info")
     async def get_storage_info(authorization: str | None = Header(default=None)):
@@ -208,7 +179,6 @@ def create_router(app_version: str) -> APIRouter:
             "healthy": healthy,
             "version": app_version,
             "storage": {"backend": storage.get_backend_info(), "health": storage_health},
-            "proxy_runtime": proxy_settings.get_runtime_status(),
             "accounts": stats,
         }
         if format == "json":

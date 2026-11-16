@@ -149,12 +149,6 @@ def _image_remaining_timeout_secs(backend: object) -> float:
     return float(config.image_poll_timeout_secs)
 
 
-def _sleep_image_retry(backend: object, seconds: float) -> None:
-    sleep_for = min(max(0.0, seconds), _image_remaining_timeout_secs(backend))
-    if sleep_for > 0:
-        time.sleep(sleep_for)
-
-
 def _sleep_until_deadline(deadline: float, seconds: float) -> None:
     sleep_for = min(max(0.0, seconds), max(0.0, deadline - time.monotonic()))
     if sleep_for > 0:
@@ -711,10 +705,6 @@ def assistant_raw_text(event: dict[str, Any], current_text: str = "", history_te
         if text:
             return strip_history(text, history_text)
     return apply_text_patch(event, current_text, history_text)
-
-
-def assistant_text(event: dict[str, Any], current_text: str = "", history_text: str = "") -> str:
-    return sanitize_output_text(assistant_raw_text(event, current_text, history_text))
 
 
 def event_assistant_text(event: dict[str, Any], history_text: str = "") -> str:
@@ -1278,28 +1268,6 @@ def stream_image_outputs(
             "message_preview": message[:200],
         })
 
-    # 当检测到文本回复但 conversation_id 丢失时，尝试从最近对话列表中恢复
-    # SSE 流太短时（模型返回文本而非触发图片工具），conversation_id 可能未被捕获，
-    # 但图片已在上游异步生成。通过列出最近对话来恢复 conversation_id。
-    if is_text_reply and not conversation_id:
-        try:
-            import time as _time
-            recovered_id = backend.find_conversation_by_prompt(
-                request.prompt, _time.time(), timeout_secs=5.0,
-            )
-            if recovered_id:
-                conversation_id = recovered_id
-                logger.info({
-                    "event": "image_conversation_id_recovered",
-                    "conversation_id": conversation_id,
-                    "message_preview": message[:200],
-                })
-        except Exception as exc:
-            logger.warning({
-                "event": "image_conversation_id_recovery_failed",
-                "error": repr(exc)[:300],
-            })
-
     # 在轮询图片之前，先检查 /backend-api/tasks/ 是否有 moderation 拦截
     # 这样可以避免不必要的长时间轮询超时
     # 注意：当 should_poll_for_image 为 True 或检测到文本回复时，
@@ -1352,8 +1320,7 @@ def stream_image_outputs(
         else:
             raise
     except Exception as exc:
-        # 当检测到文本回复时，首次轮询的临时网络错误不应直接中断，
-        # 因为图片可能仍在后台异步生成中，后续 retry poll 会继续尝试。
+        # 当检测到文本回复时，轮询的临时网络错误不应盖掉模型的文字回复。
         if is_text_reply and conversation_id:
             logger.warning({
                 "event": "image_text_reply_first_poll_error_ignored",
@@ -1376,107 +1343,9 @@ def stream_image_outputs(
         return
 
     if message:
-        # 检测模型是否返回了文本描述（含 referenced_image_ids）而非实际生成图片
-        # 这说明模型已发起图片生成工具调用，但 SSE 在工具完成前断开。
-        # 此时应再尝试轮询图片结果，而不是直接把文本当作最终输出。
-        # 当 is_text_reply 但 conversation_id 丢失时，尝试从最近对话列表恢复
-        if is_text_reply and not conversation_id:
-            try:
-                import time as _time
-                recovered_id = backend.find_conversation_by_prompt(
-                    request.prompt, _time.time(), timeout_secs=5.0,
-                )
-                if recovered_id:
-                    conversation_id = recovered_id
-                    logger.info({
-                        "event": "image_text_reply_conversation_id_recovered",
-                        "conversation_id": conversation_id,
-                        "message_preview": message[:200],
-                    })
-            except Exception as exc:
-                logger.warning({
-                    "event": "image_text_reply_conversation_id_recovery_failed",
-                    "error": repr(exc)[:300],
-                })
-        if is_text_reply and conversation_id:
-            logger.info({
-                "event": "image_model_text_reply_retry_poll",
-                "conversation_id": conversation_id,
-                "message_preview": message[:200],
-            })
-            # 文本回复场景下，图片可能需要 4-5 分钟才能异步生成完成。
-            # 使用配置的剩余总预算并允许短重试，避免因临时网络问题提前退出。
-            MAX_POLL_RETRIES = 3
-            for poll_attempt in range(1, MAX_POLL_RETRIES + 1):
-                retry_poll_timeout = _image_remaining_timeout_secs(backend)
-                if retry_poll_timeout <= 0:
-                    break
-                try:
-                    polled_file_ids, polled_sediment_ids = backend._poll_image_results(
-                        conversation_id,
-                        retry_poll_timeout,
-                        file_ids,
-                        sediment_ids,
-                    )
-                    file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
-                    sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
-                    break  # 轮询成功，退出重试循环
-                except Exception as exc:
-                    error_str = str(exc)
-                    is_transient = (
-                        isinstance(exc, ImagePollTimeoutError)
-                        or is_tls_connection_error(error_str)
-                        or "upstream" in error_str.lower()
-                        or "connection" in error_str.lower()
-                        or "timeout" in error_str.lower()
-                    )
-                    logger.warning({
-                        "event": "image_model_text_reply_poll_failed",
-                        "conversation_id": conversation_id,
-                        "poll_attempt": poll_attempt,
-                        "error": repr(exc)[:300],
-                        "is_transient": is_transient,
-                    })
-                    # 如果还有重试次数且不是超时/内容违规错误，继续重试
-                    if poll_attempt < MAX_POLL_RETRIES and not isinstance(exc, (ImagePollTimeoutError, ImageContentPolicyError)):
-                        # 递增退避：30s, 60s, 90s
-                        backoff = 30.0 * poll_attempt
-                        logger.info({
-                            "event": "image_model_text_reply_poll_retry",
-                            "conversation_id": conversation_id,
-                            "poll_attempt": poll_attempt,
-                            "backoff_secs": backoff,
-                        })
-                        _sleep_image_retry(backend, backoff)
-                        continue
-                    # 超时错误或重试次数用尽，停止重试
-                    break
-
-            if file_ids or sediment_ids:
-                image_urls = backend.resolve_conversation_image_urls(
-                    conversation_id, file_ids, sediment_ids, poll=False,
-                )
-                if image_urls:
-                    data = _format_image_bytes(
-                        backend.download_image_bytes(image_urls),
-                        request.prompt,
-                        request.response_format,
-                        request.base_url,
-                    )
-                    if data:
-                        yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
-                        return
-        elif is_text_reply:
-            logger.warning({
-                "event": "image_model_text_reply_no_image",
-                "conversation_id": conversation_id,
-                "message_preview": message[:200],
-            })
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
         return
 
-    # 兜底：当 message 为空且图片 URL 解析失败时，先尝试一次短延迟重试轮询
-    # 然后抛出明确错误而非让调用方得到 "upstream completed without generating images" 这种模糊报错
     logger.warning({
         "event": "image_stream_no_result_fallback",
         "conversation_id": conversation_id,
@@ -1484,111 +1353,14 @@ def stream_image_outputs(
         "sediment_ids": sediment_ids,
         "should_poll_for_image": should_poll_for_image,
     })
-    # 当 should_poll_for_image 为 True 但 conversation_id 丢失时，尝试恢复
-    if should_poll_for_image and not conversation_id:
-        try:
-            import time as _time
-            recovered_id = backend.find_conversation_by_prompt(
-                request.prompt, _time.time(), timeout_secs=5.0,
-            )
-            if recovered_id:
-                conversation_id = recovered_id
-                logger.info({
-                    "event": "image_fallback_conversation_id_recovered",
-                    "conversation_id": conversation_id,
-                })
-        except Exception as exc:
-            logger.warning({
-                "event": "image_fallback_conversation_id_recovery_failed",
-                "error": repr(exc)[:300],
-            })
     if should_poll_for_image and conversation_id:
-        # 图片可能仍在异步处理中（上游 SSE 流在图片生成完成前就结束了）。
-        # 使用配置的剩余总预算并允许短重试，避免因临时网络问题或图片尚未提交而提前退出。
-        MAX_FALLBACK_POLL_RETRIES = 3
-        for poll_attempt in range(1, MAX_FALLBACK_POLL_RETRIES + 1):
-            retry_wait_secs = min(30.0 * poll_attempt, config.image_poll_initial_wait_secs * poll_attempt)
-            logger.info({
-                "event": "image_stream_retry_poll_after_wait",
-                "conversation_id": conversation_id,
-                "retry_wait_secs": retry_wait_secs,
-                "poll_attempt": poll_attempt,
-            })
-            _sleep_image_retry(backend, retry_wait_secs)
-            retry_poll_timeout = _image_remaining_timeout_secs(backend)
-            if retry_poll_timeout <= 0:
-                break
-            try:
-                polled_file_ids, polled_sediment_ids = backend._poll_image_results(
-                    conversation_id,
-                    retry_poll_timeout,
-                    file_ids,
-                    sediment_ids,
-                )
-                file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
-                sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
-                break  # 轮询成功，退出重试循环
-            except Exception as exc:
-                error_str = str(exc)
-                is_transient = (
-                    isinstance(exc, ImagePollTimeoutError)
-                    or is_tls_connection_error(error_str)
-                    or "upstream" in error_str.lower()
-                    or "connection" in error_str.lower()
-                    or "timeout" in error_str.lower()
-                )
-                logger.warning({
-                    "event": "image_stream_retry_poll_failed",
-                    "conversation_id": conversation_id,
-                    "poll_attempt": poll_attempt,
-                    "error": repr(exc)[:300],
-                    "is_transient": is_transient,
-                })
-                # 如果还有重试次数且不是超时/内容违规错误，继续重试
-                if poll_attempt < MAX_FALLBACK_POLL_RETRIES and not isinstance(exc, (ImagePollTimeoutError, ImageContentPolicyError)):
-                    # 递增退避：30s, 60s
-                    backoff = 30.0 * poll_attempt
-                    logger.info({
-                        "event": "image_stream_retry_poll_retry",
-                        "conversation_id": conversation_id,
-                        "poll_attempt": poll_attempt,
-                        "backoff_secs": backoff,
-                    })
-                    _sleep_image_retry(backend, backoff)
-                    continue
-                # 超时错误或重试次数用尽，停止重试
-                break
-        
-        if file_ids or sediment_ids:
-            image_urls = backend.resolve_conversation_image_urls(
-                conversation_id, file_ids, sediment_ids, poll=False,
-            )
-            if image_urls:
-                data = _format_image_bytes(
-                    backend.download_image_bytes(image_urls),
-                    request.prompt,
-                    request.response_format,
-                    request.base_url,
-                )
-                if data:
-                    yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
-                    return
-        
-        # 重试后仍然失败，yield 错误消息
-        yield ImageOutput(kind="message", model=request.model, index=index, total=total,
-                          text="Image generation completed upstream but the result could not be retrieved. "
-                               "The image may still be processing. Please try again in a moment.",
-                          conversation_id=conversation_id)
-    elif message:
-        yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
+        text = ("Image generation completed upstream but the result could not be retrieved. "
+                "The image may still be processing. Please try again in a moment.")
     else:
-        # conversation_id 也为空时（SSE 流极短、未捕获到会话 ID），
         # 仍然 yield 一条消息，避免 stream_image_outputs_with_pool 产生
         # "upstream completed without generating images" 模糊报错
-        yield ImageOutput(kind="message", model=request.model, index=index, total=total,
-                          text="Image generation started upstream but the response was incomplete. "
-                               "Please try again.",
-                          conversation_id=conversation_id)
+        text = "Image generation started upstream but the response was incomplete. Please try again."
+    yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=text, conversation_id=conversation_id)
 
 
 def _codex_response_images(value: Any) -> list[str]:

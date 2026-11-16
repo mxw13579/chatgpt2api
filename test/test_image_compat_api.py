@@ -20,7 +20,6 @@ from fastapi.testclient import TestClient
 
 from api import ai, support
 from services.log_service import log_service
-from services.protocol import chat_completion_cache as cache_module
 from services.protocol import conversation
 from services.protocol import openai_v1_chat_complete as chat
 from services.protocol import openai_v1_response as responses
@@ -128,24 +127,10 @@ class ImageCompatHTTPFixture(unittest.TestCase):
             "global_system_prompt": "",
         }
         self.patch_object(ai.config, "data", new=self.config_data)
-        self.cache_settings = {
-            "enabled": False, "ttl_seconds": 60, "max_entries": 16,
-            "dedupe_inflight": True, "stream_cache": True,
-            "normalize_messages": False, "drop_assistant_history": False,
-            "drop_adjacent_duplicates": False,
-        }
-        self.patch_object(
-            ai.config, "get_chat_completion_cache_settings", return_value=self.cache_settings,
-        )
         self.patches.enter_context(mock.patch(
             "utils.helper.configured_web_image_models",
             return_value={MODEL, DEFAULT_IMAGE_MODEL, TEXT_MODEL},
         ))
-        # Both protocols share a real, but fresh, cache; ambient entries survive.
-        self.cache = cache_module.ChatCompletionCache()
-        self.cache.clear()
-        self.addCleanup(self.cache.clear)
-        self.patch_object(cache_module, "chat_completion_cache", new=self.cache)
         self.identity = self.patch_object(ai, "require_identity", return_value={
             "id": "synthetic-key-id", "name": "Synthetic HTTP fixture", "role": "admin",
         })
@@ -169,7 +154,6 @@ class ImageCompatHTTPFixture(unittest.TestCase):
         self.deltas = {}
         self.searches = {}
         for path, module in PROTOCOLS.items():
-            self.patch_object(module, "chat_completion_cache", new=self.cache)
             self.pools[path] = self.patch_object(
                 module, "stream_image_outputs_with_pool",
                 side_effect=lambda _request: iter(self.outputs),
@@ -624,51 +608,6 @@ class ImageFilteringAndLoggingHTTPTests(ImageCompatHTTPFixture):
         self.assertTrue(all(detail["endpoint"] == RESPONSES_PATH for detail in details))
         self.assertEqual(details[-1]["status"], "failed")
         self.assertNotIn("success", [detail["status"] for detail in details])
-
-
-class CrossProtocolTextCacheHTTPTests(ImageCompatHTTPFixture):
-    def test_identical_text_streams_do_not_replay_other_protocol_sse(self) -> None:
-        self.cache_settings["enabled"] = True
-        bodies = {
-            CHAT_PATH: {
-                "model": TEXT_MODEL, "stream": True, "tools": None, "tool_choice": None,
-                "messages": [{"role": "user", "content": PROMPT}],
-            },
-            RESPONSES_PATH: {
-                "model": TEXT_MODEL, "stream": True, "tools": None, "tool_choice": None,
-                "input": PROMPT,
-            },
-        }
-        # Chat first reproduces the old collision: tools/tool_choice must be
-        # explicitly null on Chat to match Responses' API-model defaults.
-        for order in ((CHAT_PATH, RESPONSES_PATH), (RESPONSES_PATH, CHAT_PATH)):
-            with self.subTest(first=order[0]):
-                self.cache.clear()
-                self.reset_calls()
-                with (
-                    mock.patch.object(chat, "cache_key", wraps=cache_module.cache_key) as chat_key,
-                    mock.patch.object(responses, "cache_key", wraps=cache_module.cache_key) as responses_key,
-                ):
-                    first_results = {}
-                    for path in order:
-                        response = self.client.post(path, json=bodies[path])
-                        self.assert_text_success(response, path, stream=True)
-                        first_results[path] = sse_data(response)
-                    # Prove the canonical request digests collide, so the test
-                    # exercises protocol separation rather than different keys.
-                    self.assertEqual(
-                        cache_module.cache_key(*chat_key.call_args.args, **chat_key.call_args.kwargs),
-                        cache_module.cache_key(*responses_key.call_args.args, **responses_key.call_args.kwargs),
-                    )
-                    for path in order:
-                        response = self.client.post(path, json=bodies[path])
-                        self.assert_text_success(response, path, stream=True)
-                        self.assertEqual(sse_data(response), first_results[path])
-                for path in PROTOCOLS:
-                    self.backends[path].assert_called_once_with(TEXT_MODEL)
-                    self.deltas[path].assert_called_once()
-                self.collect_text.assert_not_called()
-                self.assert_no_pool()
 
 
 if __name__ == "__main__":

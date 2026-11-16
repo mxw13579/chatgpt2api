@@ -132,15 +132,6 @@ class AccountService:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
 
-    @staticmethod
-    def _timestamp_to_iso(value: object) -> str:
-        try:
-            ts = int(value)
-        except (TypeError, ValueError):
-            return ""
-        tz = timezone(timedelta(hours=8))
-        return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz).isoformat()
-
     def _load_accounts(self) -> dict[str, dict]:
         accounts = self.storage.load_accounts()
         return {
@@ -485,6 +476,10 @@ class AccountService:
     def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
         if not access_token:
             return ""
+        # 绝大多数调用不需要刷新，不必排队等别的账号刷新完。
+        _, account = self._get_account_for_token(access_token)
+        if account and not self._token_needs_refresh(str(account.get("access_token") or access_token), force=force):
+            return str(account.get("access_token") or access_token)
         with self._token_refresh_lock:
             resolved_token, account = self._get_account_for_token(access_token)
             if not account:
@@ -1687,56 +1682,6 @@ class AccountService:
                 pass
         return result
 
-    def build_export_items(self, access_tokens: list[str] | None = None) -> list[dict[str, str]]:
-        target_tokens = set(token for token in (access_tokens or []) if token)
-        with self._lock:
-            accounts = [
-                dict(item)
-                for item in self._accounts.values()
-                if not target_tokens or str(item.get("access_token") or "") in target_tokens
-            ]
-
-        items: list[dict[str, str]] = []
-        for account in accounts:
-            access_token = str(account.get("access_token") or "").strip()
-            refresh_token = str(account.get("refresh_token") or "").strip()
-            id_token = str(account.get("id_token") or "").strip()
-            if not access_token or not refresh_token or not id_token:
-                continue
-
-            access_payload = self._decode_jwt_payload(access_token)
-            id_payload = self._decode_jwt_payload(id_token)
-            auth_claim = access_payload.get("https://api.openai.com/auth")
-            auth_claim = auth_claim if isinstance(auth_claim, dict) else {}
-            profile_claim = access_payload.get("https://api.openai.com/profile")
-            profile_claim = profile_claim if isinstance(profile_claim, dict) else {}
-
-            email = (
-                str(account.get("email") or "").strip()
-                or str(profile_claim.get("email") or "").strip()
-                or str(id_payload.get("email") or "").strip()
-            )
-            account_id = (
-                str(account.get("account_id") or "").strip()
-                or str(auth_claim.get("chatgpt_account_id") or "").strip()
-                or str(account.get("user_id") or "").strip()
-            )
-            item = {
-                "type": str(account.get("export_type") or "codex"),
-                "email": email,
-                "account_id": account_id,
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "id_token": id_token,
-                "expired": self._timestamp_to_iso(access_payload.get("exp")),
-                "last_refresh": self._timestamp_to_iso(access_payload.get("iat")),
-            }
-            password = str(account.get("password") or "").strip()
-            if password:
-                item["password"] = password
-            items.append(item)
-        return items
-
     def get_stats(self) -> dict:
         with self._lock:
             items = list(self._accounts.values())
@@ -1764,14 +1709,5 @@ class AccountService:
             "total_fail": total_fail,
             "by_type": by_type,
         }
-
-    def account_health(self) -> dict:
-        stats = self.get_stats()
-        return {
-            "healthy": stats["active"] > 0,
-            "status": "ok" if stats["active"] > 0 else "degraded",
-            **stats,
-        }
-
 
 account_service = AccountService(config.get_storage_backend())

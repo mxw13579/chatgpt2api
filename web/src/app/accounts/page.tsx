@@ -316,8 +316,8 @@ function AccountsPageContent() {
     setIsDeleting(true);
     try {
       const data = await deleteAccounts(tokens);
-      setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      setAccounts((prev) => prev.filter((item) => !tokens.includes(item.access_token)));
+      setSelectedIds((prev) => prev.filter((id) => !tokens.includes(id)));
       toast.success(`删除 ${data.removed ?? 0} 个账户`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "删除账户失败";
@@ -383,55 +383,36 @@ function AccountsPageContent() {
       const { progress_id } = await refreshAccounts(accessTokens);
 
       // 轮询进度到完成
-      const data = await new Promise<AccountRefreshResponse>((resolve, reject) => {
-        const pollTimer = setInterval(async () => {
-          try {
-            const p = await fetchRefreshProgress(progress_id);
-            if (p.done) {
-              clearInterval(pollTimer);
-              if (p.error) {
-                reject(new Error(p.error));
-                return;
-              }
-              if (!p.result) {
-                reject(new Error("刷新结果为空"));
-                return;
-              }
-              // 更新最终进度显示
-              setProgress((prev) => ({
-                ...prev,
-                current: prev.total,
-                message: "刷新完成",
-              }));
-              // 清除联动统计
-              setRefreshSummary(null);
-              resolve(p.result);
-            } else {
-              // 实时更新进度
-              setProgress((prev) => ({
-                ...prev,
-                current: p.processed,
-              }));
-              // 实时更新统计卡片：基数 + 已刷新的累加结果
-              const runningActive = baseActive + ((p.status_counts?.["正常"]) ?? 0);
-              const runningLimited = baseLimited + ((p.status_counts?.["限流"]) ?? 0);
-              const runningAbnormal = baseAbnormal + ((p.status_counts?.["异常"]) ?? 0);
-              const runningDisabled = baseDisabled + ((p.status_counts?.["禁用"]) ?? 0);
-              setRefreshSummary({
-                total: accounts.length,
-                active: runningActive,
-                limited: runningLimited,
-                abnormal: runningAbnormal,
-                disabled: runningDisabled,
-                quota: formatCompact(baseQuotaNum + (p.total_quota ?? 0)),
-              });
-            }
-          } catch (err) {
-            clearInterval(pollTimer);
-            reject(err);
+      let data: AccountRefreshResponse;
+      for (;;) {
+        const p = await fetchRefreshProgress(progress_id);
+        if (p.done) {
+          if (p.error) {
+            throw new Error(p.error);
           }
-        }, 300);
-      });
+          if (!p.result) {
+            throw new Error("刷新结果为空");
+          }
+          setRefreshSummary(null);
+          data = p.result;
+          break;
+        }
+        // 实时更新进度
+        setProgress((prev) => ({
+          ...prev,
+          current: p.processed,
+        }));
+        // 实时更新统计卡片：基数 + 已刷新的累加结果
+        setRefreshSummary({
+          total: accounts.length,
+          active: baseActive + ((p.status_counts?.["正常"]) ?? 0),
+          limited: baseLimited + ((p.status_counts?.["限流"]) ?? 0),
+          abnormal: baseAbnormal + ((p.status_counts?.["异常"]) ?? 0),
+          disabled: baseDisabled + ((p.status_counts?.["禁用"]) ?? 0),
+          quota: formatCompact(baseQuotaNum + (p.total_quota ?? 0)),
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+      }
 
       // 刷新完成，更新数据
       setAccounts(data.items);
@@ -439,47 +420,14 @@ function AccountsPageContent() {
 
       const relogined = data.relogined ?? 0;
 
-      // 显示重新登录进度
-      if (relogined > 0) {
-        setProgress({
-          visible: true,
-          current: 0,
-          total: relogined,
-          message: `正在尝试对 ${relogined} 个账号进行移除异常状态`,
-          email: "",
-        });
-        // 模拟重新登录进度
-        let reCount = 0;
-        await new Promise<void>((resolve) => {
-          const timer = setInterval(() => {
-            reCount += 1;
-            if (reCount >= relogined) {
-              clearInterval(timer);
-              setProgress({
-                visible: true,
-                current: relogined,
-                total: relogined,
-                message: "移除异常状态完成",
-                email: "",
-              });
-              setTimeout(() => setProgress({ visible: false, current: 0, total: 0, message: "", email: "" }), 800);
-              resolve();
-            } else {
-              setProgress((prev) => ({ ...prev, current: reCount }));
-            }
-          }, 150);
-          setTimeout(resolve, 2000);
-        });
-      } else {
-        setProgress({
-          visible: true,
-          current: total,
-          total,
-          message: "刷新完成",
-          email: "",
-        });
-        setTimeout(() => setProgress({ visible: false, current: 0, total: 0, message: "", email: "" }), 800);
-      }
+      setProgress({
+        visible: true,
+        current: total,
+        total,
+        message: "刷新完成",
+        email: "",
+      });
+      setTimeout(() => setProgress({ visible: false, current: 0, total: 0, message: "", email: "" }), 800);
 
       if ((data.errors ?? []).length > 0) {
         const firstError = data.errors?.[0]?.error;
@@ -503,25 +451,17 @@ function AccountsPageContent() {
     progressId: string,
     onUpdate: (p: RefreshProgressResponse) => void,
   ): Promise<void> => {
-    return new Promise<void>((resolve, reject) => {
-      const timer = setInterval(async () => {
-        try {
-          const p = await fetchRefreshProgress(progressId);
-          if (p.done) {
-            clearInterval(timer);
-            if (p.error) {
-              reject(new Error(p.error));
-            } else {
-              onUpdate(p);
-              resolve();
-            }
-          }
-        } catch (err) {
-          clearInterval(timer);
-          reject(err);
+    for (;;) {
+      const p = await fetchRefreshProgress(progressId);
+      if (p.done) {
+        if (p.error) {
+          throw new Error(p.error);
         }
-      }, 500);
-    });
+        onUpdate(p);
+        return;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+    }
   };
 
   const handleReLogin = async (accessTokens: string[]) => {
@@ -563,63 +503,54 @@ function AccountsPageContent() {
       const { progress_id } = await reLoginAccounts(abnormalTokens);
 
       // 轮询进度到完成
-      await new Promise<void>((resolve, reject) => {
-        const pollTimer = setInterval(async () => {
-          try {
-            const p = await fetchReLoginProgress(progress_id);
-            if (p.done) {
-              clearInterval(pollTimer);
-              if (p.error) {
-                reject(new Error(p.error));
-                return;
-              }
-              setProgress((prev) => ({ ...prev, current: prev.total, message: "恢复流程已完成" }));
-              setRefreshSummary(null);
-              resolve();
-            } else {
-              // 实时更新进度
-              const results = p.results ?? [];
-              // 找到最新一条有错误的结果
-              const lastErrorResult = [...results].reverse().find((r) => r.error);
-              const emailHint = lastErrorResult
-                ? `失败: ${lastErrorResult.token} ${lastErrorResult.error ?? ""}`
-                : `已处理 ${p.processed}/${p.total}`;
-              setProgress((prev) => ({
-                ...prev,
-                current: p.processed,
-                email: emailHint,
-                message: "正在尝试恢复异常账号...",
-              }));
-
-              // 实时更新统计卡片：基数 + 已处理的恢复结果
-              let runningActive = baseActive;
-              let runningAbnormal = baseAbnormal;
-              let runningDisabled = baseDisabled;
-              for (const r of results) {
-                if (r.status === "成功") {
-                  runningActive += 1;
-                  runningAbnormal -= 1;
-                } else if (r.status === "禁用") {
-                  runningDisabled += 1;
-                  runningAbnormal -= 1;
-                }
-                // "异常"或"跳过"：保持异常状态不变
-              }
-              setRefreshSummary({
-                total: accounts.length,
-                active: runningActive,
-                limited: baseLimited,
-                abnormal: runningAbnormal,
-                disabled: runningDisabled,
-                quota: summary.quota,
-              });
-            }
-          } catch (err) {
-            clearInterval(pollTimer);
-            reject(err);
+      for (;;) {
+        const p = await fetchReLoginProgress(progress_id);
+        if (p.done) {
+          if (p.error) {
+            throw new Error(p.error);
           }
-        }, 300);
-      });
+          setProgress((prev) => ({ ...prev, current: prev.total, message: "恢复流程已完成" }));
+          setRefreshSummary(null);
+          break;
+        }
+        // 实时更新进度
+        const results = p.results ?? [];
+        // 找到最新一条有错误的结果
+        const lastErrorResult = [...results].reverse().find((r) => r.error);
+        const emailHint = lastErrorResult
+          ? `失败: ${lastErrorResult.token} ${lastErrorResult.error ?? ""}`
+          : `已处理 ${p.processed}/${p.total}`;
+        setProgress((prev) => ({
+          ...prev,
+          current: p.processed,
+          email: emailHint,
+          message: "正在尝试恢复异常账号...",
+        }));
+
+        // 实时更新统计卡片：基数 + 已处理的恢复结果
+        let runningActive = baseActive;
+        let runningAbnormal = baseAbnormal;
+        let runningDisabled = baseDisabled;
+        for (const r of results) {
+          if (r.status === "成功") {
+            runningActive += 1;
+            runningAbnormal -= 1;
+          } else if (r.status === "禁用") {
+            runningDisabled += 1;
+            runningAbnormal -= 1;
+          }
+          // "异常"或"跳过"：保持异常状态不变
+        }
+        setRefreshSummary({
+          total: accounts.length,
+          active: runningActive,
+          limited: baseLimited,
+          abnormal: runningAbnormal,
+          disabled: runningDisabled,
+          quota: summary.quota,
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+      }
 
       // 等待后台线程完成，再拉取最新数据
       await new Promise<void>((resolve) => setTimeout(resolve, 500));
@@ -685,8 +616,7 @@ function AccountsPageContent() {
         status: editStatus,
         proxy: editProxy.trim(),
       });
-      setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      setAccounts((prev) => prev.map((item) => (item.access_token === data.item.access_token ? data.item : item)));
       setEditingAccount(null);
       toast.success("账号信息已更新");
     } catch (error) {

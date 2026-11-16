@@ -1,7 +1,7 @@
 "use client";
 
 import { CloudUpload, Download, Eye, LoaderCircle, Play, RefreshCcw, Shield, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -90,6 +90,14 @@ export function BackupSettingsCard() {
   const testBackup = useSettingsStore((state) => state.testBackup);
   const setBackupField = useSettingsStore((state) => state.setBackupField);
   const setBackupInclude = useSettingsStore((state) => state.setBackupInclude);
+  const initializeBackups = useSettingsStore((state) => state.initializeBackups);
+  const hasConfig = Boolean(config);
+
+  useEffect(() => {
+    if (hasConfig) {
+      void initializeBackups();
+    }
+  }, [hasConfig, initializeBackups]);
 
   if (isLoadingConfig) {
     return (

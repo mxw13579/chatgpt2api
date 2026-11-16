@@ -11,14 +11,13 @@ import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, Di
 import { Sheet, SheetClose, SheetContent, SheetFooter, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import webConfig from "@/constants/common-env";
 import { fetchThirdPartyApps, type ThirdPartyAppsSettings } from "@/lib/api";
-import { getValidatedAuthSession } from "@/lib/auth-session";
+
 import { cn } from "@/lib/utils";
-import { clearStoredAuthSession, type StoredAuthSession } from "@/store/auth";
+import { clearStoredAuthSession, getStoredAuthSession, type StoredAuthSession } from "@/store/auth";
 
 const adminNavItems = [
   { href: "/accounts", label: "号池管理" },
   { href: "/logs", label: "日志管理" },
-  { href: "/debug", label: "调试" },
   { href: "/settings", label: "设置" },
 ];
 
@@ -55,7 +54,7 @@ export function TopNav() {
         return;
       }
 
-      const storedSession = await getValidatedAuthSession();
+      const storedSession = await getStoredAuthSession();
       if (!active) {
         return;
       }
@@ -68,8 +67,9 @@ export function TopNav() {
     };
   }, [pathname]);
 
+  const hasSession = Boolean(session);
   useEffect(() => {
-    if (!session) {
+    if (!hasSession) {
       setThirdPartyApps(null);
       return;
     }
@@ -94,7 +94,7 @@ export function TopNav() {
       active = false;
       window.removeEventListener("third-party-apps-updated", reload);
     };
-  }, [session]);
+  }, [hasSession]);
 
   const handleLogout = async () => {
     await clearStoredAuthSession();

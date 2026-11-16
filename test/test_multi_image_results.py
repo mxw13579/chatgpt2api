@@ -15,7 +15,6 @@ from services.protocol.conversation import (
     _generate_single_image,
     extract_conversation_ids,
     is_tls_connection_error,
-    stream_image_outputs,
     stream_image_outputs_with_pool,
 )
 from services.protocol.openai_v1_response import stream_image_response
@@ -231,28 +230,6 @@ class MultiImageResultTests(unittest.TestCase):
 
         self.assertEqual([event["output_index"] for event in done_events], [0, 1])
         self.assertEqual([item["result"] for item in completed["output"]], [first, second])
-
-    def test_text_reply_retry_poll_uses_configured_timeout_without_300_second_floor(self) -> None:
-        backend = mock.Mock()
-        backend.stream_conversation.return_value = iter([
-            '{"conversation_id":"conv-1","message":{"author":{"role":"assistant"},'
-            '"content":{"parts":["{\\"referenced_image_ids\\":[\\"file-input\\"]}"]}}}',
-            "[DONE]",
-        ])
-        backend.resolve_conversation_image_urls.return_value = []
-        backend._poll_image_results.side_effect = RuntimeError("temporary upstream failure")
-
-        with (
-            mock.patch.dict(config.data, {"image_poll_timeout_secs": 7, "image_poll_initial_wait_secs": 0}),
-            mock.patch("services.protocol.conversation.time.sleep", lambda _seconds: None),
-        ):
-            outputs = list(stream_image_outputs(
-                backend,
-                ConversationRequest(prompt="draw", model="gpt-image-2"),
-            ))
-
-        self.assertEqual(outputs[-1].kind, "message")
-        self.assertEqual([call.args[1] for call in backend._poll_image_results.call_args_list], [7, 7, 7])
 
     def test_image_generation_sse_request_uses_configured_image_timeout(self) -> None:
         backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)

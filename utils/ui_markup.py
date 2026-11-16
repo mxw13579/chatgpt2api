@@ -108,6 +108,9 @@ def collapse_blank_lines(text: str) -> str:
     return "\n".join(output)
 
 
+_PLAIN_RE = re.compile(r"[^`{\n<]+")
+
+
 def strip_ui_markup(text: str) -> str:
     """把上游返回的组件标记降级成 Markdown，代码块与行内代码原样保留。"""
     text = str(text or "")
@@ -135,8 +138,10 @@ def strip_ui_markup(text: str) -> str:
             index += 3
             continue
         if in_fence:
-            emit(text[index])
-            index += 1
+            end = text.find("```", index)
+            end = length if end == -1 else end
+            emit(text[index:end])
+            index = end
             continue
         if text[index] == "`":
             end = text.find("`", index + 1)
@@ -189,7 +194,10 @@ def strip_ui_markup(text: str) -> str:
             emit("<")
             index += 1
             continue
-        emit(text[index])
-        index += 1
+        # 普通字符成段输出；流式时每个增量都会重扫全文，逐字符循环太慢。
+        plain = _PLAIN_RE.match(text, index)
+        end = plain.end() if plain else index + 1
+        emit(text[index:end])
+        index = end
 
     return collapse_blank_lines("".join(output)).strip()

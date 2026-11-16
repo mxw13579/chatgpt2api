@@ -8,7 +8,6 @@ import pytest
 
 from services.storage.base import StorageBackend
 from services.storage.database_storage import DatabaseStorageBackend
-from services.storage.git_storage import GitStorageBackend
 from services.storage.json_storage import JSONStorageBackend
 
 
@@ -40,9 +39,8 @@ def _assert_redacted(error):
         assert marker not in rendered
 
 
-def test_json_and_git_inherit_non_abstract_delta_fallback():
+def test_json_inherits_non_abstract_delta_fallback():
     assert JSONStorageBackend.apply_account_changes is StorageBackend.apply_account_changes
-    assert GitStorageBackend.apply_account_changes is StorageBackend.apply_account_changes
     assert "apply_account_changes" not in StorageBackend.__abstractmethods__
 
 

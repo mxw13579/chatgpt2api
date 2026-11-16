@@ -26,12 +26,10 @@ STORED_IMAGES = [
 class ImageBytesOutputTests(unittest.TestCase):
     def setUp(self) -> None:
         self.backend = mock.Mock(spec=[
-            "resolve_conversation_image_urls", "download_image_bytes", "_poll_image_results",
-            "iter_codex_image_response_events",
+            "resolve_conversation_image_urls", "download_image_bytes", "iter_codex_image_response_events",
         ])
         self.backend.resolve_conversation_image_urls.return_value = IMAGE_URLS
         self.backend.download_image_bytes.return_value = IMAGE_BYTES
-        self.backend._poll_image_results.return_value = (["file-synthetic"], [])
         self.event = {
             "type": "conversation.completed", "conversation_id": "synthetic-conversation",
             "file_ids": ["file-synthetic"], "text": "", "turn_use_case": "image gen",
@@ -41,7 +39,6 @@ class ImageBytesOutputTests(unittest.TestCase):
             ("conversation_events", mock.Mock(return_value=[self.event])),
             ("image_storage_service", SimpleNamespace(save=self.save)),
             ("_image_remaining_timeout_secs", mock.Mock(return_value=30.0)),
-            ("_sleep_image_retry", mock.Mock()),
             ("config", SimpleNamespace(image_poll_initial_wait_secs=0)),
             ("logger", mock.Mock()),
         ):
@@ -49,44 +46,37 @@ class ImageBytesOutputTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def test_all_web_result_branches_use_bytes_and_keep_format_and_metadata(self) -> None:
-        for branch in ("direct", "text_reply", "empty_message"):
-            for response_format in (None, "b64_json", "url"):
-                with self.subTest(branch=branch, response_format=response_format):
-                    self.event["text"] = '{"size":"1920x1088","n":1}' if branch == "text_reply" else ""
-                    self.backend.resolve_conversation_image_urls.side_effect = (
-                        [IMAGE_URLS] if branch == "direct" else [[], IMAGE_URLS]
-                    )
-                    self.backend.download_image_bytes.return_value = [IMAGE_BYTES[0], b"", IMAGE_BYTES[1]]
-                    self.backend.download_image_bytes.reset_mock()
-                    self.backend._poll_image_results.reset_mock()
-                    self.save.reset_mock()
-                    self.save.side_effect = STORED_IMAGES
-                    request = conversation.ConversationRequest(
-                        model="gpt-image-2", prompt=" draw ", base_url=BASE_URL,
-                    )
-                    if response_format is not None:
-                        request.response_format = response_format
-                    with (
-                        mock.patch.object(base64, "b64decode", side_effect=AssertionError("Web bytes must not be decoded")),
-                        mock.patch.object(base64, "b64encode", wraps=base64.b64encode) as encode,
-                        mock.patch.object(conversation.time, "time", return_value=123),
-                    ):
-                        outputs = list(conversation.stream_image_outputs(self.backend, request, index=2, total=3))
-                    self.assertEqual(len(outputs), 1)
-                    output = outputs[0]
-                    key = request.response_format
-                    values = IMAGE_URLS if key == "url" else IMAGE_B64
-                    self.assertEqual(output.data, [{key: value, "revised_prompt": "draw"} for value in values])
-                    self.assertEqual(
-                        (output.kind, output.model, output.index, output.total, output.created, output.conversation_id),
-                        ("result", "gpt-image-2", 2, 3, 123, "synthetic-conversation"),
-                    )
-                    self.assertEqual(output.to_chunk()["_conversation_id"], "synthetic-conversation")
-                    self.assertEqual(self.save.call_args_list, [mock.call(data) for data in IMAGE_BYTES] if key == "url" else [])
-                    self.assertEqual(encode.call_args_list, [] if key == "url" else [mock.call(data) for data in IMAGE_BYTES])
-                    self.backend.download_image_bytes.assert_called_once_with(IMAGE_URLS)
-                    self.assertEqual(self.backend._poll_image_results.call_count, int(branch != "direct"))
+    def test_web_results_use_bytes_and_keep_format_and_metadata(self) -> None:
+        for response_format in (None, "b64_json", "url"):
+            with self.subTest(response_format=response_format):
+                self.backend.download_image_bytes.return_value = [IMAGE_BYTES[0], b"", IMAGE_BYTES[1]]
+                self.backend.download_image_bytes.reset_mock()
+                self.save.reset_mock()
+                self.save.side_effect = STORED_IMAGES
+                request = conversation.ConversationRequest(
+                    model="gpt-image-2", prompt=" draw ", base_url=BASE_URL,
+                )
+                if response_format is not None:
+                    request.response_format = response_format
+                with (
+                    mock.patch.object(base64, "b64decode", side_effect=AssertionError("Web bytes must not be decoded")),
+                    mock.patch.object(base64, "b64encode", wraps=base64.b64encode) as encode,
+                    mock.patch.object(conversation.time, "time", return_value=123),
+                ):
+                    outputs = list(conversation.stream_image_outputs(self.backend, request, index=2, total=3))
+                self.assertEqual(len(outputs), 1)
+                output = outputs[0]
+                key = request.response_format
+                values = IMAGE_URLS if key == "url" else IMAGE_B64
+                self.assertEqual(output.data, [{key: value, "revised_prompt": "draw"} for value in values])
+                self.assertEqual(
+                    (output.kind, output.model, output.index, output.total, output.created, output.conversation_id),
+                    ("result", "gpt-image-2", 2, 3, 123, "synthetic-conversation"),
+                )
+                self.assertEqual(output.to_chunk()["_conversation_id"], "synthetic-conversation")
+                self.assertEqual(self.save.call_args_list, [mock.call(data) for data in IMAGE_BYTES] if key == "url" else [])
+                self.assertEqual(encode.call_args_list, [] if key == "url" else [mock.call(data) for data in IMAGE_BYTES])
+                self.backend.download_image_bytes.assert_called_once_with(IMAGE_URLS)
 
     def test_empty_downloads_do_not_emit_success(self) -> None:
         for response_format in ("b64_json", "url"):

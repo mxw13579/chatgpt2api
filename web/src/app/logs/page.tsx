@@ -91,8 +91,8 @@ function LogsContent() {
       const references = [...new Map(data.items.flatMap(getUrls).map(r2ReferenceFromUrl).filter((image): image is ImageReference => Boolean(image)).map((image) => [image.image_id, image])).values()];
       const resolved: Record<string, ImageReference & { url: string }> = {};
       try {
-        for (let offset = 0; offset < references.length; offset += 100) {
-          for (const image of (await resolveImageReferences(references.slice(offset, offset + 100))).items) {
+        for (let offset = 0; offset < references.length; offset += 500) {
+          for (const image of (await resolveImageReferences(references.slice(offset, offset + 500))).items) {
             if (image.image_id) resolved[image.image_id] = image;
           }
         }
@@ -154,10 +154,9 @@ function LogsContent() {
   useEffect(() => {
     const refresh = () => { void loadLogs(false); };
     const changed = (event: StorageEvent) => { if (event.key === IMAGE_STORAGE_CHANGED) refresh(); };
-    window.addEventListener("focus", refresh);
     window.addEventListener(IMAGE_STORAGE_CHANGED, refresh);
     window.addEventListener("storage", changed);
-    return () => { window.removeEventListener("focus", refresh); window.removeEventListener(IMAGE_STORAGE_CHANGED, refresh); window.removeEventListener("storage", changed); };
+    return () => { window.removeEventListener(IMAGE_STORAGE_CHANGED, refresh); window.removeEventListener("storage", changed); };
   }, [loadLogs]);
 
   return (

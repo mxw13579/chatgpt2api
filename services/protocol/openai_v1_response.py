@@ -6,7 +6,6 @@ from typing import Any, Iterable, Iterator
 
 from fastapi import HTTPException
 
-from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
 from services.protocol.conversation import (
     ConversationRequest,
     ImageGenerationError,
@@ -77,13 +76,6 @@ def has_unsupported_response_tools(body: dict[str, Any]) -> bool:
     return has_unsupported_tools(body, {"image_generation", *WEB_SEARCH_TOOL_TYPES})
 
 
-def response_image_tool(body: dict[str, Any]) -> dict[str, object]:
-    for tool in body.get("tools") or []:
-        if isinstance(tool, dict) and tool.get("type") == "image_generation":
-            return tool
-    return {}
-
-
 def extract_response_image(input_value: object) -> tuple[bytes, str] | None:
     if isinstance(input_value, dict):
         if str(input_value.get("type") or "").strip() == "input_image":
@@ -103,25 +95,6 @@ def extract_response_image(input_value: object) -> tuple[bytes, str] | None:
             if images:
                 return images[0]
     return None
-
-
-def _input_image_parts(input_value: object) -> list[dict[str, Any]]:
-    parts: list[dict[str, Any]] = []
-    if isinstance(input_value, dict):
-        content = input_value.get("content")
-        if isinstance(content, list):
-            parts.extend(item for item in content if isinstance(item, dict))
-        return parts
-    if not isinstance(input_value, list):
-        return parts
-    if all(isinstance(item, dict) and item.get("type") for item in input_value):
-        return [item for item in input_value if isinstance(item, dict)]
-    for item in input_value:
-        if isinstance(item, dict):
-            content = item.get("content")
-            if isinstance(content, list):
-                parts.extend(part for part in content if isinstance(part, dict))
-    return parts
 
 
 def _is_response_content_part(value: object) -> bool:
@@ -291,7 +264,7 @@ def response_completed(
 
 def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     model = str(body.get("model") or "auto").strip() or "auto"
-    messages = normalize_text_messages(normalize_messages(messages_from_input(body.get("input"), body.get("instructions"))))
+    messages = normalize_messages(messages_from_input(body.get("input"), body.get("instructions")))
     if has_unsupported_response_tools(body):
         messages.insert(0, {"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})
     return model, messages
@@ -421,11 +394,7 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         if has_web_search_tool(body) and not has_unsupported_response_tools(body):
             yield from stream_web_search_response(body, messages)
             return
-        key = "responses:" + cache_key(body, messages, stream=bool(body.get("stream")))
-        yield from chat_completion_cache.get_or_compute_stream(
-            key,
-            lambda: stream_text_response(text_backend(model), body, messages),
-        )
+        yield from stream_text_response(text_backend(model), body, messages)
         return
 
     normalized = normalize_image_request(body, protocol="responses")

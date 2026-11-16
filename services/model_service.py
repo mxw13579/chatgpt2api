@@ -4,7 +4,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any
 
 from services.account_service import AccountService, account_service
@@ -38,6 +38,7 @@ class ModelCatalogService:
         self._cache_ttl_seconds = max(1.0, float(cache_ttl_seconds))
         self._clock = clock
         self._lock = RLock()
+        self._refresh_lock = Lock()
         self._expires_at = 0.0
         self._account_signature: tuple[tuple[str, int], ...] = ()
         self._anonymous_models: dict[str, dict[str, Any]] = {}
@@ -136,18 +137,29 @@ class ModelCatalogService:
                 elif account_type in self._models_by_account_type:
                     models_by_account_type[account_type] = self._models_by_account_type[account_type]
 
-        self._anonymous_models = anonymous_models
-        self._models_by_account_type = models_by_account_type
-        self._account_signature = signature
-        self._expires_at = self._clock() + self._cache_ttl_seconds
+        with self._lock:
+            self._anonymous_models = anonymous_models
+            self._models_by_account_type = models_by_account_type
+            self._account_signature = signature
+            self._expires_at = self._clock() + self._cache_ttl_seconds
 
     def _ensure_catalog(self) -> None:
         groups = self._active_accounts_by_type()
         signature = self._signature(groups)
+        if self._is_fresh(signature):
+            return
+        # 已有目录时，别的线程在刷新就先用旧目录，不排队等上游。
+        if not self._refresh_lock.acquire(blocking=self._expires_at == 0.0):
+            return
+        try:
+            if not self._is_fresh(signature):
+                self._refresh(groups, signature)
+        finally:
+            self._refresh_lock.release()
+
+    def _is_fresh(self, signature: tuple[tuple[str, int], ...]) -> bool:
         with self._lock:
-            if signature == self._account_signature and self._clock() < self._expires_at:
-                return
-            self._refresh(groups, signature)
+            return signature == self._account_signature and self._clock() < self._expires_at
 
     def list_models(self) -> dict[str, Any]:
         self._ensure_catalog()
