@@ -142,11 +142,6 @@ def image_request_prompt(body: dict, *, protocol: str) -> str:
         prompt = next(filter(None, (extract_prompt_from_message_content(content) for content in reversed(contents))), "")
     if not prompt:
         raise _bad_request("prompt is required")
-    instructions = body.get("instructions")
-    if instructions is not None and not isinstance(instructions, str):
-        raise _bad_request("instructions must be a string")
-    if instructions and instructions.strip():
-        prompt = f"{instructions.strip()}\n\n{prompt}"
     return prompt
 
 

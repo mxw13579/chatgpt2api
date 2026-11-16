@@ -175,7 +175,7 @@ class ImageCompatTests(unittest.TestCase):
         self.assert_bad_request({"model": "gpt-image-2", "messages": [], "input": "not selected"}, "prompt is required")
         self.assert_bad_request({"model": "gpt-image-2", "input": "", "messages": [{"role": "user", "content": "not selected"}]}, "prompt is required", "responses")
 
-    def test_only_user_text_is_used_and_instructions_prefix_it(self) -> None:
+    def test_only_latest_user_text_is_used_and_instructions_are_ignored(self) -> None:
         messages = [
             {"role": "system", "content": "system text"},
             {"role": "developer", "content": "developer text"},
@@ -186,7 +186,7 @@ class ImageCompatTests(unittest.TestCase):
         ]
         for protocol, field in (("chat", "messages"), ("responses", "input")):
             body = {"model": "gpt-image-2", field: messages, "instructions": "  style guide  "}
-            self.assertEqual(self.normalize(body, protocol).request.prompt, "style guide\n\nsecond")
+            self.assertEqual(self.normalize(body, protocol).request.prompt, "second")
 
     def test_direct_prompt_has_priority_but_keeps_selected_reference_images(self) -> None:
         body = {
@@ -195,7 +195,7 @@ class ImageCompatTests(unittest.TestCase):
             "input": [{"type": "input_image", "file_id": "file-synthetic-unselected"}],
         }
         result = self.normalize(body)
-        self.assertEqual(result.request.prompt, "prefix\n\ndirect")
+        self.assertEqual(result.request.prompt, "direct")
         self.assertEqual(result.images, [(PNG_BYTES, "image_1.png", "image/png")])
         self.assertEqual(result.request.images, [PNG_B64])
 
@@ -206,9 +206,8 @@ class ImageCompatTests(unittest.TestCase):
         for extra in ({}, {"instructions": "only instructions"}, {"messages": [{"role": "assistant", "content": "not user"}]}, {"input": "  "}):
             self.assert_bad_request({"model": "gpt-image-2", **extra}, "prompt is required")
 
-    def test_prompt_and_instructions_reject_non_strings(self) -> None:
+    def test_prompt_rejects_non_strings(self) -> None:
         self.assert_bad_request({"model": "gpt-image-2", "prompt": 12}, "prompt must be a string")
-        self.assert_bad_request({"model": "gpt-image-2", "prompt": "draw", "instructions": {}}, "instructions must be a string")
 
     def test_prompt_preview_matches_normalized_prompt_for_both_protocols(self) -> None:
         self.assertIn("image_request_prompt", self.compat.__all__)
@@ -219,13 +218,13 @@ class ImageCompatTests(unittest.TestCase):
                 ({native: None, fallback: "fallback"}, "fallback"),
                 ({native: [], fallback: "ignored", "prompt": " direct "}, "direct"),
                 ({native: "native", "prompt": "  "}, "native"),
-                ({native: [{"role": "user", "content": "native"}], "prompt": "direct", "instructions": " prefix "}, "prefix\n\ndirect"),
+                ({native: [{"role": "user", "content": "native"}], "prompt": "direct", "instructions": " prefix "}, "direct"),
                 ({native: [
                     {"role": "system", "content": "ignored system"},
                     {"role": "user", "content": "first"},
                     {"role": "assistant", "content": "ignored assistant"},
                     {"role": "user", "content": [{"type": "input_text", "text": "second"}]},
-                ], "instructions": " prefix "}, "prefix\n\nsecond"),
+                ], "instructions": " prefix "}, "second"),
                 ({native: [{"type": "input_text", "input_text": "bare blocks"}]}, "bare blocks"),
             ):
                 with self.subTest(protocol=protocol, expected=expected, fields=fields):
@@ -240,7 +239,7 @@ class ImageCompatTests(unittest.TestCase):
         for protocol, native, fallback in (("chat", "messages", "input"), ("responses", "input", "messages")):
             for fields in (
                 {}, {"instructions": "only instructions"},
-                {"prompt": 12}, {"prompt": "draw", "instructions": {}},
+                {"prompt": 12},
                 {native: [], fallback: "not selected"},
                 {native: "", fallback: "not selected"},
                 {native: [{"role": "assistant", "content": "not selected"}]},
@@ -272,7 +271,7 @@ class ImageCompatTests(unittest.TestCase):
                     "tools": [{"type": "image_generation", "model": "unsupported"}],
                     field: [{"role": "user", "content": [{"type": "text", "text": "edit"}, *images]}],
                 }
-                self.assertEqual(self.compat.image_request_prompt(body, protocol=protocol), "prefix\n\nedit")
+                self.assertEqual(self.compat.image_request_prompt(body, protocol=protocol), "edit")
 
     def test_normalization_reuses_exported_prompt_function(self) -> None:
         body = {"model": "gpt-image-2", "prompt": "original"}

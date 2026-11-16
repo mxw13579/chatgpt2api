@@ -61,7 +61,7 @@ Content-Type: application/json
 1. 非空字符串 `prompt` 优先。
 2. 未提供直接提示词时，Chat 优先读 `messages`，Responses 优先读 `input`。
 3. 原生字段缺失或为 `null` 时，允许读取另一个接口的字段。明确传入空数组/空字符串不会偷偷改读另一套内容。
-4. 不合并 `messages` 和 `input`。提示词只取选中来源中最后一条含文本的用户消息，更早的用户消息不参与；`instructions` 作为前缀加入。`system/developer/assistant` 消息不会被当作用户画图提示词。
+4. 不合并 `messages` 和 `input`。提示词只取选中来源中最后一条含文本的用户消息，更早的用户消息不参与。`instructions` 和 `system/developer/assistant` 消息不会进入画图提示词。
 5. 参考图从选中来源中最近一条含图的用户消息提取，并保留该消息的全部图片；直接的 Responses 内容块数组视为同一条消息。直接 `prompt` 可以搭配这些参考图。
 6. 内容过滤检查最终规范化的提示词，使用备用字段不会绕过过滤。
 

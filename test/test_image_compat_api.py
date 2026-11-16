@@ -528,7 +528,7 @@ class ImageFailureHTTPTests(ImageCompatHTTPFixture):
 
 
 class ImageFilteringAndLoggingHTTPTests(ImageCompatHTTPFixture):
-    def test_filter_receives_selected_prompt_and_instructions_including_other_protocol_fields(self) -> None:
+    def test_filter_receives_selected_prompt_without_instructions_including_other_protocol_fields(self) -> None:
         for path in PROTOCOLS:
             native, fallback = source_fields(path)
             native_text = "Synthetic native prompt."
@@ -559,7 +559,7 @@ class ImageFilteringAndLoggingHTTPTests(ImageCompatHTTPFixture):
                         "model": MODEL, "instructions": "  " + INSTRUCTIONS + "  ", **source,
                     })
                     self.assert_image_success(response, path)
-                    expected = INSTRUCTIONS + "\n\n" + selected
+                    expected = selected
                     self.request_filter.assert_called_once_with(expected)
                     self.assertEqual(self.pool_request(path).prompt, expected)
 
@@ -589,7 +589,7 @@ class ImageFilteringAndLoggingHTTPTests(ImageCompatHTTPFixture):
                             **text_source(fallback),
                         })
                     self.assertEqual(response.status_code, 403, response.text)
-                    self.request_filter.assert_called_once_with(INSTRUCTIONS + "\n\n" + PROMPT)
+                    self.request_filter.assert_called_once_with(PROMPT)
                     self.assert_no_pool()
                     self.assert_no_text_backend()
                     call_log.assert_called_once()
