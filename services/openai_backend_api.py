@@ -398,15 +398,6 @@ class OpenAIBackendAPI:
             self._raise_on_error(response, path)
         payload = response.json()
         default_account = ((payload.get("accounts") or {}).get("default") or {}).get("account") or {}
-        logger.debug({
-            "event": "backend_user_info_account_payload",
-            "plan_type": default_account.get("plan_type"),
-            "account_user_role": default_account.get("account_user_role"),
-            "account_id": default_account.get("account_id"),
-            "is_deactivated": default_account.get("is_deactivated"),
-            "has_active_subscription": (payload.get("accounts") or {}).get("default", {}).get("entitlement", {}).get("has_active_subscription"),
-            "subscription_plan": (payload.get("accounts") or {}).get("default", {}).get("entitlement", {}).get("subscription_plan"),
-        })
         return default_account
 
     def get_user_info(self) -> Dict[str, Any]:
@@ -443,16 +434,6 @@ class OpenAIBackendAPI:
             "restore_at": restore_at,
             "status": "限流" if quota == 0 else "正常",
         }
-        logger.debug({
-            "event": "backend_user_info_result",
-            "email": result.get("email"),
-            "user_id": result.get("user_id"),
-            "type": result.get("type"),
-            "quota": result.get("quota"),
-            "default_model_slug": result.get("default_model_slug"),
-            "restore_at": result.get("restore_at"),
-            "status": result.get("status"),
-        })
         return result
 
     def _bootstrap_headers(self) -> Dict[str, str]:
