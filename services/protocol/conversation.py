@@ -136,7 +136,26 @@ def is_image_concurrency_error(error: BaseException) -> bool:
     except (TypeError, ValueError):
         body_text = repr(body)
     text = body_text.lower()
+    if "upload_protection_limit_exceeded" in text:
+        return False
     return "concurrency_limit" in text or "too many concurrent" in text or "throttled" in text
+
+
+_UPLOAD_LIMIT_WAIT_RE = re.compile(r"请\s*(\d+)\s*(分钟|小时|天)")
+_UPLOAD_LIMIT_UNIT_SECS = {"分钟": 60, "小时": 3600, "天": 86400}
+
+
+def upload_limit_cooldown_secs(error: BaseException) -> float | None:
+    """账号达到文件上传上限时返回需要等待的秒数，其他错误返回 None。"""
+    if not isinstance(error, UpstreamHTTPError) or error.status_code != 429:
+        return None
+    body_text = json.dumps(error.body, ensure_ascii=False) if isinstance(error.body, (dict, list)) else str(error.body)
+    if "upload_protection_limit_exceeded" not in body_text:
+        return None
+    match = _UPLOAD_LIMIT_WAIT_RE.search(body_text)
+    if match is None:
+        return 3600.0
+    return float(int(match.group(1)) * _UPLOAD_LIMIT_UNIT_SECS[match.group(2)])
 
 
 def _image_remaining_timeout_secs(backend: object) -> float:
@@ -1452,6 +1471,7 @@ def _generate_single_image(
                 plan_type=plan_type,
                 source_type="codex" if codex_model else None,
                 plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+                needs_upload=bool(request.images) and not codex_model,
             )
         except RuntimeError as exc:
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
@@ -1622,6 +1642,11 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
+            upload_cooldown_secs = upload_limit_cooldown_secs(exc)
+            if upload_cooldown_secs is not None:
+                # 该账号在恢复前不再接带参考图的请求，本次直接换账号。
+                account_service.mark_upload_limited(token, upload_cooldown_secs)
+                continue
             if not emitted_for_token and is_image_concurrency_error(exc):
                 concurrency_retry_count += 1
                 if concurrency_retry_count <= MAX_CONCURRENCY_RETRIES and request_deadline > time.monotonic():

@@ -65,6 +65,7 @@ class AccountService:
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
         self._image_cooldown_until: dict[str, float] = {}
+        self._upload_cooldown_until: dict[str, float] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
 
@@ -178,6 +179,7 @@ class AccountService:
         for token in deleted:
             self._image_inflight.pop(token, None)
             self._image_cooldown_until.pop(token, None)
+            self._upload_cooldown_until.pop(token, None)
         for old in aliases:
             self._token_aliases.pop(old, None)
         self._index = self._index % len(self._accounts) if self._accounts else 0
@@ -459,6 +461,8 @@ class AccountService:
                 old_inflight = int(self._image_inflight.pop(old_token, 0))
                 if old_inflight:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
+                if old_token in self._upload_cooldown_until:
+                    self._upload_cooldown_until[new_token] = self._upload_cooldown_until.pop(old_token)
                 old_cooldown = float(self._image_cooldown_until.pop(old_token, 0.0))
                 if old_cooldown:
                     self._image_cooldown_until[new_token] = max(
@@ -917,8 +921,10 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            needs_upload: bool = False,
     ) -> list[str]:
         excluded = set(excluded_tokens or set())
+        now = time.monotonic()
         return [
             token
             for item in self._accounts.values()
@@ -928,6 +934,7 @@ class AccountService:
                and self._account_matches_source_type(item, source_type)
                and (token := item.get("access_token") or "")
                and token not in excluded
+               and not (needs_upload and self._upload_cooldown_until.get(token, 0.0) > now)
         ]
 
     def _acquire_next_candidate_token(
@@ -936,10 +943,13 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            needs_upload: bool = False,
     ) -> str:
         with self._image_slot_condition:
             while True:
-                ready_tokens = self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
+                ready_tokens = self._list_ready_candidate_tokens(
+                    excluded_tokens, plan_type, source_type, plan_types, needs_upload,
+                )
                 if not ready_tokens:
                     raise RuntimeError(
                         f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
@@ -959,6 +969,12 @@ class AccountService:
                     return access_token
                 self._image_slot_condition.wait(timeout=1.0)
 
+    def mark_upload_limited(self, access_token: str, cooldown_secs: float) -> None:
+        """账号达到文件上传上限：冷却期内不再分配带参考图的请求。"""
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            self._upload_cooldown_until[access_token] = time.monotonic() + cooldown_secs
+
     def release_image_slot(self, access_token: str) -> None:
         if not access_token:
             return
@@ -976,6 +992,7 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            needs_upload: bool = False,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -990,6 +1007,7 @@ class AccountService:
                 plan_type=plan_type,
                 source_type=source_type,
                 plan_types=plan_types,
+                needs_upload=needs_upload,
             )
             attempted_tokens.add(access_token)
             try:

@@ -480,6 +480,41 @@ class MultiImageResultTests(unittest.TestCase):
         self.assertEqual(get_token.call_count, 1)
         self.assertEqual(backend.image_request_deadline, 101.0)
 
+    def test_upload_limit_marks_account_and_switches_without_waiting(self) -> None:
+        from services.protocol.conversation import upload_limit_cooldown_secs
+
+        def limit_error(wait: str) -> UpstreamHTTPError:
+            return UpstreamHTTPError("/backend-api/files", 429, {"detail": {
+                "code": "throttled",
+                "message": f"你已达到文件上传上限。请{wait} 内重试。",
+                "reason": "upload_protection_limit_exceeded",
+            }})
+
+        self.assertEqual(upload_limit_cooldown_secs(limit_error("57分钟")), 57 * 60)
+        self.assertEqual(upload_limit_cooldown_secs(limit_error("8小时")), 8 * 3600)
+        self.assertEqual(upload_limit_cooldown_secs(limit_error("1天")), 86400)
+        self.assertEqual(upload_limit_cooldown_secs(limit_error("一会儿")), 3600)
+        self.assertIsNone(upload_limit_cooldown_secs(UpstreamHTTPError("/backend-api/files", 429, {"detail": {"code": "throttled"}})))
+
+        result = ImageOutput(kind="result", model="gpt-image-2", index=1, total=1, data=[{"url": "u"}])
+        with (
+            mock.patch("services.protocol.conversation.account_service.get_available_access_token", side_effect=["token-1", "token-2"]) as get_token,
+            mock.patch("services.protocol.conversation.account_service.get_account", return_value={"email": "a@example.test"}),
+            mock.patch("services.protocol.conversation.account_service.mark_image_result"),
+            mock.patch("services.protocol.conversation.account_service.mark_upload_limited") as mark_limited,
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=mock.Mock()),
+            mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=[limit_error("8小时"), iter([result])]),
+            mock.patch("services.protocol.conversation._sleep_until_deadline") as sleep,
+        ):
+            outputs = _generate_single_image(
+                ConversationRequest(prompt="edit", model="gpt-image-2", images=["data:image/png;base64,AA=="]), 1, 1,
+            )
+
+        self.assertEqual([output.kind for output in outputs], ["result"])
+        mark_limited.assert_called_once_with("token-1", 8 * 3600.0)
+        self.assertEqual([call.kwargs["needs_upload"] for call in get_token.call_args_list], [True, True])
+        sleep.assert_not_called()
+
     def test_sse_payload_iterator_enforces_application_deadline_for_idle_curl_stream(self) -> None:
         response = mock.Mock()
         response.queue = queue.Queue()

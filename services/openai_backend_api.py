@@ -239,6 +239,8 @@ class OpenAIBackendAPI:
         except (TypeError, ValueError):
             body_text = repr(body)
         text = body_text.lower()
+        if "upload_protection_limit_exceeded" in text:
+            return False
         return "concurrency_limit" in text or "too many concurrent" in text or "throttled" in text
 
     def _post_image_file_request(self, path: str, **kwargs: Any) -> requests.Response:

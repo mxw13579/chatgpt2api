@@ -167,13 +167,23 @@ class IncrementalAccountTests(unittest.TestCase):
         self.assertEqual(self.storage.rows["fixture-a"]["invalid_count"], 1)
         self.assertEqual(len(self.storage.change_calls), 4)
 
+    def test_upload_limited_account_is_skipped_only_for_requests_with_reference_images(self):
+        self.service._accounts["fixture-a"]["quota"] = 4
+        self.service._accounts["fixture-b"]["quota"] = 4
+        self.service.mark_upload_limited("fixture-a", 3600)
+
+        self.assertEqual(self.service._list_ready_candidate_tokens(needs_upload=True), ["fixture-b"])
+        self.assertEqual(self.service._list_ready_candidate_tokens(), ["fixture-a", "fixture-b"])
+        self.fixture.clock.now = 3600
+        self.assertEqual(self.service._list_ready_candidate_tokens(needs_upload=True), ["fixture-a", "fixture-b"])
+
     def test_candidate_selection_scans_ready_once_and_preserves_round_robin(self):
         self.service._index = 1
         with patch.object(
             self.service, "_list_ready_candidate_tokens", wraps=self.service._list_ready_candidate_tokens,
         ) as ready:
             token = self.service._acquire_next_candidate_token()
-        ready.assert_called_once_with(None, None, None, None)
+        ready.assert_called_once_with(None, None, None, None, False)
         self.assertEqual(token, "fixture-b")
         self.assertEqual(self.service._index, 2)
         self.assertEqual(self.service._image_inflight, {"fixture-b": 1})
@@ -213,7 +223,7 @@ class IncrementalAccountTests(unittest.TestCase):
         ) as wait:
             with self.assertRaisesRegex(RuntimeError, "^no available image quota$"):
                 self.service._acquire_next_candidate_token()
-        ready.assert_called_once_with(None, None, None, None)
+        ready.assert_called_once_with(None, None, None, None, False)
         wait.assert_not_called()
 
     def test_image_result_updates_quota_and_releases_slot_even_on_failure(self):
