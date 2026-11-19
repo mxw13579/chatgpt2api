@@ -1253,6 +1253,24 @@ class OpenAIBackendAPI:
                 return msg_text[:500]
         return ""
 
+    @staticmethod
+    def _conversation_message_summary(conversation: Dict[str, Any]) -> list[list[Any]]:
+        """超时排查用：上游对话里每条非用户消息的角色、去向、类型、状态和开头文字。"""
+        rows = []
+        for node in (conversation.get("mapping") or {}).values():
+            message = (node or {}).get("message") or {}
+            author = message.get("author") or {}
+            if not message or author.get("role") in ("user", "system"):
+                continue
+            content = message.get("content") or {}
+            text = "".join(part if isinstance(part, str) else f"<{part.get('content_type')}>"
+                           for part in content.get("parts") or [])
+            rows.append([
+                message.get("create_time") or 0, author.get("role"), author.get("name"), message.get("recipient"),
+                content.get("content_type"), message.get("status"), text[:80],
+            ])
+        return [row[1:] for row in sorted(rows, key=lambda row: row[0])]
+
     def _poll_image_results(
             self,
             conversation_id: str,
@@ -1330,6 +1348,7 @@ class OpenAIBackendAPI:
             return True
 
         last_task_error = ""
+        conversation: Dict[str, Any] = {}
         while _remaining() > 0:
             attempt += 1
             # 在每次轮询时，检查 /backend-api/tasks/ 是否有错误（仅记录，不中断）
@@ -1439,6 +1458,7 @@ class OpenAIBackendAPI:
             # attempts_made == 0 means the initial_wait consumed the entire budget — no HTTP attempted.
             "initial_wait_exhausted_budget": attempt == 0,
             "last_task_error": last_task_error if last_task_error else None,
+            "upstream_messages": self._conversation_message_summary(conversation),
         })
         exc = ImagePollTimeoutError(
             f"ChatGPT 生图超时（已等待 {timeout_secs} 秒）。"

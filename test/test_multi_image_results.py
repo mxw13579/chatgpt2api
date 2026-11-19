@@ -457,6 +457,21 @@ class MultiImageResultTests(unittest.TestCase):
         self.assertTrue(timers[0].cancelled)
         response.close.assert_called_once()
 
+    def test_conversation_message_summary_lists_non_user_messages_in_order(self) -> None:
+        conversation = {"mapping": {
+            "a": {"message": {"create_time": 3, "author": {"role": "tool", "name": "t2uay3k.sj1i4kz"}, "recipient": "all",
+                              "status": "in_progress", "content": {"content_type": "multimodal_text", "parts": [{"content_type": "image_asset_pointer"}]}}},
+            "b": {"message": {"create_time": 1, "author": {"role": "user"}, "content": {"content_type": "text", "parts": ["draw"]}}},
+            "c": {"message": {"create_time": 2, "author": {"role": "assistant"}, "recipient": "t2uay3k.sj1i4kz",
+                              "status": "finished_successfully", "content": {"content_type": "code", "parts": ["x" * 200]}}},
+            "d": {"message": None},
+        }}
+        self.assertEqual(OpenAIBackendAPI._conversation_message_summary(conversation), [
+            ["assistant", None, "t2uay3k.sj1i4kz", "code", "finished_successfully", "x" * 80],
+            ["tool", "t2uay3k.sj1i4kz", "all", "multimodal_text", "in_progress", "<image_asset_pointer>"],
+        ])
+        self.assertEqual(OpenAIBackendAPI._conversation_message_summary({}), [])
+
     def test_image_poll_timeout_retry_stops_when_configured_budget_is_exhausted(self) -> None:
         backend = mock.Mock()
         backend.image_request_deadline = None

@@ -46,6 +46,33 @@ class ImageBytesOutputTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
+    def test_turn_that_did_not_draw_is_retried_once_with_tool_instruction(self) -> None:
+        analysis = [
+            {"type": "conversation.delta", "conversation_id": "first", "delta": "背景是蓝色"},
+            {"type": "conversation.completed", "conversation_id": "first", "text": "背景是蓝色", "turn_use_case": "data analysis"},
+        ]
+        request = conversation.ConversationRequest(model="gpt-image-2", prompt="图片背景是什么颜色", images=["data:image/png;base64,AA=="])
+
+        with (
+            mock.patch.object(conversation, "_remove_image_conversation_later") as remove,
+            mock.patch.object(conversation, "_get_detailed_error_from_tasks", return_value=""),
+        ):
+            conversation.conversation_events.side_effect = [analysis, [self.event]]
+            outputs = list(conversation.stream_image_outputs(self.backend, request))
+            prompts = [call.kwargs["prompt"] for call in conversation.conversation_events.call_args_list]
+            self.assertEqual(prompts, [request.prompt, conversation.IMAGE_TOOL_INSTRUCTION + request.prompt])
+            self.assertEqual([output.kind for output in outputs], ["result"])
+            remove.assert_called_once_with(self.backend, "first", success=False)
+
+            # 带引导语仍没有画图：不再轮询，直接返回上游的文字。
+            conversation.conversation_events.reset_mock()
+            conversation.conversation_events.side_effect = [analysis, analysis]
+            self.backend.resolve_conversation_image_urls.reset_mock()
+            outputs = list(conversation.stream_image_outputs(self.backend, request))
+            self.assertEqual(conversation.conversation_events.call_count, 2)
+            self.assertEqual([(output.kind, output.text) for output in outputs], [("progress", "背景是蓝色"), ("message", "背景是蓝色")])
+            self.backend.resolve_conversation_image_urls.assert_not_called()
+
     def test_web_results_use_bytes_and_keep_format_and_metadata(self) -> None:
         for response_format in (None, "b64_json", "url"):
             with self.subTest(response_format=response_format):

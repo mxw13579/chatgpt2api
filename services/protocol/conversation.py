@@ -141,6 +141,8 @@ def is_image_concurrency_error(error: BaseException) -> bool:
     return "concurrency_limit" in text or "too many concurrent" in text or "throttled" in text
 
 
+# 上游没有走画图时重试用的引导语。
+IMAGE_TOOL_INSTRUCTION = "请使用图片生成工具，按下面的要求生成一张图片，不要只用文字回答。\n\n"
 _UPLOAD_LIMIT_WAIT_RE = re.compile(r"请\s*(\d+)\s*(分钟|小时|天)")
 _UPLOAD_LIMIT_UNIT_SECS = {"分钟": 60, "小时": 3600, "天": 86400}
 
@@ -1220,38 +1222,53 @@ def stream_image_outputs(
         index: int = 1,
         total: int = 1,
 ) -> Iterator[ImageOutput]:
-    last: dict[str, Any] = {}
-    for event in conversation_events(
-            backend,
-            prompt=request.prompt,
-            model=request.model,
-            images=request.images or [],
-            size=request.size,
-            quality=request.quality,
-    ):
-        last = event
-        if event.get("type") == "conversation.delta":
-            yield ImageOutput(
-                kind="progress",
+    prompt = request.prompt
+    while True:
+        last: dict[str, Any] = {}
+        progress: list[ImageOutput] = []
+        for event in conversation_events(
+                backend,
+                prompt=prompt,
                 model=request.model,
-                index=index,
-                total=total,
-                text=str(event.get("delta") or ""),
-                upstream_event_type="conversation.delta",
-                conversation_id=str(event.get("conversation_id") or ""),
-            )
-            continue
-        if event.get("type") == "conversation.event":
-            raw = event.get("raw")
-            raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
-            yield ImageOutput(
-                kind="progress",
-                model=request.model,
-                index=index,
-                total=total,
-                upstream_event_type=raw_type,
-                conversation_id=str(event.get("conversation_id") or ""),
-            )
+                images=request.images or [],
+                size=request.size,
+                quality=request.quality,
+        ):
+            last = event
+            if event.get("type") == "conversation.delta":
+                progress.append(ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    text=str(event.get("delta") or ""),
+                    upstream_event_type="conversation.delta",
+                    conversation_id=str(event.get("conversation_id") or ""),
+                ))
+                continue
+            if event.get("type") == "conversation.event":
+                raw = event.get("raw")
+                raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
+                progress.append(ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    upstream_event_type=raw_type,
+                    conversation_id=str(event.get("conversation_id") or ""),
+                ))
+        drew = last.get("turn_use_case") == "image gen" or last.get("file_ids") or last.get("sediment_ids")
+        if drew or last.get("blocked") or prompt != request.prompt:
+            break
+        # 上游这一轮没有走画图（改用数据分析或直接文字回答）：丢弃这轮输出，加引导语重试一次。
+        logger.info({
+            "event": "image_retry_with_tool_instruction",
+            "conversation_id": last.get("conversation_id"),
+            "turn_use_case": last.get("turn_use_case"),
+        })
+        _remove_image_conversation_later(backend, str(last.get("conversation_id") or ""), success=False)
+        prompt = IMAGE_TOOL_INSTRUCTION + request.prompt
+    yield from progress
 
     conversation_id = str(last.get("conversation_id") or "")
     file_ids = [str(item) for item in last.get("file_ids") or []]
@@ -1272,7 +1289,7 @@ def stream_image_outputs(
         error_text = detailed_error or message or "Image generation was rejected by upstream policy."
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=error_text, conversation_id=conversation_id)
         return
-    should_poll_for_image = bool(request.images) or last.get("turn_use_case") == "image gen"
+    should_poll_for_image = last.get("turn_use_case") == "image gen"
     if message and not file_ids and not sediment_ids and not should_poll_for_image and not is_text_reply:
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
         return
