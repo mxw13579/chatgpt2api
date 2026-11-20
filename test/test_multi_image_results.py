@@ -8,7 +8,7 @@ from unittest import mock
 from curl_cffi.requests.models import STREAM_END
 
 from services.config import config
-from services.openai_backend_api import ImagePollTimeoutError, OpenAIBackendAPI
+from services.openai_backend_api import ImagePollTimeoutError, ImageQueuedError, ImageQuotaExceededError, OpenAIBackendAPI
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
@@ -529,6 +529,41 @@ class MultiImageResultTests(unittest.TestCase):
         mark_limited.assert_called_once_with("token-1", 8 * 3600.0)
         self.assertEqual([call.kwargs["needs_upload"] for call in get_token.call_args_list], [True, True])
         sleep.assert_not_called()
+
+    def test_queued_or_quota_exhausted_turn_switches_account_without_waiting(self) -> None:
+        def tool_reply(text: str) -> dict:
+            return {"mapping": {"a": {"message": {
+                "create_time": 1, "author": {"role": "tool", "name": "t2uay3k.sj1i4kz"}, "recipient": "all",
+                "status": "finished_successfully", "content": {"content_type": "text", "parts": [text]},
+            }}}}
+
+        queued = "免费排队稍后生成这张图像，或升级订阅立即生成。"
+        quota = "你已达到 Free 套餐的图像生成请求上限。上限将在 7小时 后重置，届时可创建更多图像。"
+        for text, error_type in ((queued, ImageQueuedError), (quota, ImageQuotaExceededError)):
+            backend = FakeBackend([tool_reply(text)])
+            with (
+                mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 0}),
+                self.assertRaises(error_type) as raised,
+            ):
+                backend._poll_image_results("conv-1", timeout_secs=10)
+            self.assertEqual(raised.exception.conversation_id, "conv-1")
+            self.assertEqual(backend.calls, 1)
+
+        result = ImageOutput(kind="result", model="gpt-image-2", index=1, total=1, data=[{"url": "u"}])
+        with (
+            mock.patch("services.protocol.conversation.account_service.get_available_access_token", side_effect=["token-1", "token-2", "token-3"]),
+            mock.patch("services.protocol.conversation.account_service.get_account", return_value={"email": "a@example.test"}),
+            mock.patch("services.protocol.conversation.account_service.mark_image_result"),
+            mock.patch("services.protocol.conversation.account_service.update_account") as update_account,
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=mock.Mock()),
+            mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=[
+                ImageQueuedError(queued, "conv-1"), ImageQuotaExceededError(quota, "conv-2"), iter([result]),
+            ]),
+        ):
+            outputs = _generate_single_image(ConversationRequest(prompt="draw", model="gpt-image-2"), 1, 1)
+
+        self.assertEqual([output.kind for output in outputs], ["result"])
+        update_account.assert_called_once_with("token-2", {"status": "限流", "quota": 0}, quiet=True)
 
     def test_sse_payload_iterator_enforces_application_deadline_for_idle_curl_stream(self) -> None:
         response = mock.Mock()

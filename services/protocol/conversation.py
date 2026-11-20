@@ -18,6 +18,8 @@ from services.image_storage_service import image_storage_service
 from services.openai_backend_api import (
     ImageContentPolicyError,
     ImagePollTimeoutError,
+    ImageQueuedError,
+    ImageQuotaExceededError,
     ImageStreamHardTimeoutError,
     OpenAIBackendAPI,
     TEXT_STREAM_TIMEOUT_SECS,
@@ -1290,6 +1292,9 @@ def stream_image_outputs(
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=error_text, conversation_id=conversation_id)
         return
     should_poll_for_image = last.get("turn_use_case") == "image gen"
+    if not message and not file_ids and not sediment_ids and not should_poll_for_image:
+        # 上游没有走画图，也没有任何回复：轮询等不到图，直接失败。
+        raise ImageGenerationError("上游没有生成图片，也没有返回任何内容，请重试。", conversation_id=conversation_id)
     if message and not file_ids and not sediment_ids and not should_poll_for_image and not is_text_reply:
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
         return
@@ -1561,6 +1566,19 @@ def _generate_single_image(
                 return outputs
             account_service.mark_image_result(token, True)
             return outputs
+        except (ImageQueuedError, ImageQuotaExceededError) as exc:
+            # 上游把这次生图排进免费队列，或该账号图像额度已用完：不等待，直接换账号。
+            account_service.mark_image_result(token, False)
+            quota_exceeded = isinstance(exc, ImageQuotaExceededError)
+            logger.warning({
+                "event": "image_quota_exceeded_switch_account" if quota_exceeded else "image_queued_switch_account",
+                "account_email": account_email,
+                "index": index,
+                "error": str(exc),
+            })
+            if quota_exceeded:
+                account_service.update_account(token, {"status": "限流", "quota": 0}, quiet=True)
+            continue
         except ImagePollTimeoutError as exc:
             account_service.mark_image_result(token, False)
             if account_email:

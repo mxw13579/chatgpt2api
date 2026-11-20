@@ -73,6 +73,13 @@ class ImageBytesOutputTests(unittest.TestCase):
             self.assertEqual([(output.kind, output.text) for output in outputs], [("progress", "背景是蓝色"), ("message", "背景是蓝色")])
             self.backend.resolve_conversation_image_urls.assert_not_called()
 
+            # 带引导语仍没有画图，也没有任何文字：不轮询，直接失败。
+            silent = [{"type": "conversation.completed", "conversation_id": "second", "text": "", "turn_use_case": "multimodal"}]
+            conversation.conversation_events.side_effect = [silent, silent]
+            with self.assertRaises(conversation.ImageGenerationError):
+                list(conversation.stream_image_outputs(self.backend, request))
+            self.backend.resolve_conversation_image_urls.assert_not_called()
+
     def test_web_results_use_bytes_and_keep_format_and_metadata(self) -> None:
         for response_format in (None, "b64_json", "url"):
             with self.subTest(response_format=response_format):

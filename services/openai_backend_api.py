@@ -48,6 +48,16 @@ class ImageContentPolicyError(ImageTaskError):
     pass
 
 
+class ImageQueuedError(ImageTaskError):
+    """上游把这次生图排进了免费队列，短时间内不会出图。"""
+    pass
+
+
+class ImageQuotaExceededError(ImageTaskError):
+    """账号的图像生成额度已用完。"""
+    pass
+
+
 class ImageStreamHardTimeoutError(RuntimeError):
     """图片 SSE 流读取超过硬上限时抛出，用于快速中断被挂起的长连接。"""
     pass
@@ -1408,6 +1418,11 @@ class OpenAIBackendAPI:
             # 而非 /backend-api/tasks/ 的 task error 结构中。
             # 如果在没有找到图片文件 ID 的同时检测到内容政策违规，立即中断轮询。
             if not file_ids and not sediment_ids:
+                for row in self._conversation_message_summary(conversation):
+                    if "图像生成请求上限" in row[-1]:
+                        raise ImageQuotaExceededError(row[-1], conversation_id or "")
+                    if "免费排队稍后生成" in row[-1]:
+                        raise ImageQueuedError(row[-1], conversation_id or "")
                 policy_msg = self._find_content_policy_error_in_conversation(conversation)
                 if policy_msg:
                     logger.warning({
