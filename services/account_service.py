@@ -65,7 +65,6 @@ class AccountService:
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
         self._image_cooldown_until: dict[str, float] = {}
-        self._upload_cooldown_until: dict[str, float] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
 
@@ -104,6 +103,10 @@ class AccountService:
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _utc_iso(epoch: float) -> str:
+        return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="seconds")
 
     @staticmethod
     def _decode_jwt_payload(token: str) -> dict:
@@ -179,7 +182,6 @@ class AccountService:
         for token in deleted:
             self._image_inflight.pop(token, None)
             self._image_cooldown_until.pop(token, None)
-            self._upload_cooldown_until.pop(token, None)
         for old in aliases:
             self._token_aliases.pop(old, None)
         self._index = self._index % len(self._accounts) if self._accounts else 0
@@ -461,8 +463,6 @@ class AccountService:
                 old_inflight = int(self._image_inflight.pop(old_token, 0))
                 if old_inflight:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
-                if old_token in self._upload_cooldown_until:
-                    self._upload_cooldown_until[new_token] = self._upload_cooldown_until.pop(old_token)
                 old_cooldown = float(self._image_cooldown_until.pop(old_token, 0.0))
                 if old_cooldown:
                     self._image_cooldown_until[new_token] = max(
@@ -924,7 +924,7 @@ class AccountService:
             needs_upload: bool = False,
     ) -> list[str]:
         excluded = set(excluded_tokens or set())
-        now = time.monotonic()
+        now = self._utc_iso(time.time())
         return [
             token
             for item in self._accounts.values()
@@ -934,7 +934,7 @@ class AccountService:
                and self._account_matches_source_type(item, source_type)
                and (token := item.get("access_token") or "")
                and token not in excluded
-               and not (needs_upload and self._upload_cooldown_until.get(token, 0.0) > now)
+               and not (needs_upload and (item.get("upload_limited_until") or "") > now)
         ]
 
     def _acquire_next_candidate_token(
@@ -951,6 +951,19 @@ class AccountService:
                     excluded_tokens, plan_type, source_type, plan_types, needs_upload,
                 )
                 if not ready_tokens:
+                    if needs_upload and self._list_ready_candidate_tokens(
+                            excluded_tokens, plan_type, source_type, plan_types,
+                    ):
+                        now = self._utc_iso(time.time())
+                        earliest = min(
+                            until for item in self._accounts.values()
+                            if (until := item.get("upload_limited_until") or "") > now
+                        )
+                        raise RuntimeError(
+                            "no available image quota for requests with reference images: the remaining accounts "
+                            f"reached the upstream file upload limit, earliest recovery at {earliest}. "
+                            "Requests without reference images are not affected."
+                        )
                     raise RuntimeError(
                         f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
                         if plan_type or source_type else "no available image quota"
@@ -970,10 +983,14 @@ class AccountService:
                 self._image_slot_condition.wait(timeout=1.0)
 
     def mark_upload_limited(self, access_token: str, cooldown_secs: float) -> None:
-        """账号达到文件上传上限：冷却期内不再分配带参考图的请求。"""
+        """账号达到文件上传上限：恢复时间写入账号数据，到点前不再分配带参考图的请求。"""
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
-            self._upload_cooldown_until[access_token] = time.monotonic() + cooldown_secs
+            current = self._accounts.get(access_token)
+            if current is None:
+                return
+            until = self._utc_iso(time.time() + cooldown_secs)
+            self._apply_account_changes_locked([{**current, "upload_limited_until": until}], [])
 
     def release_image_slot(self, access_token: str) -> None:
         if not access_token:
@@ -1708,6 +1725,8 @@ class AccountService:
         limited = sum(1 for a in items if a.get("status") == "限流")
         abnormal = sum(1 for a in items if a.get("status") == "异常")
         disabled = sum(1 for a in items if a.get("status") == "禁用")
+        now = self._utc_iso(time.time())
+        upload_limited = sum(1 for a in items if (a.get("upload_limited_until") or "") > now)
         total_quota = sum(max(0, int(a.get("quota") or 0)) for a in items if a.get("status") == "正常")
         total_success = sum(int(a.get("success") or 0) for a in items)
         total_fail = sum(int(a.get("fail") or 0) for a in items)
@@ -1722,6 +1741,7 @@ class AccountService:
             "limited": limited,
             "abnormal": abnormal,
             "disabled": disabled,
+            "upload_limited": upload_limited,
             "total_quota": total_quota,
             "total_success": total_success,
             "total_fail": total_fail,

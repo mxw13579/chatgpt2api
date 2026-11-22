@@ -50,6 +50,8 @@ export type Account = {
   }>;
   default_model_slug?: string | null;
   restore_at?: string | null;
+  /** 账号达到上游文件上传上限后的恢复时间；在此之前不分配带参考图的请求。 */
+  upload_limited_until?: string | null;
   success: number;
   fail: number;
   /** 当前图片在途数(正在生成、尚未结束的图片数)。号池空闲时持续 > 0 表示并发槽位泄漏。 */

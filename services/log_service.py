@@ -346,7 +346,7 @@ def _image_error_response(exc: Exception) -> JSONResponse:
         return openai_error_response(
             {
                 "error": {
-                    "message": "no available image quota",
+                    "message": message if "reference images" in message else "no available image quota",
                     "type": "insufficient_quota",
                     "param": None,
                     "code": "insufficient_quota",

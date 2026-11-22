@@ -63,12 +63,19 @@ import { cn } from "@/lib/utils";
 
 import { AccountImportDialog } from "./components/account-import-dialog";
 
-const accountStatusOptions: { label: string; value: AccountStatus | "all" }[] = [
+type StatusFilter = AccountStatus | "all" | "upload_limited";
+
+function isUploadLimited(account: Account) {
+  return Boolean(account.upload_limited_until) && new Date(account.upload_limited_until as string).getTime() > Date.now();
+}
+
+const accountStatusOptions: { label: string; value: StatusFilter }[] = [
   { label: "全部状态", value: "all" },
   { label: "正常", value: "正常" },
   { label: "限流", value: "限流" },
   { label: "异常", value: "异常" },
   { label: "禁用", value: "禁用" },
+  { label: "上传受限", value: "upload_limited" },
 ];
 
 const statusMeta: Record<
@@ -90,6 +97,7 @@ const metricCards = [
   { key: "limited", label: "限流账户", color: "text-orange-500", icon: CircleAlert },
   { key: "abnormal", label: "异常账户", color: "text-rose-500", icon: CircleOff },
   { key: "disabled", label: "禁用账户", color: "text-stone-500", icon: Ban },
+  { key: "uploadLimited", label: "上传受限", color: "text-amber-600", icon: CircleAlert },
   { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
 ] as const;
 
@@ -172,7 +180,7 @@ function AccountsPageContent() {
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState("all");
-  const [statusFilter, setStatusFilter] = useState<AccountStatus | "all">("all");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState("10");
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
@@ -253,7 +261,9 @@ function AccountsPageContent() {
       const searchMatched =
         normalizedQuery.length === 0 || (account.email ?? "").toLowerCase().includes(normalizedQuery);
       const typeMatched = typeFilter === "all" || displayAccountType(account) === typeFilter;
-      const statusMatched = statusFilter === "all" || account.status === statusFilter;
+      const statusMatched =
+        statusFilter === "all" ||
+        (statusFilter === "upload_limited" ? isUploadLimited(account) : account.status === statusFilter);
       return searchMatched && typeMatched && statusMatched;
     });
   }, [accounts, query, statusFilter, typeFilter]);
@@ -271,9 +281,10 @@ function AccountsPageContent() {
     const limited = accounts.filter((item) => item.status === "限流").length;
     const abnormal = accounts.filter((item) => item.status === "异常").length;
     const disabled = accounts.filter((item) => item.status === "禁用").length;
+    const uploadLimited = accounts.filter(isUploadLimited).length;
     const quota = formatQuotaSummary(accounts);
 
-    return { total, active, limited, abnormal, disabled, quota };
+    return { total, active, limited, abnormal, disabled, uploadLimited, quota };
   }, [accounts]);
 
   const accountTypeOptions = useMemo(
@@ -776,10 +787,10 @@ function AccountsPageContent() {
       </Dialog>
 
       <section className="space-y-3">
-        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-7">
           {metricCards.map((item) => {
             const Icon = item.icon;
-            const value = (refreshSummary ?? summary)[item.key];
+            const value = (refreshSummary ?? summary)[item.key] ?? summary[item.key];
             return (
               <Card key={item.key} className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
                 <CardContent className="p-4">
@@ -878,7 +889,7 @@ function AccountsPageContent() {
             <Select
               value={statusFilter}
               onValueChange={(value) => {
-                setStatusFilter(value as AccountStatus | "all");
+                setStatusFilter(value as StatusFilter);
                 setPage(1);
               }}
             >
@@ -1045,6 +1056,14 @@ function AccountsPageContent() {
                             <StatusIcon className="size-3.5" />
                             {account.status}
                           </Badge>
+                          {isUploadLimited(account) ? (
+                            <div
+                              className="mt-1 text-xs leading-5 text-amber-600"
+                              title="该账号达到上游文件上传上限，恢复前不分配带参考图的请求；纯文字生图不受影响"
+                            >
+                              上传受限 · {formatRestoreAt(account.upload_limited_until).relative}
+                            </div>
+                          ) : null}
                         </td>
                         <td className="px-4 py-3">
                           <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>
