@@ -14,6 +14,7 @@ from PIL import Image
 
 from services.config import DATA_DIR, IMAGE_STORAGE_LOCK, config
 from services.r2_client import CloudflareR2Client, R2Error
+from utils.log import logger
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
 R2_USAGE_FILE = DATA_DIR / "r2_usage.json"
@@ -146,13 +147,13 @@ class ImageStorageService:
             usage[account_id] = {"month": month, "uploads": self._monthly_uploads(usage, account_id, month) + 1}
             _write_json_object(self.usage_file, usage)
 
-    def _pick_account(self, settings: dict, now: datetime) -> dict | None:
+    def _pick_account(self, settings: dict, now: datetime, excluded: set[str] = frozenset()) -> dict | None:
         """Enabled account with the lowest share of its monthly upload limit used."""
         usage = self._load_usage()
         month = self._month(now)
         candidates = []
         for account in settings.get("r2_accounts", []):
-            if not account["enabled"]:
+            if not account["enabled"] or account["id"] in excluded:
                 continue
             used = self._monthly_uploads(usage, account["id"], month)
             if used < account["monthly_upload_limit"]:
@@ -249,52 +250,61 @@ class ImageStorageService:
         return CloudflareR2Client({**self.account(account_id), "prefix": "images"})
 
     def save(self, image_data: bytes) -> StoredImage:
-        with self._index_lock:
-            settings = self.settings()
-            extension, mime, dimensions = _r2_image_info(image_data)
-            now = _utc_now()
-            document = self._load_document()
-            account = self._pick_account(settings, now)
-            if account is None:
-                raise ImageStorageError("R2 image storage has no enabled account with remaining monthly uploads")
-            rel = f"images/{now:%Y/%m/%d}/{uuid.uuid4().hex}{extension}"
-            expires = now + timedelta(minutes=int(settings.get("retention_minutes", 60)))
-            item = {
-                "rel": rel, "path": rel, "name": Path(rel).name, "date": now.strftime("%Y-%m-%d"),
-                "storage": "r2", "account_id": account["id"], "object_key": rel, "image_id": rel,
-                "size": len(image_data), "mime": mime, "created_at": now.isoformat(),
-                "expires_at": expires.isoformat(), "pending": True,
-            }
-            if dimensions:
-                item["width"], item["height"] = dimensions
-            document["items"][rel] = item
-            _write_json_object(self.index_file, document)
-            self._count_upload(account["id"], now)
-            self._uploading.add(rel)
-        try:
-            client = CloudflareR2Client({**account, "prefix": "images"})
-            try:
-                client.upload_bytes(
-                    rel, image_data, content_type=mime,
-                    metadata={"expires-at": expires.isoformat()},
-                    cache_control=f"public, max-age=0, s-maxage={int(settings.get('cache_ttl_seconds', 60))}, must-revalidate",
-                )
-            except R2Error:
-                raise ImageStorageError("R2 image upload failed") from None
-            finally:
-                client.close()
+        extension, mime, dimensions = _r2_image_info(image_data)
+        failed: set[str] = set()
+        while True:
             with self._index_lock:
+                settings = self.settings()
+                now = _utc_now()
                 document = self._load_document()
-                item = document["items"][rel]
-                item.update(pending=False, uploaded_at=_now_iso())
+                account = self._pick_account(settings, now, failed)
+                if account is None:
+                    # 每个可用账号都试过且都失败时，报上传失败；否则是没有可用账号。
+                    raise ImageStorageError(
+                        "R2 image upload failed" if failed
+                        else "R2 image storage has no enabled account with remaining monthly uploads"
+                    )
+                rel = f"images/{now:%Y/%m/%d}/{uuid.uuid4().hex}{extension}"
+                expires = now + timedelta(minutes=int(settings.get("retention_minutes", 60)))
+                item = {
+                    "rel": rel, "path": rel, "name": Path(rel).name, "date": now.strftime("%Y-%m-%d"),
+                    "storage": "r2", "account_id": account["id"], "object_key": rel, "image_id": rel,
+                    "size": len(image_data), "mime": mime, "created_at": now.isoformat(),
+                    "expires_at": expires.isoformat(), "pending": True,
+                }
+                if dimensions:
+                    item["width"], item["height"] = dimensions
+                document["items"][rel] = item
                 _write_json_object(self.index_file, document)
-                accounts = {account["id"]: account for account in self.settings().get("r2_accounts", [])}
-                url = self._r2_public_url(item, accounts)
-            return StoredImage(rel=rel, url=url, storage="r2", size=len(image_data),
-                               image_id=rel, account_id=account["id"], expires_at=expires.isoformat())
-        finally:
-            with self._index_lock:
-                self._uploading.discard(rel)
+                self._count_upload(account["id"], now)
+                self._uploading.add(rel)
+            try:
+                client = CloudflareR2Client({**account, "prefix": "images"})
+                try:
+                    client.upload_bytes(
+                        rel, image_data, content_type=mime,
+                        metadata={"expires-at": expires.isoformat()},
+                        cache_control=f"public, max-age=0, s-maxage={int(settings.get('cache_ttl_seconds', 60))}, must-revalidate",
+                    )
+                except R2Error as exc:
+                    # 这个账号传不上去（如密钥失效返回 403）：记下原因，换下一个账号。
+                    logger.warning({"event": "r2_image_upload_failed", "account": account["name"], "error": str(exc)})
+                    failed.add(account["id"])
+                    continue
+                finally:
+                    client.close()
+                with self._index_lock:
+                    document = self._load_document()
+                    item = document["items"][rel]
+                    item.update(pending=False, uploaded_at=_now_iso())
+                    _write_json_object(self.index_file, document)
+                    accounts = {account["id"]: account for account in self.settings().get("r2_accounts", [])}
+                    url = self._r2_public_url(item, accounts)
+                return StoredImage(rel=rel, url=url, storage="r2", size=len(image_data),
+                                   image_id=rel, account_id=account["id"], expires_at=expires.isoformat())
+            finally:
+                with self._index_lock:
+                    self._uploading.discard(rel)
 
     def _delete_r2(self, rel: str, client: CloudflareR2Client) -> bool:
         with self._index_lock:

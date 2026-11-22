@@ -109,9 +109,18 @@ class R2ImageStorageTests(unittest.TestCase):
         self.client.upload_bytes.side_effect = R2Error("synthetic")
         with self.assertRaises(ImageStorageError):
             self.service.save(image_bytes())
-        self.assertEqual(sum(item["uploads"] for item in self.usage().values()), 1)
+        # 两个账号都试过，各计一次。
+        self.assertEqual(sum(item["uploads"] for item in self.usage().values()), 2)
         items = list(json.loads((self.root / "image_index.json").read_text())["items"].values())
-        self.assertTrue(items[0]["pending"])
+        self.assertTrue(all(item["pending"] for item in items))
+
+    def test_failed_upload_switches_to_the_next_account(self):
+        self.client.upload_bytes.side_effect = [R2Error("synthetic", status_code=403), None]
+        one, two = (item["id"] for item in self.settings["r2_accounts"])
+        stored = self.service.save(image_bytes())
+        self.assertEqual(stored.account_id, two)
+        self.assertEqual([call.args[0]["id"] for call in self.factory.call_args_list], [one, two])
+        self.assertFalse(self.service.metadata(stored.rel)["pending"])
 
     def test_expired_images_are_deleted_with_their_account(self):
         stored = self.service.save(image_bytes())

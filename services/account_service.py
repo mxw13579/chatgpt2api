@@ -1728,6 +1728,10 @@ class AccountService:
         now = self._utc_iso(time.time())
         upload_limited = sum(1 for a in items if (a.get("upload_limited_until") or "") > now)
         total_quota = sum(max(0, int(a.get("quota") or 0)) for a in items if a.get("status") == "正常")
+        upload_quota = sum(
+            max(0, int(a.get("quota") or 0)) for a in items
+            if a.get("status") == "正常" and not (a.get("upload_limited_until") or "") > now
+        )
         total_success = sum(int(a.get("success") or 0) for a in items)
         total_fail = sum(int(a.get("fail") or 0) for a in items)
         by_type = {}
@@ -1743,6 +1747,7 @@ class AccountService:
             "disabled": disabled,
             "upload_limited": upload_limited,
             "total_quota": total_quota,
+            "upload_quota": upload_quota,
             "total_success": total_success,
             "total_fail": total_fail,
             "by_type": by_type,

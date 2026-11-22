@@ -176,7 +176,8 @@ class IncrementalAccountTests(unittest.TestCase):
         self.assertEqual(self.service._list_ready_candidate_tokens(), ["fixture-a", "fixture-b"])
         # 恢复时间随账号数据落库，重启后仍然生效。
         self.assertEqual(self.storage.rows["fixture-a"]["upload_limited_until"], "2023-11-14T23:13:20+00:00")
-        self.assertEqual(self.service.get_stats()["upload_limited"], 1)
+        stats = self.service.get_stats()
+        self.assertEqual((stats["upload_limited"], stats["total_quota"], stats["upload_quota"]), (1, 8, 4))
 
         self.service.mark_upload_limited("fixture-b", 7200)
         with self.assertRaisesRegex(RuntimeError, "reference images.*earliest recovery at 2023-11-14T23:13:20"):

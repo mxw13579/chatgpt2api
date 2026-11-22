@@ -99,6 +99,7 @@ const metricCards = [
   { key: "disabled", label: "禁用账户", color: "text-stone-500", icon: Ban },
   { key: "uploadLimited", label: "上传受限", color: "text-amber-600", icon: CircleAlert },
   { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
+  { key: "uploadQuota", label: "图生图额度", color: "text-blue-500", icon: RefreshCw },
 ] as const;
 
 function formatCompact(value: number) {
@@ -284,7 +285,10 @@ function AccountsPageContent() {
     const uploadLimited = accounts.filter(isUploadLimited).length;
     const quota = formatQuotaSummary(accounts);
 
-    return { total, active, limited, abnormal, disabled, uploadLimited, quota };
+    // 图生图要上传参考图：只算当前没有上传受限的账号。
+    const uploadQuota = formatQuotaSummary(accounts.filter((item) => !isUploadLimited(item)));
+
+    return { total, active, limited, abnormal, disabled, uploadLimited, quota, uploadQuota };
   }, [accounts]);
 
   const accountTypeOptions = useMemo(
@@ -787,7 +791,7 @@ function AccountsPageContent() {
       </Dialog>
 
       <section className="space-y-3">
-        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-7">
+        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-8">
           {metricCards.map((item) => {
             const Icon = item.icon;
             const value = (refreshSummary ?? summary)[item.key] ?? summary[item.key];
