@@ -1799,6 +1799,10 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                     "error": str(exc)[:300],
                 })
 
+    if errors and not results:
+        # 全部失败：原样抛出原始错误，状态码与单张图一致（如内容审核拒绝返回 400，而不是 502）。
+        raise errors[max(errors)]
+
     if errors and request.strict_image_results:
         # 一次任务偶然返回多张图，也不能掩盖其他任务的失败。
         raise ImageGenerationError(

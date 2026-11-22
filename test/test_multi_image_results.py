@@ -96,6 +96,21 @@ class MultiImageResultTests(unittest.TestCase):
 
         generate.assert_called_once_with(request, 1, 1)
 
+    def test_parallel_generation_keeps_original_error_when_every_image_fails(self) -> None:
+        from services.protocol.conversation import ImageGenerationError
+
+        rejected = ImageGenerationError(
+            "rejected", status_code=400, error_type="invalid_request_error", code="content_policy_violation",
+        )
+        with (
+            mock.patch.dict(config.data, {"image_parallel_generation": True}),
+            mock.patch("services.protocol.conversation._generate_single_image", side_effect=rejected),
+            self.assertRaises(ImageGenerationError) as raised,
+        ):
+            list(stream_image_outputs_with_pool(ConversationRequest(model="gpt-image-2", prompt="draw", n=3)))
+
+        self.assertEqual((raised.exception.status_code, raised.exception.code), (400, "content_policy_violation"))
+
     def test_stream_id_extractor_keeps_full_file_ids(self) -> None:
         payload = (
             '{"conversation_id":"conv-1"} '
