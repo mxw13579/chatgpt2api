@@ -145,11 +145,14 @@ def create_router() -> APIRouter:
         else:
             result = account_service.add_accounts(tokens)
         refresh_result = account_service.refresh_accounts(tokens)
+        # 刷新后才知道上游 user_id：同一账号同一套餐的旧记录在这里被新导入的覆盖。
+        merged = account_service.merge_duplicate_accounts(tokens)
         return {
             **result,
+            "merged": merged,
             "refreshed": refresh_result.get("refreshed", 0),
             "errors": refresh_result.get("errors", []),
-            "items": _public_accounts(refresh_result.get("items", result.get("items", []))),
+            "items": _public_accounts(account_service.list_accounts()),
         }
 
     @router.delete("/api/accounts")

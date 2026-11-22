@@ -237,7 +237,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
         );
       } else {
         toast.success(
-          `${successText ?? "导入完成"}，新增 ${data.added ?? 0} 个，跳过 ${data.skipped ?? 0} 个重复项，已自动刷新账号信息`,
+          `${successText ?? "导入完成"}，新增 ${data.added ?? 0} 个，跳过 ${data.skipped ?? 0} 个重复项${data.merged ? `，覆盖 ${data.merged} 个同账号旧记录` : ""}，已自动刷新账号信息`,
         );
       }
     } catch (error) {
@@ -297,7 +297,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
         );
       } else {
         toast.success(
-          `OAuth 登录完成，新增 ${data.added ?? 0} 个，跳过 ${data.skipped ?? 0} 个重复项，已自动刷新账号信息`,
+          `OAuth 登录完成，新增 ${data.added ?? 0} 个，跳过 ${data.skipped ?? 0} 个重复项${data.merged ? `，覆盖 ${data.merged} 个同账号旧记录` : ""}，已自动刷新账号信息`,
         );
       }
     } catch (error) {

@@ -1248,6 +1248,40 @@ class AccountService:
             )
         return {"added": added, "skipped": skipped, "items": items}
 
+    def merge_duplicate_accounts(self, access_tokens: list[str]) -> int:
+        """导入后调用：同一上游账号（user_id）同一套餐已有别的记录时合并成一条。
+
+        保留 token 过期时间最晚的那条（相同时保留刚导入的），成功/失败次数相加，
+        创建时间取最早，上传受限时间取最晚。返回被合并掉的记录数。
+        """
+        removed = 0
+        with self._lock:
+            for token in access_tokens:
+                new = self._accounts.get(self._resolve_access_token_locked(token))
+                if not new or not new.get("user_id"):
+                    continue
+                group = [new] + [
+                    item for item in self._accounts.values()
+                    if item is not new and item.get("user_id") == new["user_id"] and item.get("type") == new["type"]
+                ]
+                if len(group) == 1:
+                    continue
+                keep = max(group, key=lambda item: (self._jwt_exp(item["access_token"]), item is new))
+                merged = {
+                    **keep,
+                    "created_at": min(item["created_at"] for item in group),
+                    "success": sum(item["success"] for item in group),
+                    "fail": sum(item["fail"] for item in group),
+                    "upload_limited_until": max(item.get("upload_limited_until") or "" for item in group) or None,
+                }
+                self._apply_account_changes_locked([merged], [])
+                removed += self._delete_accounts_locked(
+                    {item["access_token"] for item in group if item is not keep}
+                )
+            if removed:
+                self._log_account_event(f"合并 {removed} 个重复账号", {"removed": removed})
+        return removed
+
     def delete_accounts(self, tokens: list[str]) -> dict:
         target_set = set(token for token in tokens if token)
         if not target_set:
@@ -1586,7 +1620,7 @@ class AccountService:
 
         refreshed = 0
         errors = []
-        max_workers = min(10, len(access_tokens))
+        max_workers = min(30, len(access_tokens))
 
         try:
             # 出错也等待已启动的 worker 退出，再将记录置为完成，避免 TTL 驱逐活跃任务。

@@ -93,6 +93,7 @@ type AccountMutationResponse = {
   items: Account[];
   added?: number;
   skipped?: number;
+  merged?: number;
   removed?: number;
   refreshed?: number;
   relogined?: number;

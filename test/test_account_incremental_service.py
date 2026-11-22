@@ -167,6 +167,39 @@ class IncrementalAccountTests(unittest.TestCase):
         self.assertEqual(self.storage.rows["fixture-a"]["invalid_count"], 1)
         self.assertEqual(len(self.storage.change_calls), 4)
 
+    def test_import_merges_records_of_the_same_upstream_account_and_plan(self):
+        def jwt(exp: int, name: str) -> str:
+            import base64, json
+            body = base64.urlsafe_b64encode(json.dumps({"exp": exp, "n": name}).encode()).decode().rstrip("=")
+            return f"h.{body}.s"
+
+        old, new, team = jwt(100, "old"), jwt(200, "new"), jwt(50, "team")
+        self.service._add_account_payloads([
+            {"access_token": old, "user_id": "user-1", "type": "free", "created_at": "2026-01-01 00:00:00",
+             "success": 5, "fail": 2, "upload_limited_until": "2099-01-01T00:00:00+00:00"},
+            {"access_token": team, "user_id": "user-1", "type": "team"},
+            {"access_token": new, "user_id": "user-1", "type": "free", "created_at": "2026-02-01 00:00:00",
+             "success": 1, "fail": 0},
+        ])
+
+        self.assertEqual(self.service.merge_duplicate_accounts([new]), 1)
+        merged = self.service.get_account(new)
+        self.assertEqual(
+            (merged["success"], merged["fail"], merged["created_at"], merged["upload_limited_until"]),
+            (6, 2, "2026-01-01 00:00:00", "2099-01-01T00:00:00+00:00"),
+        )
+        self.assertIsNone(self.service.get_account(old))
+        self.assertNotIn(old, self.storage.rows)
+        # 套餐不同的记录保留。
+        self.assertIsNotNone(self.service.get_account(team))
+
+        # 导入的 token 比已有的旧：保留已有的那条，丢掉导入的。
+        older = jwt(150, "older")
+        self.service._add_account_payloads([{"access_token": older, "user_id": "user-1", "type": "free"}])
+        self.assertEqual(self.service.merge_duplicate_accounts([older]), 1)
+        self.assertIsNone(self.service.get_account(older))
+        self.assertIsNotNone(self.service.get_account(new))
+
     def test_upload_limited_account_is_skipped_only_for_requests_with_reference_images(self):
         self.service._accounts["fixture-a"]["quota"] = 4
         self.service._accounts["fixture-b"]["quota"] = 4
