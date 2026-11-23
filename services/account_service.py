@@ -975,6 +975,13 @@ class AccountService:
                     if int(self._image_inflight.get(token, 0)) < max_concurrency
                        and float(self._image_cooldown_until.get(token, 0.0)) <= now
                 ]
+                if tokens and not needs_upload:
+                    # 不带参考图的请求优先用上传受限的账号，把还能上传的账号留给图生图。
+                    limited_since = self._utc_iso(time.time())
+                    tokens = [
+                        token for token in tokens
+                        if (self._accounts[token].get("upload_limited_until") or "") > limited_since
+                    ] or tokens
                 if tokens:
                     access_token = tokens[self._index % len(tokens)]
                     self._index += 1

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.9.25 - 2026-11-22
+
++ [优化] 不带参考图的生图请求优先分配给上传受限的账号，受限账号都没有额度或都在忙时才用其他账号，把还能上传的账号留给图生图。
+
 ## 1.9.24 - 2026-11-22
 
 + [修复] 文生图请求被上游图像工具误判成“编辑已有图片”（工具返回 `The user asked to edit or restore a specific existing image…`）时，不再轮询到超时后返回 502：没带参考图的请求加上“全新生成、没有参考图”的引导语换账号重试一次；重试后仍然如此，或请求本身带了参考图，直接返回 400（`code` 为 `no_image_generated`）并带上上游助手的答复原文。日志事件 `image_source_missing_retry` / `image_source_missing`。

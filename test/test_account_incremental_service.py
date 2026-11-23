@@ -212,6 +212,11 @@ class IncrementalAccountTests(unittest.TestCase):
         stats = self.service.get_stats()
         self.assertEqual((stats["upload_limited"], stats["total_quota"], stats["upload_quota"]), (1, 8, 4))
 
+        # 不带参考图的请求优先用上传受限的账号；受限账号占满后才用其他账号。
+        for expected in ["fixture-a"] * self.fixture.config.image_account_concurrency + ["fixture-b"]:
+            self.assertEqual(self.service._acquire_next_candidate_token(), expected)
+        self.service._image_inflight.clear()
+
         self.service.mark_upload_limited("fixture-b", 7200)
         with self.assertRaisesRegex(RuntimeError, "reference images.*earliest recovery at 2023-11-14T23:13:20"):
             self.service._acquire_next_candidate_token(needs_upload=True)
