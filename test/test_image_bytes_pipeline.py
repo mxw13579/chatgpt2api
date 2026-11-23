@@ -73,6 +73,14 @@ class ImageBytesOutputTests(unittest.TestCase):
             self.assertEqual([(output.kind, output.text) for output in outputs], [("progress", "背景是蓝色"), ("message", "背景是蓝色")])
             self.backend.resolve_conversation_image_urls.assert_not_called()
 
+            # 带引导语后账号回复自己不能画图：不当作内容拒绝，抛出可换号重试的错误。
+            unable = [{"type": "conversation.completed", "conversation_id": "third",
+                       "text": "目前无法在此对话中直接生成或编辑图片。", "turn_use_case": "multimodal"}]
+            conversation.conversation_events.side_effect = [unable, unable]
+            with self.assertRaises(conversation.ImageToolFailedError) as unable_error:
+                list(conversation.stream_image_outputs(self.backend, request))
+            self.assertEqual(unable_error.exception.conversation_id, "third")
+
             # 带引导语仍没有画图，也没有任何文字：不轮询，直接失败。
             silent = [{"type": "conversation.completed", "conversation_id": "second", "text": "", "turn_use_case": "multimodal"}]
             conversation.conversation_events.side_effect = [silent, silent]

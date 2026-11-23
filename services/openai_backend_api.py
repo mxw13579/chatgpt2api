@@ -64,7 +64,7 @@ class ImageSourceMissingError(ImageTaskError):
 
 
 class ImageToolFailedError(ImageTaskError):
-    """上游图像工具自己报错，这一轮不会出图。"""
+    """上游图像工具自己报错，或这个账号当前不能画图：这一轮不会出图，换账号可能成功。"""
     pass
 
 

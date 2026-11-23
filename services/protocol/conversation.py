@@ -1298,6 +1298,12 @@ def stream_image_outputs(
     if not message and not file_ids and not sediment_ids and not should_poll_for_image:
         # 上游没有走画图，也没有任何回复：轮询等不到图，直接失败。
         raise ImageGenerationError("上游没有生成图片，也没有返回任何内容，请重试。", conversation_id=conversation_id)
+    if (
+        "无法在此对话中直接生成或编辑图片" in message
+        and not file_ids and not sediment_ids and not should_poll_for_image
+    ):
+        # 这个账号当前不能画图：不是内容审核拒绝，交给上层换账号重试。
+        raise ImageToolFailedError(message, conversation_id)
     if message and not file_ids and not sediment_ids and not should_poll_for_image and not is_text_reply:
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
         return
@@ -1601,7 +1607,7 @@ def _generate_single_image(
                 conversation_id=exc.conversation_id,
             ) from exc
         except ImageToolFailedError as exc:
-            # 上游图像工具自己报错（偶发）：不等到轮询超时，换账号重试一次。
+            # 上游图像工具自己报错（偶发），或这个账号当前不能画图：不等到轮询超时，换账号重试一次。
             account_service.mark_image_result(token, False)
             logger.warning({
                 "event": "image_tool_failed" if tool_failed_retried else "image_tool_failed_retry",
