@@ -8,7 +8,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
 import tiktoken
@@ -22,6 +22,7 @@ from services.openai_backend_api import (
     ImageQueuedError,
     ImageQuotaExceededError,
     ImageSourceMissingError,
+    ImageToolFailedError,
     ImageStreamHardTimeoutError,
     OpenAIBackendAPI,
     TEXT_STREAM_TIMEOUT_SECS,
@@ -146,10 +147,6 @@ def is_image_concurrency_error(error: BaseException) -> bool:
 
 
 # 上游没有走画图时重试用的引导语。
-IMAGE_NEW_INSTRUCTION = (
-    "这是一次全新的图片生成请求，没有参考图，也不需要编辑或修复任何已有图片。"
-    "请直接使用图片生成工具，按下面的要求从零生成一张新图片。\n\n"
-)
 IMAGE_TOOL_INSTRUCTION = "请使用图片生成工具，按下面的要求生成一张图片，不要只用文字回答。\n\n"
 _UPLOAD_LIMIT_WAIT_RE = re.compile(r"请\s*(\d+)\s*(分钟|小时|天)")
 _UPLOAD_LIMIT_UNIT_SECS = {"分钟": 60, "小时": 3600, "天": 86400}
@@ -1481,6 +1478,7 @@ def _generate_single_image(
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
     concurrency_retry_count = 0
+    tool_failed_retried = False
     account_email = ""
     request_deadline = time.monotonic() + float(config.image_poll_timeout_secs)
 
@@ -1586,19 +1584,14 @@ def _generate_single_image(
                 account_service.update_account(token, {"status": "限流", "quota": 0}, quiet=True)
             continue
         except ImageSourceMissingError as exc:
-            # 上游图像工具把请求当成编辑已有图片却找不到原图：轮询等不到图。
-            # 没带参考图的请求加引导语换账号重试一次，否则直接返回上游的答复。
+            # 上游图像工具把请求当成编辑已有图片却找不到原图：轮询等不到图，换号也没用，直接返回。
             account_service.mark_image_result(token, False)
-            retry = not request.images and not request.prompt.startswith(IMAGE_NEW_INSTRUCTION)
             logger.warning({
-                "event": "image_source_missing_retry" if retry else "image_source_missing",
+                "event": "image_source_missing",
                 "account_email": account_email,
                 "index": index,
                 "error": str(exc)[:200],
             })
-            if retry:
-                request = replace(request, prompt=IMAGE_NEW_INSTRUCTION + request.prompt)
-                continue
             raise ImageGenerationError(
                 str(exc),
                 status_code=400,
@@ -1606,6 +1599,21 @@ def _generate_single_image(
                 code="no_image_generated",
                 account_email=account_email,
                 conversation_id=exc.conversation_id,
+            ) from exc
+        except ImageToolFailedError as exc:
+            # 上游图像工具自己报错（偶发）：不等到轮询超时，换账号重试一次。
+            account_service.mark_image_result(token, False)
+            logger.warning({
+                "event": "image_tool_failed" if tool_failed_retried else "image_tool_failed_retry",
+                "account_email": account_email,
+                "index": index,
+                "error": str(exc)[:200],
+            })
+            if not tool_failed_retried:
+                tool_failed_retried = True
+                continue
+            raise ImageGenerationError(
+                str(exc), account_email=account_email, conversation_id=exc.conversation_id,
             ) from exc
         except ImagePollTimeoutError as exc:
             account_service.mark_image_result(token, False)

@@ -63,6 +63,11 @@ class ImageSourceMissingError(ImageTaskError):
     pass
 
 
+class ImageToolFailedError(ImageTaskError):
+    """上游图像工具自己报错，这一轮不会出图。"""
+    pass
+
+
 class ImageStreamHardTimeoutError(RuntimeError):
     """图片 SSE 流读取超过硬上限时抛出，用于快速中断被挂起的长连接。"""
     pass
@@ -1269,7 +1274,8 @@ class OpenAIBackendAPI:
         return ""
 
     @staticmethod
-    def _last_assistant_text(conversation: Dict[str, Any]) -> str:
+    def _upstream_reply_suffix(conversation: Dict[str, Any]) -> str:
+        """最后一条助手文字答复，拼在错误信息后面；还没有答复时为空。"""
         messages = [
             node["message"] for node in (conversation.get("mapping") or {}).values()
             if ((node or {}).get("message") or {}).get("author", {}).get("role") == "assistant"
@@ -1277,7 +1283,8 @@ class OpenAIBackendAPI:
         if not messages:
             return ""
         parts = (max(messages, key=lambda message: message.get("create_time") or 0).get("content") or {}).get("parts") or []
-        return "".join(part for part in parts if isinstance(part, str)).strip()
+        text = "".join(part for part in parts if isinstance(part, str)).strip()
+        return f"上游答复：{text}" if text else ""
 
     @staticmethod
     def _conversation_message_summary(conversation: Dict[str, Any]) -> list[list[Any]]:
@@ -1441,7 +1448,14 @@ class OpenAIBackendAPI:
                         raise ImageQueuedError(row[-1], conversation_id or "")
                     if row[0] == "tool" and "edit or restore a specific existing image" in row[-1]:
                         raise ImageSourceMissingError(
-                            self._last_assistant_text(conversation) or row[-1], conversation_id or "",
+                            "上游图像工具把这次请求当成了编辑已有图片，但没有可用的原图，未能生成图片。"
+                            + self._upstream_reply_suffix(conversation),
+                            conversation_id or "",
+                        )
+                    if row[0] == "tool" and "We experienced an error when generating images" in row[-1]:
+                        raise ImageToolFailedError(
+                            "上游图像工具出错，未能生成图片，请重试。" + self._upstream_reply_suffix(conversation),
+                            conversation_id or "",
                         )
                 policy_msg = self._find_content_policy_error_in_conversation(conversation)
                 if policy_msg:

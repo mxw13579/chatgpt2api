@@ -8,7 +8,7 @@ from unittest import mock
 from curl_cffi.requests.models import STREAM_END
 
 from services.config import config
-from services.openai_backend_api import ImagePollTimeoutError, ImageQueuedError, ImageQuotaExceededError, ImageSourceMissingError, OpenAIBackendAPI
+from services.openai_backend_api import ImagePollTimeoutError, ImageQueuedError, ImageQuotaExceededError, ImageSourceMissingError, ImageToolFailedError, OpenAIBackendAPI
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
@@ -615,8 +615,8 @@ class MultiImageResultTests(unittest.TestCase):
         self.assertEqual([output.kind for output in outputs], ["result"])
         update_account.assert_called_once_with("token-2", {"status": "限流", "quota": 0}, quiet=True)
 
-    def test_tool_missing_source_image_retries_once_with_instruction_then_returns_400(self) -> None:
-        from services.protocol.conversation import IMAGE_NEW_INSTRUCTION, ImageGenerationError
+    def test_tool_refusals_stop_polling_missing_source_returns_400_tool_error_retries_once(self) -> None:
+        from services.protocol.conversation import ImageGenerationError
 
         def message(role: str, text: str, created: int) -> dict:
             return {"message": {
@@ -624,21 +624,31 @@ class MultiImageResultTests(unittest.TestCase):
                 "status": "finished_successfully", "content": {"content_type": "text", "parts": [text]},
             }}
 
-        tool_text = "The user asked to edit or restore a specific existing image, but there is no usable image."
-        backend = FakeBackend([{"mapping": {"a": message("tool", tool_text, 1), "b": message("assistant", "请上传原图。", 2)}}])
-        with (
-            mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 0}),
-            self.assertRaises(ImageSourceMissingError) as raised,
+        missing_text = "上游图像工具把这次请求当成了编辑已有图片，但没有可用的原图，未能生成图片。"
+        failed_text = "上游图像工具出错，未能生成图片，请重试。"
+        for tool_text, reply, error_type, expected in (
+            ("The user asked to edit or restore a specific existing image, but there is no usable image.",
+             [message("assistant", "请上传原图。", 2)], ImageSourceMissingError, missing_text + "上游答复：请上传原图。"),
+            ("The user asked to edit or restore a specific existing image, but there is no usable image.",
+             [], ImageSourceMissingError, missing_text),
+            ("We experienced an error when generating images. Before doing anything else, please tell the user.",
+             [], ImageToolFailedError, failed_text),
         ):
-            backend._poll_image_results("conv-1", timeout_secs=10)
-        self.assertEqual((str(raised.exception), raised.exception.conversation_id, backend.calls), ("请上传原图。", "conv-1", 1))
+            backend = FakeBackend([{"mapping": dict(enumerate([message("tool", tool_text, 1), *reply]))}])
+            with (
+                mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 0}),
+                self.assertRaises(error_type) as raised,
+            ):
+                backend._poll_image_results("conv-1", timeout_secs=10)
+            self.assertEqual((str(raised.exception), raised.exception.conversation_id, backend.calls), (expected, "conv-1", 1))
 
         result = ImageOutput(kind="result", model="gpt-image-2", index=1, total=1, data=[{"url": "u"}])
-        missing = ImageSourceMissingError("请上传原图。", "conv-1")
-        for images, side_effect, prompts in (
-            (None, [missing, iter([result])], ["draw", IMAGE_NEW_INSTRUCTION + "draw"]),
-            (None, [missing, missing], ["draw", IMAGE_NEW_INSTRUCTION + "draw"]),
-            (["aW1hZ2U="], [missing], ["draw"]),
+        missing = ImageSourceMissingError(missing_text, "conv-1")
+        failed = ImageToolFailedError(failed_text, "conv-1")
+        for side_effect, attempts, expected in (
+            ([missing], 1, (400, "no_image_generated", missing_text)),
+            ([failed, iter([result])], 2, None),
+            ([failed, failed], 2, (502, "upstream_error", failed_text)),
         ):
             with (
                 mock.patch("services.protocol.conversation.account_service.get_available_access_token", return_value="token"),
@@ -647,17 +657,15 @@ class MultiImageResultTests(unittest.TestCase):
                 mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=mock.Mock()),
                 mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=side_effect) as stream,
             ):
-                request = ConversationRequest(prompt="draw", model="gpt-image-2", images=images)
-                if isinstance(side_effect[-1], ImageSourceMissingError):
-                    with self.assertRaises(ImageGenerationError) as failed:
-                        _generate_single_image(request, 1, 1)
-                    self.assertEqual(
-                        (failed.exception.status_code, failed.exception.code, str(failed.exception)),
-                        (400, "no_image_generated", "请上传原图。"),
-                    )
-                else:
+                request = ConversationRequest(prompt="draw", model="gpt-image-2")
+                if expected is None:
                     self.assertEqual(_generate_single_image(request, 1, 1), [result])
-            self.assertEqual([call.args[1].prompt for call in stream.call_args_list], prompts)
+                else:
+                    with self.assertRaises(ImageGenerationError) as raised_final:
+                        _generate_single_image(request, 1, 1)
+                    error = raised_final.exception
+                    self.assertEqual((error.status_code, error.code, str(error)), expected)
+            self.assertEqual(stream.call_count, attempts)
 
     def test_sse_payload_iterator_enforces_application_deadline_for_idle_curl_stream(self) -> None:
         response = mock.Mock()
