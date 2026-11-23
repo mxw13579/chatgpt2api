@@ -42,5 +42,6 @@ def install_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
         if _is_openai_compatible_path(request.url.path):
-            return _compatible_error_response(request, exc.errors(), 422)
+            # 与 OpenAI 一致用 400：中转会把 422 当成可重试的错误反复重发。
+            return _compatible_error_response(request, exc.errors(), 400)
         return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
