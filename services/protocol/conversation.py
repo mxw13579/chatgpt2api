@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import re
 import threading
@@ -1742,7 +1743,53 @@ def _generate_single_image(
                 backend.close()
 
 
+# 同一内容（提示词 + 参考图）被内容审核拒绝的时间和原文：30 分钟内满 2 次后直接返回 400，
+# 不再取账号、上传参考图；成功一次即清除。
+_POLICY_REJECTION_TTL_SECS = 1800
+_POLICY_REJECTION_LIMIT = 2
+_policy_rejections: dict[str, list[tuple[float, str]]] = {}
+_policy_rejections_lock = threading.Lock()
+
+
+def _policy_rejection_key(request: ConversationRequest) -> str:
+    digest = hashlib.sha256(request.prompt.encode("utf-8"))
+    for image in request.images or []:
+        digest.update(b"\0" + hashlib.sha256(image.encode("ascii")).digest())
+    return digest.hexdigest()
+
+
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
+    key = _policy_rejection_key(request)
+    oldest = time.time() - _POLICY_REJECTION_TTL_SECS
+    with _policy_rejections_lock:
+        rejections = [item for item in _policy_rejections.get(key, []) if item[0] > oldest]
+    if len(rejections) >= _POLICY_REJECTION_LIMIT:
+        logger.info({"event": "image_policy_repeat_blocked", "key": key[:16], "rejections": len(rejections)})
+        raise ImageGenerationError(
+            rejections[-1][1],
+            status_code=400,
+            error_type="invalid_request_error",
+            code="content_policy_violation",
+        )
+    succeeded = False
+    try:
+        for output in _stream_image_outputs_with_pool(request):
+            succeeded = succeeded or output.kind == "result"
+            yield output
+    except ImageGenerationError as exc:
+        if exc.code == "content_policy_violation":
+            now = time.time()
+            with _policy_rejections_lock:
+                for other in [k for k, items in _policy_rejections.items() if items[-1][0] <= now - _POLICY_REJECTION_TTL_SECS]:
+                    del _policy_rejections[other]
+                _policy_rejections.setdefault(key, []).append((now, str(exc)))
+        raise
+    if succeeded:
+        with _policy_rejections_lock:
+            _policy_rejections.pop(key, None)
+
+
+def _stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
     """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
     if not is_supported_image_model(request.model):
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(supported_image_models())))

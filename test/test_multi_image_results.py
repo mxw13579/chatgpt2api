@@ -111,6 +111,41 @@ class MultiImageResultTests(unittest.TestCase):
 
         self.assertEqual((raised.exception.status_code, raised.exception.code), (400, "content_policy_violation"))
 
+    def test_content_rejected_twice_is_refused_without_reaching_upstream(self) -> None:
+        from services.protocol import conversation
+        from services.protocol.conversation import ImageGenerationError
+
+        rejected = ImageGenerationError(
+            "upstream rejection text", status_code=400, error_type="invalid_request_error",
+            code="content_policy_violation",
+        )
+        request = ConversationRequest(model="gpt-image-2", prompt="repeat me", images=["aW1hZ2U="])
+        other_image = ConversationRequest(model="gpt-image-2", prompt="repeat me", images=["b3RoZXI="])
+        result = [ImageOutput(kind="result", model="gpt-image-2", index=1, total=1, data=[{"b64_json": "x"}])]
+        self.addCleanup(conversation._policy_rejections.clear)
+
+        with mock.patch("services.protocol.conversation._generate_single_image", side_effect=rejected) as generate:
+            for _ in range(3):
+                with self.assertRaises(ImageGenerationError) as raised:
+                    list(stream_image_outputs_with_pool(request))
+            self.assertEqual(generate.call_count, 2)
+            self.assertEqual(
+                (raised.exception.status_code, raised.exception.code, str(raised.exception)),
+                (400, "content_policy_violation", "upstream rejection text"),
+            )
+            # 同一提示词换一张参考图是另一个键。
+            with self.assertRaises(ImageGenerationError):
+                list(stream_image_outputs_with_pool(other_image))
+            self.assertEqual(generate.call_count, 3)
+
+        # 拒绝记录过期后放行，成功一次清空记录。
+        with (
+            mock.patch("services.protocol.conversation._generate_single_image", return_value=result) as generate,
+            mock.patch("services.protocol.conversation.time.time", return_value=conversation.time.time() + 1801),
+        ):
+            self.assertEqual(list(stream_image_outputs_with_pool(request)), result)
+        self.assertNotIn(conversation._policy_rejection_key(request), conversation._policy_rejections)
+
     def test_stream_id_extractor_keeps_full_file_ids(self) -> None:
         payload = (
             '{"conversation_id":"conv-1"} '
