@@ -58,6 +58,11 @@ class ImageQuotaExceededError(ImageTaskError):
     pass
 
 
+class ImageSourceMissingError(ImageTaskError):
+    """上游图像工具把请求当成编辑已有图片，但对话里没有可用的原图。"""
+    pass
+
+
 class ImageStreamHardTimeoutError(RuntimeError):
     """图片 SSE 流读取超过硬上限时抛出，用于快速中断被挂起的长连接。"""
     pass
@@ -1264,6 +1269,17 @@ class OpenAIBackendAPI:
         return ""
 
     @staticmethod
+    def _last_assistant_text(conversation: Dict[str, Any]) -> str:
+        messages = [
+            node["message"] for node in (conversation.get("mapping") or {}).values()
+            if ((node or {}).get("message") or {}).get("author", {}).get("role") == "assistant"
+        ]
+        if not messages:
+            return ""
+        parts = (max(messages, key=lambda message: message.get("create_time") or 0).get("content") or {}).get("parts") or []
+        return "".join(part for part in parts if isinstance(part, str)).strip()
+
+    @staticmethod
     def _conversation_message_summary(conversation: Dict[str, Any]) -> list[list[Any]]:
         """超时排查用：上游对话里每条非用户消息的角色、去向、类型、状态和开头文字。"""
         rows = []
@@ -1423,6 +1439,10 @@ class OpenAIBackendAPI:
                         raise ImageQuotaExceededError(row[-1], conversation_id or "")
                     if "免费排队稍后生成" in row[-1]:
                         raise ImageQueuedError(row[-1], conversation_id or "")
+                    if row[0] == "tool" and "edit or restore a specific existing image" in row[-1]:
+                        raise ImageSourceMissingError(
+                            self._last_assistant_text(conversation) or row[-1], conversation_id or "",
+                        )
                 policy_msg = self._find_content_policy_error_in_conversation(conversation)
                 if policy_msg:
                     logger.warning({

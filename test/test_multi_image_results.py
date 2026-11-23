@@ -8,7 +8,7 @@ from unittest import mock
 from curl_cffi.requests.models import STREAM_END
 
 from services.config import config
-from services.openai_backend_api import ImagePollTimeoutError, ImageQueuedError, ImageQuotaExceededError, OpenAIBackendAPI
+from services.openai_backend_api import ImagePollTimeoutError, ImageQueuedError, ImageQuotaExceededError, ImageSourceMissingError, OpenAIBackendAPI
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
@@ -614,6 +614,50 @@ class MultiImageResultTests(unittest.TestCase):
 
         self.assertEqual([output.kind for output in outputs], ["result"])
         update_account.assert_called_once_with("token-2", {"status": "限流", "quota": 0}, quiet=True)
+
+    def test_tool_missing_source_image_retries_once_with_instruction_then_returns_400(self) -> None:
+        from services.protocol.conversation import IMAGE_NEW_INSTRUCTION, ImageGenerationError
+
+        def message(role: str, text: str, created: int) -> dict:
+            return {"message": {
+                "create_time": created, "author": {"role": role}, "recipient": "all",
+                "status": "finished_successfully", "content": {"content_type": "text", "parts": [text]},
+            }}
+
+        tool_text = "The user asked to edit or restore a specific existing image, but there is no usable image."
+        backend = FakeBackend([{"mapping": {"a": message("tool", tool_text, 1), "b": message("assistant", "请上传原图。", 2)}}])
+        with (
+            mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 0}),
+            self.assertRaises(ImageSourceMissingError) as raised,
+        ):
+            backend._poll_image_results("conv-1", timeout_secs=10)
+        self.assertEqual((str(raised.exception), raised.exception.conversation_id, backend.calls), ("请上传原图。", "conv-1", 1))
+
+        result = ImageOutput(kind="result", model="gpt-image-2", index=1, total=1, data=[{"url": "u"}])
+        missing = ImageSourceMissingError("请上传原图。", "conv-1")
+        for images, side_effect, prompts in (
+            (None, [missing, iter([result])], ["draw", IMAGE_NEW_INSTRUCTION + "draw"]),
+            (None, [missing, missing], ["draw", IMAGE_NEW_INSTRUCTION + "draw"]),
+            (["aW1hZ2U="], [missing], ["draw"]),
+        ):
+            with (
+                mock.patch("services.protocol.conversation.account_service.get_available_access_token", return_value="token"),
+                mock.patch("services.protocol.conversation.account_service.get_account", return_value={"email": "a@example.test"}),
+                mock.patch("services.protocol.conversation.account_service.mark_image_result"),
+                mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=mock.Mock()),
+                mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=side_effect) as stream,
+            ):
+                request = ConversationRequest(prompt="draw", model="gpt-image-2", images=images)
+                if isinstance(side_effect[-1], ImageSourceMissingError):
+                    with self.assertRaises(ImageGenerationError) as failed:
+                        _generate_single_image(request, 1, 1)
+                    self.assertEqual(
+                        (failed.exception.status_code, failed.exception.code, str(failed.exception)),
+                        (400, "no_image_generated", "请上传原图。"),
+                    )
+                else:
+                    self.assertEqual(_generate_single_image(request, 1, 1), [result])
+            self.assertEqual([call.args[1].prompt for call in stream.call_args_list], prompts)
 
     def test_sse_payload_iterator_enforces_application_deadline_for_idle_curl_stream(self) -> None:
         response = mock.Mock()

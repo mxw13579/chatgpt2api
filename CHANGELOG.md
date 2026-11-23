@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.9.24 - 2026-11-22
+
++ [修复] 文生图请求被上游图像工具误判成“编辑已有图片”（工具返回 `The user asked to edit or restore a specific existing image…`）时，不再轮询到超时后返回 502：没带参考图的请求加上“全新生成、没有参考图”的引导语换账号重试一次；重试后仍然如此，或请求本身带了参考图，直接返回 400（`code` 为 `no_image_generated`）并带上上游助手的答复原文。日志事件 `image_source_missing_retry` / `image_source_missing`。
+
 ## 1.9.23 - 2026-11-22
 
 + [新增] 同一内容（提示词 + 参考图）30 分钟内被上游内容审核拒绝满 2 次后，再次提交直接返回 400（沿用上游的拒绝原文，`code` 为 `content_policy_violation`），不再取账号、上传参考图；拒绝记录 30 分钟后过期，期间成功一次即清除。记录只在进程内存里，重启后重新计数。被拦截的请求记日志 `image_policy_repeat_blocked`。
