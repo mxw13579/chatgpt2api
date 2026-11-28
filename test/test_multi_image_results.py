@@ -615,6 +615,14 @@ class MultiImageResultTests(unittest.TestCase):
         self.assertEqual([output.kind for output in outputs], ["result"])
         update_account.assert_called_once_with("token-2", {"status": "限流", "quota": 0}, quiet=True)
 
+    def test_short_raw_base64_image_is_not_probed_as_file_path(self) -> None:
+        import base64
+
+        data = bytes(225)
+        encoded = base64.b64encode(data).decode()
+        self.assertEqual(len(encoded), 300)
+        self.assertEqual(FakeBackend()._decode_image_base64(encoded), data)
+
     def test_tool_refusals_stop_polling_missing_source_returns_400_tool_error_retries_once(self) -> None:
         from services.protocol.conversation import ImageGenerationError
 
@@ -641,6 +649,35 @@ class MultiImageResultTests(unittest.TestCase):
             ):
                 backend._poll_image_results("conv-1", timeout_secs=10)
             self.assertEqual((str(raised.exception), raised.exception.conversation_id, backend.calls), (expected, "conv-1", 1))
+
+        def code(created: int) -> dict:
+            return {"message": {
+                "create_time": created, "author": {"role": "assistant"}, "recipient": "t2uay3k.sj1i4kz",
+                "status": "finished_successfully", "content": {"content_type": "code", "text": "{}"},
+            }}
+
+        # 助手调用过工具并给出最终答复，但没有工具结果：按工具出错处理；额度不足按额度用完处理。
+        for nodes, error_type, expected in (
+            ([code(1), message("assistant", "抱歉，本次图片生成遇到技术错误。", 2)],
+             ImageToolFailedError, failed_text + "上游答复：抱歉，本次图片生成遇到技术错误。"),
+            ([code(1), message("assistant", "你的套餐目前额度不足，暂时无法创建图像。", 2)],
+             ImageQuotaExceededError, "你的套餐目前额度不足，暂时无法创建图像。"),
+        ):
+            backend = FakeBackend([{"mapping": dict(enumerate(nodes))}])
+            with (
+                mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 0}),
+                self.assertRaises(error_type) as raised,
+            ):
+                backend._poll_image_results("conv-1", timeout_secs=10)
+            self.assertEqual((str(raised.exception), backend.calls), (expected, 1))
+
+        # 没调用过工具的文字答复不算工具出错，继续轮询到超时。
+        backend = FakeBackend([{"mapping": {0: message("assistant", "好的，稍等。", 1)}}] * 50)
+        with (
+            mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 0, "image_poll_interval_secs": 0.01}),
+            self.assertRaises(ImagePollTimeoutError),
+        ):
+            backend._poll_image_results("conv-1", timeout_secs=0.05)
 
         result = ImageOutput(kind="result", model="gpt-image-2", index=1, total=1, data=[{"url": "u"}])
         missing = ImageSourceMissingError(missing_text, "conv-1")

@@ -791,7 +791,7 @@ class OpenAIBackendAPI:
         """把 base64 图片字符串或本地路径解码成二进制。"""
         if (
                 image
-                and len(image) < 512
+                and len(image) < 256
                 and not image.startswith("data:")
                 and "\n" not in image
                 and "\r" not in image
@@ -807,7 +807,7 @@ class OpenAIBackendAPI:
         data = self._decode_image_base64(image)
         if (
                 image
-                and len(image) < 512
+                and len(image) < 256
                 and not image.startswith("data:")
                 and "\n" not in image
                 and "\r" not in image
@@ -1441,8 +1441,9 @@ class OpenAIBackendAPI:
             # 而非 /backend-api/tasks/ 的 task error 结构中。
             # 如果在没有找到图片文件 ID 的同时检测到内容政策违规，立即中断轮询。
             if not file_ids and not sediment_ids:
-                for row in self._conversation_message_summary(conversation):
-                    if "图像生成请求上限" in row[-1]:
+                rows = self._conversation_message_summary(conversation)
+                for row in rows:
+                    if "图像生成请求上限" in row[-1] or "套餐目前额度不足" in row[-1]:
                         raise ImageQuotaExceededError(row[-1], conversation_id or "")
                     if "免费排队稍后生成" in row[-1]:
                         raise ImageQueuedError(row[-1], conversation_id or "")
@@ -1466,6 +1467,18 @@ class OpenAIBackendAPI:
                         "error_msg": policy_msg[:200],
                     })
                     raise ImageContentPolicyError(policy_msg, conversation_id or "")
+                # 助手调用过图像工具、已经给出最终答复，却没有任何工具结果：这一轮不会再出图。
+                if (
+                        rows
+                        and rows[-1][:1] + rows[-1][2:5] == ["assistant", "all", "text", "finished_successfully"]
+                        and rows[-1][-1]
+                        and any(row[0] == "assistant" and row[3] == "code" for row in rows)
+                        and not any(row[0] == "tool" and row[3] != "system_error" for row in rows)
+                ):
+                    raise ImageToolFailedError(
+                        "上游图像工具出错，未能生成图片，请重试。" + self._upstream_reply_suffix(conversation),
+                        conversation_id or "",
+                    )
 
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
